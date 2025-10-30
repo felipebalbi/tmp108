@@ -68,27 +68,22 @@ jobs:
           components: clippy
 
       - name: cargo clippy
-        uses: giraffate/clippy-action@v1
-        with:
-          reporter: 'github-pr-review'
-          fail_on_error: 'true'
-          clippy_flags: --all-features --all-targets -- -Dwarnings -F clippy::suspicious -F clippy::correctness -D clippy::perf -F clippy::style
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo clippy --all-features --all-targets -- -W clippy::suspicious -W clippy::correctness -W clippy::perf -W clippy::style
 
-  # Enable once we have a released crate
-  # semver:
-  #   runs-on: ubuntu-latest
-  #   name: semver
-  #   steps:
-  #     - uses: actions/checkout@v5
-  #       with:
-  #         submodules: true
-  #     - name: Install stable
-  #       uses: dtolnay/rust-toolchain@stable
-  #       with:
-  #         components: rustfmt
-  #     - name: cargo-semver-checks
-  #       uses: obi1kenobi/cargo-semver-checks-action@v2
+  semver:
+    runs-on: ubuntu-latest
+    name: semver
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo-semver-checks
+        uses: obi1kenobi/cargo-semver-checks-action@v2
 
   doc:
     # run docs generation on nightly rather than stable. This enables features like
@@ -163,7 +158,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        msrv: ["1.84"] # We're relying on namespaced-features, which
+        msrv: ["1.85"] # We're relying on namespaced-features, which
                        # was released in 1.60
                        #
                        # We also depend on `fixed' which requires rust
@@ -178,6 +173,8 @@ jobs:
                        # embassy upstream switched to rust 1.83
                        #
                        # f32::abs moved to core from std
+                       #
+                       # need edition 2024
 
     name: ubuntu / ${{ matrix.msrv }}
     steps:
@@ -209,5 +206,11 @@ jobs:
       - name: Install stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: cargo test
+      - name: cargo test (blocking)
         run: cargo test --locked
+
+      - name: cargo test (async)
+        run: cargo test --locked -F async
+
+      - name: cargo test (embedded-sensors-hal)
+        run: cargo test --locked -F async,embedded-sensors-hal-async
