@@ -1,6 +1,6 @@
 [config]
 register_address_type = "u8"
-default_byte_order = "LE"
+default_byte_order = "BE"
 name_word_boundaries = ["Hyphen"]
 
 [temperature]
@@ -15,7 +15,7 @@ type = "register"
 address = 1
 size_bits = 16
 access = "RW"
-reset_value = 0x1022
+reset_value = 0x2210
 description = "Configuration register"
 
 [configuration.fields.m]
@@ -83,6 +83,7 @@ end = 14
 
 [configuration.fields.hys.conversion]
 name = "hysteresis"
+description = "Hysteresis control"
 _0-C = 0
 _1-C = 1
 _2-C = 2
@@ -96,6 +97,7 @@ end = 16
 
 [configuration.fields.pol.conversion]
 name = "polarity"
+description = "ALERT pin polarity"
 active-low = 0
 active-high = 1
 
