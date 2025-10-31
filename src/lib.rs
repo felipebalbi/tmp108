@@ -684,27 +684,27 @@ mod tests {
     #[test]
     fn default_configuration() {
         let cfg = Configuration::new();
-        assert_eq!(u16::from_le_bytes(cfg.into()), 0x1022);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2210);
     }
 
     #[test]
     fn modify_mode() {
         let mut cfg = Configuration::new();
         cfg.set_m(Mode::Shutdown);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1020);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2010);
         cfg.set_m(Mode::OneShot);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1021);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2110);
         cfg.set_m(Mode::Continuous);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2210);
     }
 
     #[test]
     fn modify_thermostat_mode() {
         let mut cfg = Configuration::new();
         cfg.set_tm(Thermostat::Comparator);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2210);
         cfg.set_tm(Thermostat::Interrupt);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1026);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2610);
     }
 
     #[test]
@@ -712,48 +712,48 @@ mod tests {
         let mut cfg = Configuration::new();
         cfg.set_fl(true);
         cfg.set_fh(false);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x102a);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2a10);
         cfg.set_fl(false);
         cfg.set_fh(true);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1032);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x3210);
         cfg.set_fl(true);
         cfg.set_fh(true);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x103a);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x3a10);
     }
 
     #[test]
     fn modify_conversion_rate() {
         let mut cfg = Configuration::new();
         cfg.set_cr(ConversionRate::_0_25Hz);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1002);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x0210);
         cfg.set_cr(ConversionRate::_1Hz);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2210);
         cfg.set_cr(ConversionRate::_4Hz);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1042);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x4210);
         cfg.set_cr(ConversionRate::_16Hz);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1062);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x6210);
     }
 
     #[test]
     fn modify_hysteresis() {
         let mut cfg = Configuration::new();
         cfg.set_hys(Hysteresis::_0C);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x0022);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2200);
         cfg.set_hys(Hysteresis::_1C);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2210);
         cfg.set_hys(Hysteresis::_2C);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2022);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2220);
         cfg.set_hys(Hysteresis::_4C);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x3022);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2230);
     }
 
     #[test]
     fn modify_polarity() {
         let mut cfg = Configuration::new();
         cfg.set_pol(Polarity::ActiveLow);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2210);
         cfg.set_pol(Polarity::ActiveHigh);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x9022);
+        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2290);
     }
 
     #[cfg(not(feature = "async"))]
@@ -795,10 +795,10 @@ mod tests {
         #[test]
         fn change_configuration() {
             let expectations = vec![
-                Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
-                Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
-                Transaction::write(0x48, vec![0x01, 0x66, 0xb0]),
-                Transaction::write_read(0x48, vec![0x01], vec![0x66, 0xb0]),
+                Transaction::write_read(0x48, vec![0x01], vec![0x10, 0x22]),
+                Transaction::write_read(0x48, vec![0x01], vec![0x10, 0x22]),
+                Transaction::write(0x48, vec![0x01, 0xb0, 0x66]),
+                Transaction::write_read(0x48, vec![0x01], vec![0xb0, 0x66]),
             ];
 
             let mock = Mock::new(&expectations);
@@ -992,10 +992,10 @@ mod tests {
         #[tokio::test]
         async fn change_configuration() {
             let expectations = vec![
-                Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
-                Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
-                Transaction::write(0x48, vec![0x01, 0x66, 0xb0]),
-                Transaction::write_read(0x48, vec![0x01], vec![0x66, 0xb0]),
+                Transaction::write_read(0x48, vec![0x01], vec![0x10, 0x22]),
+                Transaction::write_read(0x48, vec![0x01], vec![0x10, 0x22]),
+                Transaction::write(0x48, vec![0x01, 0xb0, 0x66]),
+                Transaction::write_read(0x48, vec![0x01], vec![0xb0, 0x66]),
             ];
 
             let mock = Mock::new(&expectations);
@@ -1029,17 +1029,17 @@ mod tests {
         #[tokio::test]
         async fn read_temperature_default_address() {
             let expectations = vec![
-                vec![Transaction::write_read(0x48, vec![0x00], vec![0x7f, 0xf0])],
-                vec![Transaction::write_read(0x48, vec![0x00], vec![0x64, 0x00])],
-                vec![Transaction::write_read(0x48, vec![0x00], vec![0x50, 0x00])],
-                vec![Transaction::write_read(0x48, vec![0x00], vec![0x4b, 0x00])],
-                vec![Transaction::write_read(0x48, vec![0x00], vec![0x32, 0x00])],
-                vec![Transaction::write_read(0x48, vec![0x00], vec![0x19, 0x00])],
-                vec![Transaction::write_read(0x48, vec![0x00], vec![0x00, 0x40])],
+                vec![Transaction::write_read(0x48, vec![0x00], vec![0xf0, 0x7f])],
+                vec![Transaction::write_read(0x48, vec![0x00], vec![0x00, 0x64])],
+                vec![Transaction::write_read(0x48, vec![0x00], vec![0x00, 0x50])],
+                vec![Transaction::write_read(0x48, vec![0x00], vec![0x00, 0x4b])],
+                vec![Transaction::write_read(0x48, vec![0x00], vec![0x00, 0x32])],
+                vec![Transaction::write_read(0x48, vec![0x00], vec![0x00, 0x19])],
+                vec![Transaction::write_read(0x48, vec![0x00], vec![0x40, 0x00])],
                 vec![Transaction::write_read(0x48, vec![0x00], vec![0x00, 0x00])],
-                vec![Transaction::write_read(0x48, vec![0x00], vec![0xff, 0xc0])],
-                vec![Transaction::write_read(0x48, vec![0x00], vec![0xe7, 0x00])],
-                vec![Transaction::write_read(0x48, vec![0x00], vec![0xc9, 0x00])],
+                vec![Transaction::write_read(0x48, vec![0x00], vec![0xc0, 0xff])],
+                vec![Transaction::write_read(0x48, vec![0x00], vec![0x00, 0xe7])],
+                vec![Transaction::write_read(0x48, vec![0x00], vec![0x00, 0xc9])],
             ];
             let temps = [127.9375, 100.0, 80.0, 75.0, 50.0, 25.0, 0.25, 0.0, -0.25, -25.0, -55.0];
 
@@ -1060,28 +1060,28 @@ mod tests {
         #[tokio::test]
         async fn set_and_read_high_limit() {
             let expectations = vec![
-                Transaction::write(0x48, vec![0x03, 0x7f, 0xf0]),
-                Transaction::write_read(0x48, vec![0x03], vec![0x7f, 0xf0]),
-                Transaction::write(0x48, vec![0x03, 0x64, 0x00]),
-                Transaction::write_read(0x48, vec![0x03], vec![0x64, 0x00]),
-                Transaction::write(0x48, vec![0x03, 0x50, 0x00]),
-                Transaction::write_read(0x48, vec![0x03], vec![0x50, 0x00]),
-                Transaction::write(0x48, vec![0x03, 0x4b, 0x00]),
-                Transaction::write_read(0x48, vec![0x03], vec![0x4b, 0x00]),
-                Transaction::write(0x48, vec![0x03, 0x32, 0x00]),
-                Transaction::write_read(0x48, vec![0x03], vec![0x32, 0x00]),
-                Transaction::write(0x48, vec![0x03, 0x19, 0x00]),
-                Transaction::write_read(0x48, vec![0x03], vec![0x19, 0x00]),
-                Transaction::write(0x48, vec![0x03, 0x00, 0x40]),
-                Transaction::write_read(0x48, vec![0x03], vec![0x00, 0x40]),
+                Transaction::write(0x48, vec![0x03, 0xf0, 0x7f]),
+                Transaction::write_read(0x48, vec![0x03], vec![0xf0, 0x7f]),
+                Transaction::write(0x48, vec![0x03, 0x00, 0x64]),
+                Transaction::write_read(0x48, vec![0x03], vec![0x00, 0x64]),
+                Transaction::write(0x48, vec![0x03, 0x00, 0x50]),
+                Transaction::write_read(0x48, vec![0x03], vec![0x00, 0x50]),
+                Transaction::write(0x48, vec![0x03, 0x00, 0x4b]),
+                Transaction::write_read(0x48, vec![0x03], vec![0x00, 0x4b]),
+                Transaction::write(0x48, vec![0x03, 0x00, 0x32]),
+                Transaction::write_read(0x48, vec![0x03], vec![0x00, 0x32]),
+                Transaction::write(0x48, vec![0x03, 0x00, 0x19]),
+                Transaction::write_read(0x48, vec![0x03], vec![0x00, 0x19]),
+                Transaction::write(0x48, vec![0x03, 0x40, 0x00]),
+                Transaction::write_read(0x48, vec![0x03], vec![0x40, 0x00]),
                 Transaction::write(0x48, vec![0x03, 0x00, 0x00]),
                 Transaction::write_read(0x48, vec![0x03], vec![0x00, 0x00]),
-                Transaction::write(0x48, vec![0x03, 0xff, 0xc0]),
-                Transaction::write_read(0x48, vec![0x03], vec![0xff, 0xc0]),
-                Transaction::write(0x48, vec![0x03, 0xe7, 0x00]),
-                Transaction::write_read(0x48, vec![0x03], vec![0xe7, 0x00]),
-                Transaction::write(0x48, vec![0x03, 0xc9, 0x00]),
-                Transaction::write_read(0x48, vec![0x03], vec![0xc9, 0x00]),
+                Transaction::write(0x48, vec![0x03, 0xc0, 0xff]),
+                Transaction::write_read(0x48, vec![0x03], vec![0xc0, 0xff]),
+                Transaction::write(0x48, vec![0x03, 0x00, 0xe7]),
+                Transaction::write_read(0x48, vec![0x03], vec![0x00, 0xe7]),
+                Transaction::write(0x48, vec![0x03, 0x00, 0xc9]),
+                Transaction::write_read(0x48, vec![0x03], vec![0x00, 0xc9]),
             ];
             let temps = [127.9375, 100.0, 80.0, 75.0, 50.0, 25.0, 0.25, 0.0, -0.25, -25.0, -55.0];
 
@@ -1106,28 +1106,28 @@ mod tests {
         #[tokio::test]
         async fn set_and_read_low_limit() {
             let expectations = vec![
-                Transaction::write(0x48, vec![0x02, 0x7f, 0xf0]),
-                Transaction::write_read(0x48, vec![0x02], vec![0x7f, 0xf0]),
-                Transaction::write(0x48, vec![0x02, 0x64, 0x00]),
-                Transaction::write_read(0x48, vec![0x02], vec![0x64, 0x00]),
-                Transaction::write(0x48, vec![0x02, 0x50, 0x00]),
-                Transaction::write_read(0x48, vec![0x02], vec![0x50, 0x00]),
-                Transaction::write(0x48, vec![0x02, 0x4b, 0x00]),
-                Transaction::write_read(0x48, vec![0x02], vec![0x4b, 0x00]),
-                Transaction::write(0x48, vec![0x02, 0x32, 0x00]),
-                Transaction::write_read(0x48, vec![0x02], vec![0x32, 0x00]),
-                Transaction::write(0x48, vec![0x02, 0x19, 0x00]),
-                Transaction::write_read(0x48, vec![0x02], vec![0x19, 0x00]),
-                Transaction::write(0x48, vec![0x02, 0x00, 0x40]),
-                Transaction::write_read(0x48, vec![0x02], vec![0x00, 0x40]),
+                Transaction::write(0x48, vec![0x02, 0xf0, 0x7f]),
+                Transaction::write_read(0x48, vec![0x02], vec![0xf0, 0x7f]),
+                Transaction::write(0x48, vec![0x02, 0x00, 0x64]),
+                Transaction::write_read(0x48, vec![0x02], vec![0x00, 0x64]),
+                Transaction::write(0x48, vec![0x02, 0x00, 0x50]),
+                Transaction::write_read(0x48, vec![0x02], vec![0x00, 0x50]),
+                Transaction::write(0x48, vec![0x02, 0x00, 0x4b]),
+                Transaction::write_read(0x48, vec![0x02], vec![0x00, 0x4b]),
+                Transaction::write(0x48, vec![0x02, 0x00, 0x32]),
+                Transaction::write_read(0x48, vec![0x02], vec![0x00, 0x32]),
+                Transaction::write(0x48, vec![0x02, 0x00, 0x19]),
+                Transaction::write_read(0x48, vec![0x02], vec![0x00, 0x19]),
+                Transaction::write(0x48, vec![0x02, 0x40, 0x00]),
+                Transaction::write_read(0x48, vec![0x02], vec![0x40, 0x00]),
                 Transaction::write(0x48, vec![0x02, 0x00, 0x00]),
                 Transaction::write_read(0x48, vec![0x02], vec![0x00, 0x00]),
-                Transaction::write(0x48, vec![0x02, 0xff, 0xc0]),
-                Transaction::write_read(0x48, vec![0x02], vec![0xff, 0xc0]),
-                Transaction::write(0x48, vec![0x02, 0xe7, 0x00]),
-                Transaction::write_read(0x48, vec![0x02], vec![0xe7, 0x00]),
-                Transaction::write(0x48, vec![0x02, 0xc9, 0x00]),
-                Transaction::write_read(0x48, vec![0x02], vec![0xc9, 0x00]),
+                Transaction::write(0x48, vec![0x02, 0xc0, 0xff]),
+                Transaction::write_read(0x48, vec![0x02], vec![0xc0, 0xff]),
+                Transaction::write(0x48, vec![0x02, 0x00, 0xe7]),
+                Transaction::write_read(0x48, vec![0x02], vec![0x00, 0xe7]),
+                Transaction::write(0x48, vec![0x02, 0x00, 0xc9]),
+                Transaction::write_read(0x48, vec![0x02], vec![0x00, 0xc9]),
             ];
             let temps = [127.9375, 100.0, 80.0, 75.0, 50.0, 25.0, 0.25, 0.0, -0.25, -25.0, -55.0];
 
@@ -1157,13 +1157,13 @@ mod tests {
 
             // Sensor i2c bus mocks and expectations
             let i2c_expectations = vec![
-                Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
-                Transaction::write(0x48, vec![0x01, 0x26, 0x10]),
-                Transaction::write(0x48, vec![0x02, 0x19, 0x00]),
-                Transaction::write(0x48, vec![0x03, 0x50, 0x00]),
-                Transaction::write_read(0x48, vec![0x01], vec![0x26, 0x10]),
-                Transaction::write_read(0x48, vec![0x01], vec![0x26, 0x10]),
-                Transaction::write_read(0x48, vec![0x00], vec![0x50, 0x00]),
+                Transaction::write_read(0x48, vec![0x01], vec![0x10, 0x22]),
+                Transaction::write(0x48, vec![0x01, 0x10, 0x26]),
+                Transaction::write(0x48, vec![0x02, 0x00, 0x19]),
+                Transaction::write(0x48, vec![0x03, 0x00, 0x50]),
+                Transaction::write_read(0x48, vec![0x01], vec![0x10, 0x26]),
+                Transaction::write_read(0x48, vec![0x01], vec![0x10, 0x26]),
+                Transaction::write_read(0x48, vec![0x00], vec![0x00, 0x50]),
             ];
             let i2c_mock = Mock::new(&i2c_expectations);
 
