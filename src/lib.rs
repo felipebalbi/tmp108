@@ -7,6 +7,33 @@
 //! to the official [`Datasheet`].
 //!
 //! [`Datasheet`]: https://www.ti.com/lit/gpn/tmp108
+//!
+//! # Operational notes
+//!
+//! ## I²C bus ownership
+//!
+//! The driver assumes single-master ownership of the TMP108. Several
+//! methods (notably [`Tmp108::configure`], [`Tmp108::one_shot`], and
+//! [`Tmp108::shutdown`]) perform a read-modify-write on the
+//! configuration register as two distinct I²C transactions. On a
+//! multi-master bus, a second master writing to register `0x01`
+//! between the read and the write will silently lose those writes —
+//! the TMP108 has no register-level lock. In multi-master designs,
+//! serialise driver access at a higher level (e.g. a bus mutex around
+//! the entire driver, not just individual I²C transactions).
+//!
+//! ## Driver lifecycle on drop
+//!
+//! Dropping a [`Tmp108`] or [`AlertTmp108`] does **not** change the
+//! chip's operating mode. The chip retains whatever `M` bits were last
+//! written. If you want the chip to stop drawing current after the
+//! driver goes out of scope, call [`Tmp108::shutdown`] (or finish a
+//! [`Tmp108::continuous`] call cleanly) before dropping.
+//!
+//! In particular, dropping the future returned by
+//! [`Tmp108::continuous`] mid-flight (e.g. via `embassy_futures::select!`
+//! or `tokio::time::timeout`) leaves the chip in `Mode::Continuous`
+//! indefinitely. See the cancel-safety note on that method.
 
 #![doc(html_root_url = "https://docs.rs/tmp108/latest")]
 #![doc = include_str!("../README.md")]
@@ -261,7 +288,42 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
     }
 }
 
-/// Tmp108 asynchronous device driver (with alert pin)
+/// Async TMP108 driver with an ALERT GPIO pin attached.
+///
+/// Wraps a bare [`Tmp108`] with a pin implementing
+/// [`embedded_hal_async::digital::Wait`] (and
+/// [`embedded_hal::digital::InputPin`]), so it can implement
+/// [`embedded_sensors_hal_async::temperature::TemperatureThresholdWait`].
+///
+/// # Notes on alert behavior
+///
+/// The driver's [`wait_for_temperature_threshold`][1] implementation
+/// relies on the `embedded-hal-async` [`Wait`][2] trait contract:
+/// implementations must report transitions that occur between `Wait`
+/// calls (e.g. via a pending-edge / latched-interrupt mechanism in the
+/// MCU's GPIO controller). If the HAL implementation drops pending
+/// edges, the driver will miss them — this is a property of the HAL,
+/// not the driver.
+///
+/// The chip's `Polarity` (active-low vs active-high) is read from the
+/// configuration register on every call to `wait_for_temperature_threshold`.
+/// Do **not** reconfigure polarity while a `wait_for_temperature_threshold`
+/// future is pending — the awaiting future will continue to wait for the
+/// old polarity while the chip's ALERT output follows the new one.
+///
+/// In Comparator mode the ALERT pin remains asserted as long as the
+/// temperature is outside the `[TLow + HYS, THigh − HYS]` band; calling
+/// `wait_for_temperature_threshold` in a tight loop while the chip is
+/// still over-temperature will return immediately on every iteration
+/// (because [`wait_for_low`][3] / [`wait_for_high`][4] return
+/// immediately when the pin is already at the requested level). For
+/// repeated-trigger workflows prefer Interrupt mode, or apply
+/// application-level backoff between iterations.
+///
+/// [1]: embedded_sensors_hal_async::temperature::TemperatureThresholdWait::wait_for_temperature_threshold
+/// [2]: embedded_hal_async::digital::Wait
+/// [3]: embedded_hal_async::digital::Wait::wait_for_low
+/// [4]: embedded_hal_async::digital::Wait::wait_for_high
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
 pub struct AlertTmp108<
     I2C: embedded_hal_async::i2c::I2c,
@@ -423,6 +485,68 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
 )]
 impl<I2C: AsyncI2c> Tmp108<I2C> {
     const CELSIUS_PER_BIT: f32 = 0.0625;
+
+    /// Probe the chip's presence by reading the configuration register.
+    ///
+    /// The TMP108 does not expose a `WHO_AM_I` / device-ID register, so a
+    /// true identity probe is impossible. This method does the next-best
+    /// thing: it reads the configuration register and reports whether
+    /// the value matches the chip's documented power-on reset (POR)
+    /// value `0x1022`. Useful immediately after power-on to confirm the
+    /// chip is freshly out of reset and on the bus.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)` — the read succeeded and the configuration register
+    ///   matches the POR value. Strong evidence the chip is present and
+    ///   has not yet been reconfigured.
+    /// - `Ok(false)` — the read succeeded but the configuration differs
+    ///   from POR. Still strong evidence the chip is present (it `ACKed`
+    ///   and returned plausible register data) but it was already
+    ///   reconfigured since power-on. False negatives are unavoidable on
+    ///   any boot path where the chip was configured before this method
+    ///   ran.
+    /// - `Err(_)` — the I2C read failed. Most likely cause is that no
+    ///   chip is present at the expected address (NACK), but any bus
+    ///   error reports here as well.
+    ///
+    /// # Errors
+    ///
+    /// `I2C::Error` when the I2C read fails.
+    ///
+    /// (Doctest runs against the blocking API; the async variant has the same
+    /// shape with `.await` after the call.)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
+    /// # #[cfg(feature = "async")] fn main() {}
+    /// # #[cfg(not(feature = "async"))]
+    /// # fn main() {
+    /// use tmp108::Tmp108;
+    /// // Chip returns the POR configuration -> probe() reports true.
+    /// let i2c = Mock::new(&[
+    ///     Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
+    /// ]);
+    /// let mut tmp = Tmp108::new_with_a0_gnd(i2c);
+    /// assert!(tmp.probe().unwrap());
+    /// # let mut i2c = tmp.destroy();
+    /// # i2c.done();
+    /// # }
+    /// ```
+    pub async fn probe(&mut self) -> Result<bool, I2C::Error> {
+        /// TMP108 configuration register reset value, per the datasheet.
+        const POR: u16 = 0x1022;
+
+        #[cfg(feature = "async")]
+        let raw = self.inner.configuration().read_async().await?;
+
+        #[cfg(not(feature = "async"))]
+        let raw = self.inner.configuration().read()?;
+
+        Ok(u16::from_le_bytes(raw.into()) == POR)
+    }
 
     /// Read configuration register
     ///
@@ -643,11 +767,33 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
     }
 
     #[cfg(feature = "async")]
-    /// Initiate continuous conversions
+    /// Initiate continuous conversions.
+    ///
+    /// Switches the chip into [`Mode::Continuous`], runs the user-supplied
+    /// closure, and unconditionally returns the chip to [`Mode::Shutdown`]
+    /// before returning, **regardless of whether the closure succeeded or
+    /// failed**. This ensures the chip is not left burning current after
+    /// a transient bus failure inside the closure.
+    ///
+    /// # Cancel-safety
+    ///
+    /// **The returned future is *not* cancel-safe.** If it is dropped
+    /// before completion (e.g. by `embassy_futures::select!`,
+    /// `tokio::time::timeout`, or a task cancellation), the chip is left
+    /// in [`Mode::Continuous`] and will continue to draw current
+    /// indefinitely. Callers that need cancellation must structure their
+    /// own recovery, for example by calling
+    /// [`shutdown`][Self::shutdown] after a cancelled call.
     ///
     /// # Errors
     ///
-    /// `I2C::Error` when the I2C transaction fails
+    /// - If the closure returns `Err(e)`, the cleanup `shutdown()` still
+    ///   runs but its result is discarded; the closure's error is
+    ///   returned.
+    /// - If the closure returns `Ok(())` and the cleanup `shutdown()`
+    ///   fails, that I2C error is returned.
+    /// - If the initial transition into `Mode::Continuous` fails, the
+    ///   closure is not invoked and the I2C error is returned.
     ///
     /// # Examples
     ///
@@ -683,18 +829,51 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
             .modify_async(|r| r.set_m(Mode::Continuous))
             .await?;
 
-        f(self).await?;
-        self.shutdown().await
+        // Run the user closure and capture its result, but always attempt
+        // shutdown afterwards so the chip is not left in Continuous mode.
+        // The closure's error takes precedence over a shutdown failure:
+        // the user's failure is the actionable signal, the cleanup error
+        // is a secondary symptom.
+        let user_result = f(self).await;
+        let cleanup_result = self.shutdown().await;
+        user_result.and(cleanup_result)
     }
 
-    /// Wait for conversion to complete. This method will block for the amount
-    /// of time dictated by the CR bits in the `Configuration` register.
-    /// Caller is required to call this method from within their continuous
-    /// conversion closure.
+    /// Wait one conversion period, then read the temperature register.
+    ///
+    /// Reads the configuration register to discover the current
+    /// [`ConversionRate`], delays for one period (1/CR), and then reads
+    /// the temperature register. Intended for callers driving the chip
+    /// in [`Mode::Continuous`] (typically from inside a
+    /// [`continuous`][Self::continuous] closure) who want to align
+    /// reads with the chip's conversion cadence.
+    ///
+    /// # Stale-reading on first call
+    ///
+    /// The TMP108's conversion period (1/CR — 4 s, 1 s, 250 ms, or
+    /// 62.5 ms) is **not** the same as its conversion **time** (~30 ms
+    /// regardless of CR). After entering [`Mode::Continuous`] the chip's
+    /// next conversion is not phase-aligned with when you enabled it,
+    /// so the first call to this method may return the previous
+    /// conversion result. For "guaranteed fresh" semantics, use
+    /// [`one_shot`][Self::one_shot] followed by a delay of one period
+    /// and a [`temperature`][Self::temperature] read, or discard the
+    /// first reading after entering Continuous.
+    ///
+    /// # I²C cost per call
+    ///
+    /// Each call performs **two** I²C transactions: a configuration
+    /// read (to determine the CR) and a temperature read. Callers in
+    /// power- or bandwidth-sensitive loops who know they will not
+    /// change CR can avoid the per-call configuration read by calling
+    /// [`read_configuration`][Self::read_configuration] once, computing
+    /// the period delay themselves, and calling
+    /// [`temperature`][Self::temperature] directly.
     ///
     /// # Errors
     ///
-    /// `I2C::Error` when the I2C transaction fails
+    /// `I2C::Error` when either the configuration read or the
+    /// temperature read fails.
     ///
     /// (Doctest runs against the blocking API; the async variant has the same
     /// shape with `.await` after the calls.)
@@ -774,7 +953,10 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
     ///
     /// # Errors
     ///
-    /// `I2C::Error` when the I2C transaction fails
+    /// - `Error::InvalidInput` if `limit` is NaN, ±∞, or outside
+    ///   `[-128.0, 127.9375] °C` (the representable range of the chip's
+    ///   12-bit fixed-point limit register).
+    /// - `Error::Bus` when the I2C transaction fails.
     ///
     /// (Doctest runs against the blocking API; the async variant has the same
     /// shape with `.await` after the call.)
@@ -796,14 +978,18 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
     /// # i2c.done();
     /// # }
     /// ```
-    pub async fn set_low_limit(&mut self, limit: f32) -> Result<(), I2C::Error> {
-        let raw = Self::to_raw(limit).to_be_bytes();
+    pub async fn set_low_limit(&mut self, limit: f32) -> Result<(), Error<I2C::Error>> {
+        let raw = Self::to_raw(limit).ok_or(Error::InvalidInput)?.to_be_bytes();
 
         #[cfg(feature = "async")]
-        self.inner.t_low().write_async(|r| *r = TLow::from(raw)).await?;
+        self.inner
+            .t_low()
+            .write_async(|r| *r = TLow::from(raw))
+            .await
+            .map_err(Error::Bus)?;
 
         #[cfg(not(feature = "async"))]
-        self.inner.t_low().write(|r| *r = TLow::from(raw))?;
+        self.inner.t_low().write(|r| *r = TLow::from(raw)).map_err(Error::Bus)?;
 
         Ok(())
     }
@@ -848,7 +1034,10 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
     ///
     /// # Errors
     ///
-    /// `I2C::Error` when the I2C transaction fails
+    /// - `Error::InvalidInput` if `limit` is NaN, ±∞, or outside
+    ///   `[-128.0, 127.9375] °C` (the representable range of the chip's
+    ///   12-bit fixed-point limit register).
+    /// - `Error::Bus` when the I2C transaction fails.
     ///
     /// (Doctest runs against the blocking API; the async variant has the same
     /// shape with `.await` after the call.)
@@ -870,25 +1059,58 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
     /// # i2c.done();
     /// # }
     /// ```
-    pub async fn set_high_limit(&mut self, limit: f32) -> Result<(), I2C::Error> {
-        let raw = Self::to_raw(limit).to_be_bytes();
+    pub async fn set_high_limit(&mut self, limit: f32) -> Result<(), Error<I2C::Error>> {
+        let raw = Self::to_raw(limit).ok_or(Error::InvalidInput)?.to_be_bytes();
 
         #[cfg(feature = "async")]
-        self.inner.t_high().write_async(|r| *r = THigh::from(raw)).await?;
+        self.inner
+            .t_high()
+            .write_async(|r| *r = THigh::from(raw))
+            .await
+            .map_err(Error::Bus)?;
 
         #[cfg(not(feature = "async"))]
-        self.inner.t_high().write(|r| *r = THigh::from(raw))?;
+        self.inner
+            .t_high()
+            .write(|r| *r = THigh::from(raw))
+            .map_err(Error::Bus)?;
 
         Ok(())
     }
 
     fn to_celsius(t: i16) -> f32 {
-        f32::from(t / 16) * Self::CELSIUS_PER_BIT
+        // Per the datasheet the temperature and limit registers are
+        // left-aligned 12-bit signed values: the LSB is the bit at
+        // position 4 (0.0625 °C/LSB) and bits 3..0 are reserved=0.
+        // Compute the conversion as a single multiplication by
+        // CELSIUS_PER_BIT/16 (== 1/256 = 0.003_906_25, exactly
+        // representable in f32) instead of dividing by 16 first via
+        // integer division.
+        //
+        // For datasheet-conforming inputs (bits 3..0 == 0) this returns
+        // exactly the same f32 as before. For any non-zero low bits it
+        // returns the correct value instead of truncating toward zero
+        // (which was asymmetric for negative inputs).
+        f32::from(t) * (Self::CELSIUS_PER_BIT / 16.0)
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    fn to_raw(t: f32) -> i16 {
-        (t * 16.0 / Self::CELSIUS_PER_BIT) as i16
+    /// Convert a temperature in degrees Celsius to the raw 12-bit signed
+    /// fixed-point representation used by the chip's TLow/THigh registers.
+    ///
+    /// Returns `None` for inputs that are NaN, ±∞, or outside the
+    /// representable range `[-128.0, 127.9375] °C`.
+    fn to_raw(t: f32) -> Option<i16> {
+        // i16 representable range divided by the 16x scale factor.
+        const MIN: f32 = -128.0;
+        const MAX: f32 = 127.937_5;
+
+        if !t.is_finite() || !(MIN..=MAX).contains(&t) {
+            return None;
+        }
+
+        // Range-checked above; this cast cannot truncate.
+        #[allow(clippy::cast_possible_truncation)]
+        Some((t * 16.0 / Self::CELSIUS_PER_BIT) as i16)
     }
 }
 
@@ -957,18 +1179,26 @@ impl<I2C: AsyncI2c> AsyncRegisterInterface for Interface<I2C> {
 }
 
 /// Tmp108 Errors
+///
+/// The `E` parameter is the underlying I2C error type. The `P` parameter
+/// is the error type of an optional ALERT GPIO pin; it defaults to
+/// [`core::convert::Infallible`] so bare [`Tmp108`] (which has no pin)
+/// uses `Error<I2C::Error>` and never produces a [`Pin`][Self::Pin]
+/// error. [`AlertTmp108`] specializes to
+/// `Error<I2C::Error, ALERT::Error>` and uses the [`Pin`][Self::Pin]
+/// variant when the GPIO peripheral fails.
 #[derive(Debug)]
-pub enum Error<E: embedded_hal::i2c::Error> {
-    /// I2C Bus Error
+pub enum Error<E: embedded_hal::i2c::Error, P: embedded_hal::digital::Error = core::convert::Infallible> {
+    /// I2C bus error.
     Bus(E),
-    /// Invalid Input Error
+    /// Input failed validation (out of range, NaN, ±∞, unsupported value).
     InvalidInput,
-    /// Other Error
-    Other,
+    /// ALERT pin GPIO error.
+    Pin(P),
 }
 
 #[cfg(all(feature = "embedded-sensors-hal", not(feature = "async")))]
-impl<E: embedded_hal::i2c::Error> embedded_sensors_hal::sensor::Error for Error<E> {
+impl<E: embedded_hal::i2c::Error, P: embedded_hal::digital::Error> embedded_sensors_hal::sensor::Error for Error<E, P> {
     fn kind(&self) -> embedded_sensors_hal::sensor::ErrorKind {
         embedded_sensors_hal::sensor::ErrorKind::Other
     }
@@ -987,7 +1217,9 @@ impl<I2C: embedded_hal::i2c::I2c> embedded_sensors_hal::temperature::Temperature
 }
 
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
-impl<E: embedded_hal_async::i2c::Error> embedded_sensors_hal_async::sensor::Error for Error<E> {
+impl<E: embedded_hal_async::i2c::Error, P: embedded_hal::digital::Error> embedded_sensors_hal_async::sensor::Error
+    for Error<E, P>
+{
     fn kind(&self) -> embedded_sensors_hal_async::sensor::ErrorKind {
         embedded_sensors_hal_async::sensor::ErrorKind::Other
     }
@@ -1009,7 +1241,7 @@ impl<I2C: embedded_hal_async::i2c::I2c> embedded_sensors_hal_async::temperature:
 impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait + embedded_hal::digital::InputPin>
     embedded_sensors_hal_async::sensor::ErrorType for AlertTmp108<I2C, ALERT>
 {
-    type Error = Error<I2C::Error>;
+    type Error = Error<I2C::Error, <ALERT as embedded_hal::digital::ErrorType>::Error>;
 }
 
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
@@ -1029,14 +1261,14 @@ impl<I2C: embedded_hal_async::i2c::I2c> embedded_sensors_hal_async::temperature:
         &mut self,
         threshold: embedded_sensors_hal_async::temperature::DegreesCelsius,
     ) -> Result<(), Self::Error> {
-        self.set_low_limit(threshold).await.map_err(Error::Bus)
+        self.set_low_limit(threshold).await
     }
 
     async fn set_temperature_threshold_high(
         &mut self,
         threshold: embedded_sensors_hal_async::temperature::DegreesCelsius,
     ) -> Result<(), Self::Error> {
-        self.set_high_limit(threshold).await.map_err(Error::Bus)
+        self.set_high_limit(threshold).await
     }
 }
 
@@ -1048,14 +1280,16 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
         &mut self,
         threshold: embedded_sensors_hal_async::temperature::DegreesCelsius,
     ) -> Result<(), Self::Error> {
-        self.tmp108.set_low_limit(threshold).await.map_err(Error::Bus)
+        // Bare-Tmp108 set_*_limit returns Error<I2C::Error>; widen the Pin
+        // type parameter to the AlertTmp108-flavored Error.
+        self.tmp108.set_low_limit(threshold).await.map_err(widen_pin_err)
     }
 
     async fn set_temperature_threshold_high(
         &mut self,
         threshold: embedded_sensors_hal_async::temperature::DegreesCelsius,
     ) -> Result<(), Self::Error> {
-        self.tmp108.set_high_limit(threshold).await.map_err(Error::Bus)
+        self.tmp108.set_high_limit(threshold).await.map_err(widen_pin_err)
     }
 }
 
@@ -1077,10 +1311,10 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
             // ALERT pin only resets when temperature falls within the range of (Tlow + HYS) and
             // (Thigh - HYS).
             (Thermostat::Comparator, Polarity::ActiveLow) => {
-                self.alert.wait_for_low().await.map_err(|_| Error::Other)?;
+                self.alert.wait_for_low().await.map_err(Error::Pin)?;
             }
             (Thermostat::Comparator, Polarity::ActiveHigh) => {
-                self.alert.wait_for_high().await.map_err(|_| Error::Other)?;
+                self.alert.wait_for_high().await.map_err(Error::Pin)?;
             }
 
             // In interrupt mode, the ALERT pin is immediately reset (by reading config register)
@@ -1089,11 +1323,11 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
             // If called in a loop, next iteration would wait even if temperature remains outside
             // threshold.
             (Thermostat::Interrupt, Polarity::ActiveLow) => {
-                self.alert.wait_for_falling_edge().await.map_err(|_| Error::Other)?;
+                self.alert.wait_for_falling_edge().await.map_err(Error::Pin)?;
                 let _ = self.tmp108.read_configuration().await.map_err(Error::Bus)?;
             }
             (Thermostat::Interrupt, Polarity::ActiveHigh) => {
-                self.alert.wait_for_rising_edge().await.map_err(|_| Error::Other)?;
+                self.alert.wait_for_rising_edge().await.map_err(Error::Pin)?;
                 let _ = self.tmp108.read_configuration().await.map_err(Error::Bus)?;
             }
         }
@@ -1110,24 +1344,40 @@ impl<I2C: embedded_hal_async::i2c::I2c> embedded_sensors_hal_async::temperature:
         &mut self,
         hysteresis: embedded_sensors_hal_async::temperature::DegreesCelsius,
     ) -> Result<(), Self::Error> {
-        // Trait method takes a continuous range of f32 values as argument, but internally driver
-        // only accepts 4 discrete values for hysteresis.
+        // The trait method takes a continuous range of f32 °C values, but
+        // the chip only supports four discrete hysteresis settings:
+        // 0, 1, 2, and 4 °C. Snap the input to the nearest legal value
+        // within a tolerance band of 0.05 °C; reject anything outside the
+        // band (and any non-finite input) with `Error::InvalidInput`.
         //
-        // We ensure only a correct value for hysteresis is passed in, and return error otherwise.
-        let hysteresis = if (hysteresis - 0.0).abs() < f32::EPSILON {
-            Hysteresis::_0C
-        } else if (hysteresis - 1.0).abs() < f32::EPSILON {
-            Hysteresis::_1C
-        } else if (hysteresis - 2.0).abs() < f32::EPSILON {
-            Hysteresis::_2C
-        } else if (hysteresis - 4.0).abs() < f32::EPSILON {
-            Hysteresis::_4C
-        } else {
-            return Err(Error::InvalidInput);
-        };
+        // The tolerance is generous enough to absorb ordinary float
+        // arithmetic (e.g. 0.1 + 0.9 rounding away from 1.0) while still
+        // surfacing genuinely unsupported requests like 3.0 °C.
+        const HYS_VALUES: &[(f32, Hysteresis)] = &[
+            (0.0, Hysteresis::_0C),
+            (1.0, Hysteresis::_1C),
+            (2.0, Hysteresis::_2C),
+            (4.0, Hysteresis::_4C),
+        ];
+        const HYS_TOLERANCE: f32 = 0.05;
 
-        let mut config = self.read_configuration().await.map_err(|_| Error::Other)?;
-        config.hysteresis = hysteresis;
+        if !hysteresis.is_finite() {
+            return Err(Error::InvalidInput);
+        }
+
+        // HYS_VALUES is non-empty so min_by always returns Some.
+        let (closest, snapped) = HYS_VALUES
+            .iter()
+            .copied()
+            .min_by(|(a, _), (b, _)| (hysteresis - a).abs().total_cmp(&(hysteresis - b).abs()))
+            .expect("HYS_VALUES is non-empty");
+
+        if (hysteresis - closest).abs() > HYS_TOLERANCE {
+            return Err(Error::InvalidInput);
+        }
+
+        let mut config = self.read_configuration().await.map_err(Error::Bus)?;
+        config.hysteresis = snapped;
         self.configure(config).await.map_err(Error::Bus)
     }
 }
@@ -1140,7 +1390,24 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
         &mut self,
         hysteresis: embedded_sensors_hal_async::temperature::DegreesCelsius,
     ) -> Result<(), Self::Error> {
-        self.tmp108.set_temperature_threshold_hysteresis(hysteresis).await
+        self.tmp108
+            .set_temperature_threshold_hysteresis(hysteresis)
+            .await
+            .map_err(widen_pin_err)
+    }
+}
+
+/// Widen an `Error<E>` (with Pin = Infallible) to `Error<E, P>` for any
+/// `P`. Used by the `AlertTmp108` trait impls that delegate to bare
+/// `Tmp108` methods (which cannot themselves produce a `Pin` error).
+#[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
+fn widen_pin_err<E: embedded_hal_async::i2c::Error, P: embedded_hal::digital::Error>(
+    e: Error<E, core::convert::Infallible>,
+) -> Error<E, P> {
+    match e {
+        Error::Bus(e) => Error::Bus(e),
+        Error::InvalidInput => Error::InvalidInput,
+        Error::Pin(never) => match never {},
     }
 }
 
@@ -1240,7 +1507,6 @@ mod tests {
             assert_eq!(tmp.addr(), 0x48);
             let mut mock = tmp.destroy();
             mock.done();
-
             let mock = Mock::new(&expectations);
             let tmp = Tmp108::new_with_a0_vplus(mock);
             assert_eq!(tmp.addr(), 0x49);
@@ -1415,6 +1681,98 @@ mod tests {
                 let temp = result.unwrap();
                 assert_approx_eq!(temp, *t, 1e-4);
             }
+
+            let mut mock = tmp108.destroy();
+            mock.done();
+        }
+
+        #[test]
+        fn reject_invalid_set_limit_inputs() {
+            // No I2C transactions are expected; out-of-range / non-finite
+            // inputs must be rejected before any bus traffic.
+            let mock = Mock::new(&[]);
+            let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
+
+            // Values just outside the representable [-128.0, 127.9375] range.
+            for bad in [128.0_f32, 127.940_f32, -128.001_f32, -200.0_f32, 200.0_f32] {
+                assert!(matches!(tmp108.set_low_limit(bad), Err(Error::InvalidInput)));
+                assert!(matches!(tmp108.set_high_limit(bad), Err(Error::InvalidInput)));
+            }
+
+            // Non-finite values.
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                assert!(matches!(tmp108.set_low_limit(bad), Err(Error::InvalidInput)));
+                assert!(matches!(tmp108.set_high_limit(bad), Err(Error::InvalidInput)));
+            }
+
+            let mut mock = tmp108.destroy();
+            mock.done();
+        }
+
+        #[test]
+        fn to_celsius_is_symmetric_around_zero() {
+            // For datasheet-conforming inputs (bits 3..0 == 0) the
+            // conversion is identical to the previous integer-division
+            // implementation. For inputs with non-zero low bits the new
+            // implementation no longer truncates toward zero, which was
+            // asymmetric for negative values.
+            //
+            // 0xFFFF as i16 = -1. Old code: f32::from(-1 / 16) * 0.0625 =
+            // f32::from(0) * 0.0625 = 0.0. New code: f32::from(-1) *
+            // (0.0625 / 16.0) = -0.003_906_25.
+            let cases: &[(i16, f32)] = &[
+                (0x0000, 0.0),
+                (0x0010, 0.0625),
+                (0xFFF0_u16 as i16, -0.0625),
+                (0x7FF0, 127.9375),
+                (0xC900_u16 as i16, -55.0),
+                // Non-zero low bits: symmetric resolution.
+                (0x0001, 0.003_906_25),
+                (0xFFFF_u16 as i16, -0.003_906_25),
+            ];
+            for (raw, expected) in cases {
+                let got = Tmp108::<Mock>::to_celsius(*raw);
+                assert_approx_eq!(got, *expected, 1e-5);
+            }
+        }
+
+        #[test]
+        fn probe_returns_true_for_por_value() {
+            // Configuration register at 0x01 returns the POR value 0x1022.
+            // The register layout is little-endian per tmp108.toml so the
+            // wire bytes are [0x22, 0x10].
+            let expectations = vec![Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10])];
+            let mock = Mock::new(&expectations);
+            let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
+
+            assert_eq!(tmp108.probe(), Ok(true));
+
+            let mut mock = tmp108.destroy();
+            mock.done();
+        }
+
+        #[test]
+        fn probe_returns_false_for_non_por_value() {
+            // Chip is present (ACKs) but has been reconfigured.
+            let expectations = vec![Transaction::write_read(0x48, vec![0x01], vec![0x66, 0xb0])];
+            let mock = Mock::new(&expectations);
+            let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
+
+            assert_eq!(tmp108.probe(), Ok(false));
+
+            let mut mock = tmp108.destroy();
+            mock.done();
+        }
+
+        #[test]
+        fn probe_propagates_bus_error() {
+            let expectations = vec![Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]).with_error(
+                embedded_hal::i2c::ErrorKind::NoAcknowledge(embedded_hal::i2c::NoAcknowledgeSource::Address),
+            )];
+            let mock = Mock::new(&expectations);
+            let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
+
+            assert!(tmp108.probe().is_err());
 
             let mut mock = tmp108.destroy();
             mock.done();
@@ -1617,6 +1975,125 @@ mod tests {
             mock.done();
         }
 
+        #[tokio::test]
+        async fn reject_invalid_set_limit_inputs() {
+            // No I2C transactions are expected; out-of-range / non-finite
+            // inputs must be rejected before any bus traffic.
+            let mock = Mock::new(&[]);
+            let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
+
+            // Values just outside the representable [-128.0, 127.9375] range.
+            for bad in [128.0_f32, 127.940_f32, -128.001_f32, -200.0_f32, 200.0_f32] {
+                assert!(matches!(tmp108.set_low_limit(bad).await, Err(Error::InvalidInput)));
+                assert!(matches!(tmp108.set_high_limit(bad).await, Err(Error::InvalidInput)));
+            }
+
+            // Non-finite values.
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                assert!(matches!(tmp108.set_low_limit(bad).await, Err(Error::InvalidInput)));
+                assert!(matches!(tmp108.set_high_limit(bad).await, Err(Error::InvalidInput)));
+            }
+
+            let mut mock = tmp108.destroy();
+            mock.done();
+        }
+
+        #[tokio::test]
+        async fn probe_returns_true_for_por_value() {
+            let expectations = vec![Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10])];
+            let mock = Mock::new(&expectations);
+            let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
+
+            assert_eq!(tmp108.probe().await, Ok(true));
+
+            let mut mock = tmp108.destroy();
+            mock.done();
+        }
+
+        #[tokio::test]
+        async fn probe_returns_false_for_non_por_value() {
+            let expectations = vec![Transaction::write_read(0x48, vec![0x01], vec![0x66, 0xb0])];
+            let mock = Mock::new(&expectations);
+            let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
+
+            assert_eq!(tmp108.probe().await, Ok(false));
+
+            let mut mock = tmp108.destroy();
+            mock.done();
+        }
+
+        #[tokio::test]
+        async fn continuous_runs_shutdown_when_closure_returns_err() {
+            // Expectations:
+            //  1. Enter Continuous: read cfg, write cfg with M=Continuous.
+            //  2. Closure causes one temperature read that returns a bus error.
+            //  3. Cleanup must still run: read cfg, write cfg with M=Shutdown.
+            //
+            // If the cleanup is skipped (the pre-fix behavior) the mock will
+            // panic at destroy() because the last two expectations were not
+            // consumed.
+            let expectations = vec![
+                Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
+                Transaction::write(0x48, vec![0x01, 0x22, 0x10]),
+                Transaction::write_read(0x48, vec![0x00], vec![0x32, 0x00])
+                    .with_error(embedded_hal::i2c::ErrorKind::Other),
+                Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
+                Transaction::write(0x48, vec![0x01, 0x20, 0x10]),
+            ];
+            let mock = Mock::new(&expectations);
+            let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
+
+            let result = tmp108
+                .continuous(async |t| {
+                    let _ = t.temperature().await?;
+                    Ok(())
+                })
+                .await;
+
+            // The closure's error must be propagated (closure error wins
+            // over shutdown success).
+            assert!(result.is_err());
+
+            // All five expected transactions consumed -> the cleanup
+            // shutdown ran.
+            let mut mock = tmp108.destroy();
+            mock.done();
+        }
+
+        #[tokio::test]
+        async fn continuous_returns_closure_error_when_shutdown_also_fails() {
+            use embedded_hal_async::i2c::Error as _;
+
+            // Closure fails AND shutdown fails. The closure's error must win.
+            let closure_err = embedded_hal::i2c::ErrorKind::Bus;
+            let shutdown_err = embedded_hal::i2c::ErrorKind::ArbitrationLoss;
+
+            let expectations = vec![
+                // Enter Continuous.
+                Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
+                Transaction::write(0x48, vec![0x01, 0x22, 0x10]),
+                // Closure errors.
+                Transaction::write_read(0x48, vec![0x00], vec![0x32, 0x00]).with_error(closure_err),
+                // Shutdown read errors too.
+                Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]).with_error(shutdown_err),
+            ];
+            let mock = Mock::new(&expectations);
+            let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
+
+            let result = tmp108
+                .continuous(async |t| {
+                    let _ = t.temperature().await?;
+                    Ok(())
+                })
+                .await;
+
+            // Must propagate the closure error, not the shutdown error.
+            assert_eq!(result.err().map(|e| e.kind()), Some(closure_err));
+
+            let mut mock = tmp108.destroy();
+            mock.done();
+        }
+
         #[cfg(feature = "embedded-sensors-hal-async")]
         #[tokio::test]
         async fn handle_threshold_alerts_properly() {
@@ -1664,6 +2141,140 @@ mod tests {
             // Check that recently sampled temperature is returned
             let temp = result.unwrap();
             assert_approx_eq!(temp, 80.0, 1e-4);
+
+            let (mut i2c_mock, mut pin_mock) = tmp108.destroy();
+            i2c_mock.done();
+            pin_mock.done();
+        }
+
+        #[cfg(feature = "embedded-sensors-hal-async")]
+        #[tokio::test]
+        async fn hysteresis_snaps_within_tolerance() {
+            use embedded_sensors_hal_async::temperature::TemperatureHysteresis;
+
+            // For each legal value, every input within 0.05 °C must
+            // succeed and program the corresponding chip setting (no I2C
+            // mismatch). Each acceptance path performs: read cfg, write cfg.
+            //
+            // - 0.0 °C snaps to Hysteresis::_0C => HYS bits 0b00 => cfg word 0x0022 -> bytes [0x22, 0x00]
+            // - 1.0 °C snaps to Hysteresis::_1C => HYS bits 0b01 => cfg word 0x1022 -> bytes [0x22, 0x10]
+            // - 2.0 °C snaps to Hysteresis::_2C => HYS bits 0b10 => cfg word 0x2022 -> bytes [0x22, 0x20]
+            // - 4.0 °C snaps to Hysteresis::_4C => HYS bits 0b11 => cfg word 0x3022 -> bytes [0x22, 0x30]
+            //
+            // For each accepted input we expect: write-read of cfg, then a
+            // write of the new cfg. The chip's POR is 0x1022 (HYS=01).
+            let cases: &[(f32, [u8; 2])] = &[
+                // Exact-match accepted values.
+                (0.0, [0x22, 0x00]),
+                (1.0, [0x22, 0x10]),
+                (2.0, [0x22, 0x20]),
+                (4.0, [0x22, 0x30]),
+                // Within-tolerance inputs that previously failed under
+                // f32::EPSILON snapping.
+                (0.04_f32, [0x22, 0x00]),
+                (1.000_000_1_f32, [0x22, 0x10]),
+                (0.1_f32 + 0.9_f32, [0x22, 0x10]),
+                (1.95_f32, [0x22, 0x20]),
+                (3.97_f32, [0x22, 0x30]),
+            ];
+
+            // Each accepted input triggers:
+            //   1. read_configuration() in the hysteresis impl: write_read
+            //   2. configure() -> modify (read-modify-write): write_read + write
+            // The current cfg byte stream is the chip's POR value 0x1022 ->
+            // [0x22, 0x10]. After snapping the result is reflected in the
+            // HYS bits of the final write.
+            let mut expectations = Vec::new();
+            for (_, written) in cases {
+                // read_configuration
+                expectations.push(Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]));
+                // configure -> modify: read
+                expectations.push(Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]));
+                // configure -> modify: write
+                expectations.push(Transaction::write(0x48, vec![0x01, written[0], written[1]]));
+            }
+
+            let mock = Mock::new(&expectations);
+            let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
+
+            for (input, _) in cases {
+                let r = tmp108.set_temperature_threshold_hysteresis(*input).await;
+                assert!(r.is_ok(), "input {input} should be accepted");
+            }
+
+            let mut mock = tmp108.destroy();
+            mock.done();
+        }
+
+        #[cfg(feature = "embedded-sensors-hal-async")]
+        #[tokio::test]
+        async fn hysteresis_rejects_out_of_tolerance_and_non_finite() {
+            use embedded_sensors_hal_async::temperature::TemperatureHysteresis;
+
+            // No I2C transactions expected; out-of-tolerance and non-finite
+            // inputs must be rejected before any bus traffic.
+            let mock = Mock::new(&[]);
+            let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
+
+            for bad in [-0.5_f32, 0.5_f32, 3.0_f32, 5.0_f32, -1.0_f32, 10.0_f32] {
+                let r = tmp108.set_temperature_threshold_hysteresis(bad).await;
+                assert!(
+                    matches!(r, Err(Error::InvalidInput)),
+                    "input {bad} should be rejected as InvalidInput, got {r:?}"
+                );
+            }
+
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let r = tmp108.set_temperature_threshold_hysteresis(bad).await;
+                assert!(
+                    matches!(r, Err(Error::InvalidInput)),
+                    "input {bad} should be rejected as InvalidInput, got {r:?}"
+                );
+            }
+
+            let mut mock = tmp108.destroy();
+            mock.done();
+        }
+
+        #[cfg(feature = "embedded-sensors-hal-async")]
+        #[tokio::test]
+        async fn alert_pin_error_is_propagated_as_error_pin() {
+            use embedded_hal_mock::eh1::{MockError, digital};
+            use embedded_sensors_hal_async::temperature::TemperatureThresholdWait;
+
+            // Configure for Interrupt + ActiveLow so wait_for_falling_edge
+            // is the gating operation. The pin then errors; the driver
+            // must surface the GPIO error via Error::Pin(_), not swallow
+            // it (the pre-fix behavior collapsed all GPIO failures to
+            // Error::Other).
+            let i2c_expectations = vec![
+                // configure: read + write
+                Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
+                Transaction::write(0x48, vec![0x01, 0x26, 0x10]),
+                // wait_for_temperature_threshold reads cfg first
+                Transaction::write_read(0x48, vec![0x01], vec![0x26, 0x10]),
+            ];
+            let i2c_mock = Mock::new(&i2c_expectations);
+
+            let pin_err = MockError::Io(std::io::ErrorKind::Other);
+            let pin_expectations =
+                vec![digital::Transaction::wait_for_edge(digital::Edge::Falling).with_error(pin_err.clone())];
+            let pin_mock = digital::Mock::new(&pin_expectations);
+
+            let mut tmp108 = AlertTmp108::new_with_a0_gnd(i2c_mock, pin_mock);
+
+            let cfg = Config {
+                thermostat_mode: Thermostat::Interrupt,
+                alert_polarity: Polarity::ActiveLow,
+                ..Default::default()
+            };
+            tmp108.tmp108.configure(cfg).await.unwrap();
+
+            let result = tmp108.wait_for_temperature_threshold().await;
+            match result {
+                Err(Error::Pin(e)) => assert_eq!(e, pin_err),
+                other => panic!("expected Error::Pin, got {other:?}"),
+            }
 
             let (mut i2c_mock, mut pin_mock) = tmp108.destroy();
             i2c_mock.done();
