@@ -14,7 +14,7 @@ async fn main() -> Result<()> {
         .temperature()
         .await
         .map_err(|_| anyhow!("Failed to read temperature"))?;
-    println!("Temperature: {temperature:.2} C");
+    println!("Temperature: {temperature:.4} C");
 
     Ok(())
 }

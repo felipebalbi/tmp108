@@ -29,7 +29,7 @@ ensure that an invalid address is not attempted.
 ```rust
 use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
 use tmp108::blocking::Tmp108;
-use tmp108::{Config, ConversionRate, Hysteresis, Polarity, Thermostat};
+use tmp108::{Celsius, Config, ConversionRate, Hysteresis, Polarity, Thermostat};
 
 # fn main() -> Result<(), embedded_hal::i2c::ErrorKind> {
 # let expectations = [
@@ -61,8 +61,14 @@ config.hysteresis = Hysteresis::FourC;
 
 tmp.configure(config)?;
 
-tmp.set_low_limit(26.5)?;
-tmp.set_high_limit(48.0)?;
+// Thresholds are parsed once, into a type the part can actually store.
+// Out-of-range values and NaN are rejected here rather than silently
+// truncated into a bogus trip point.
+let low = Celsius::try_from_degrees(26.5).expect("26.5 C is representable");
+let high = Celsius::try_from_degrees(48.0).expect("48 C is representable");
+
+tmp.set_low_limit(low)?;
+tmp.set_high_limit(high)?;
 
 let temperature = tmp.temperature()?;
 println!("Temperature: {temperature:.2} C");

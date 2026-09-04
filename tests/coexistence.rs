@@ -12,13 +12,13 @@ async fn blocking_and_async_drivers_coexist() {
 
     let mut blocking = tmp108::blocking::Tmp108::new_with_a0_gnd(Mock::new(&expectations));
     let temperature = blocking.temperature().unwrap();
-    assert!((temperature - 25.0).abs() < 1e-4);
+    assert_eq!(temperature, tmp108::Celsius::try_from_degrees(25.0).unwrap());
     let mut mock = blocking.destroy();
     mock.done();
 
     let mut asynchronous = tmp108::asynch::Tmp108::new_with_a0_gnd(Mock::new(&expectations));
     let temperature = asynchronous.temperature().await.unwrap();
-    assert!((temperature - 25.0).abs() < 1e-4);
+    assert_eq!(temperature, tmp108::Celsius::try_from_degrees(25.0).unwrap());
     let mut mock = asynchronous.destroy();
     mock.done();
 }

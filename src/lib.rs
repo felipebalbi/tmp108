@@ -23,7 +23,9 @@ mod interface;
 #[cfg(feature = "async")]
 pub mod asynch;
 pub mod blocking;
+pub mod celsius;
 
+pub use crate::celsius::{Celsius, OutOfRange};
 pub use crate::inner::{ConversionRate, Hysteresis, Mode, Polarity, Thermostat};
 
 use crate::inner::Configuration;
@@ -114,17 +116,6 @@ impl ConversionRate {
     }
 }
 
-const CELSIUS_PER_BIT: f32 = 0.0625;
-
-pub(crate) fn to_celsius(t: i16) -> f32 {
-    f32::from(t / 16) * CELSIUS_PER_BIT
-}
-
-#[allow(clippy::cast_possible_truncation)]
-pub(crate) fn to_raw(t: f32) -> i16 {
-    (t * 16.0 / CELSIUS_PER_BIT) as i16
-}
-
 /// Tmp108 Errors
 #[derive(Debug)]
 pub enum Error<E: embedded_hal::i2c::Error> {
@@ -193,15 +184,6 @@ mod tests {
         assert_eq!(ConversionRate::OneHz.delay_us(), 1_000_000);
         assert_eq!(ConversionRate::FourHz.delay_us(), 250_000);
         assert_eq!(ConversionRate::SixteenHz.delay_us(), 62_500);
-    }
-
-    #[test]
-    fn celsius_conversions() {
-        assert!((to_celsius(0x7ff0_u16.cast_signed()) - 127.9375).abs() < 1e-4);
-        assert!((to_celsius(0) - 0.0).abs() < 1e-4);
-        assert!((to_celsius(0xc900_u16.cast_signed()) + 55.0).abs() < 1e-4);
-        assert_eq!(to_raw(127.9375), 0x7ff0_u16.cast_signed());
-        assert_eq!(to_raw(-55.0), 0xc900_u16.cast_signed());
     }
 
     #[test]

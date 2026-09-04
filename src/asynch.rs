@@ -7,7 +7,7 @@ use embedded_hal_async::i2c::I2c;
 
 use crate::inner::{Inner, Mode, THigh, TLow};
 use crate::interface::Interface;
-use crate::{A0, Config, to_celsius, to_raw};
+use crate::{A0, Celsius, Config};
 
 /// Asynchronous TMP108 device driver.
 #[derive(Debug)]
@@ -93,9 +93,9 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// # Errors
     ///
     /// `I2C::Error` when the I2C transaction fails
-    pub async fn temperature(&mut self) -> Result<f32, I2C::Error> {
+    pub async fn temperature(&mut self) -> Result<Celsius, I2C::Error> {
         let raw = self.inner.temperature().read_async().await?;
-        Ok(to_celsius(i16::from_be_bytes(raw.into())))
+        Ok(Celsius::from_register(raw.into()))
     }
 
     /// Configure device for one-shot conversion
@@ -147,7 +147,7 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// # Errors
     ///
     /// `I2C::Error` when the I2C transaction fails
-    pub async fn wait_for_temperature<DELAY: DelayNs>(&mut self, delay: &mut DELAY) -> Result<f32, I2C::Error> {
+    pub async fn wait_for_temperature<DELAY: DelayNs>(&mut self, delay: &mut DELAY) -> Result<Celsius, I2C::Error> {
         let config = self.read_configuration().await?;
 
         delay.delay_us(config.conversion_rate.delay_us()).await;
@@ -159,9 +159,9 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// # Errors
     ///
     /// `I2C::Error` when the I2C transaction fails
-    pub async fn low_limit(&mut self) -> Result<f32, I2C::Error> {
+    pub async fn low_limit(&mut self) -> Result<Celsius, I2C::Error> {
         let raw = self.inner.t_low().read_async().await?;
-        Ok(to_celsius(i16::from_be_bytes(raw.into())))
+        Ok(Celsius::from_register(raw.into()))
     }
 
     /// Set temperature low limit register
@@ -169,8 +169,8 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// # Errors
     ///
     /// `I2C::Error` when the I2C transaction fails
-    pub async fn set_low_limit(&mut self, limit: f32) -> Result<(), I2C::Error> {
-        let raw = to_raw(limit).to_be_bytes();
+    pub async fn set_low_limit(&mut self, limit: Celsius) -> Result<(), I2C::Error> {
+        let raw = limit.to_register();
         self.inner.t_low().write_async(|r| *r = TLow::from(raw)).await
     }
 
@@ -179,9 +179,9 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// # Errors
     ///
     /// `I2C::Error` when the I2C transaction fails
-    pub async fn high_limit(&mut self) -> Result<f32, I2C::Error> {
+    pub async fn high_limit(&mut self) -> Result<Celsius, I2C::Error> {
         let raw = self.inner.t_high().read_async().await?;
-        Ok(to_celsius(i16::from_be_bytes(raw.into())))
+        Ok(Celsius::from_register(raw.into()))
     }
 
     /// Set temperature high limit register
@@ -189,8 +189,8 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// # Errors
     ///
     /// `I2C::Error` when the I2C transaction fails
-    pub async fn set_high_limit(&mut self, limit: f32) -> Result<(), I2C::Error> {
-        let raw = to_raw(limit).to_be_bytes();
+    pub async fn set_high_limit(&mut self, limit: Celsius) -> Result<(), I2C::Error> {
+        let raw = limit.to_register();
         self.inner.t_high().write_async(|r| *r = THigh::from(raw)).await
     }
 }
@@ -249,7 +249,11 @@ impl<I2C: I2c> embedded_sensors_hal::sensor::ErrorType for Tmp108<I2C> {
 #[cfg(feature = "embedded-sensors-hal-async")]
 impl<I2C: I2c> embedded_sensors_hal_async::temperature::TemperatureSensor for Tmp108<I2C> {
     async fn temperature(&mut self) -> Result<embedded_sensors_hal_async::temperature::DegreesCelsius, Self::Error> {
-        self.temperature().await.map_err(crate::Error::Bus)
+        // Translate at the boundary: the fleet speaks degrees, the part does not.
+        self.temperature()
+            .await
+            .map(Celsius::to_degrees)
+            .map_err(crate::Error::Bus)
     }
 }
 
@@ -265,7 +269,11 @@ impl<I2C: I2c, ALERT: embedded_hal_async::digital::Wait + embedded_hal::digital:
     embedded_sensors_hal_async::temperature::TemperatureSensor for AlertTmp108<I2C, ALERT>
 {
     async fn temperature(&mut self) -> Result<embedded_sensors_hal_async::temperature::DegreesCelsius, Self::Error> {
-        self.tmp108.temperature().await.map_err(crate::Error::Bus)
+        self.tmp108
+            .temperature()
+            .await
+            .map(Celsius::to_degrees)
+            .map_err(crate::Error::Bus)
     }
 }
 
@@ -275,14 +283,18 @@ impl<I2C: I2c> embedded_sensors_hal_async::temperature::TemperatureThresholdSet 
         &mut self,
         threshold: embedded_sensors_hal_async::temperature::DegreesCelsius,
     ) -> Result<(), Self::Error> {
-        self.set_low_limit(threshold).await.map_err(crate::Error::Bus)
+        // Parse once, here. A NaN or out-of-range threshold is rejected rather
+        // than silently truncated into a bogus trip point.
+        let limit = Celsius::try_from_degrees(threshold).map_err(|_| crate::Error::InvalidInput)?;
+        self.set_low_limit(limit).await.map_err(crate::Error::Bus)
     }
 
     async fn set_temperature_threshold_high(
         &mut self,
         threshold: embedded_sensors_hal_async::temperature::DegreesCelsius,
     ) -> Result<(), Self::Error> {
-        self.set_high_limit(threshold).await.map_err(crate::Error::Bus)
+        let limit = Celsius::try_from_degrees(threshold).map_err(|_| crate::Error::InvalidInput)?;
+        self.set_high_limit(limit).await.map_err(crate::Error::Bus)
     }
 }
 
@@ -294,14 +306,16 @@ impl<I2C: I2c, ALERT: embedded_hal_async::digital::Wait + embedded_hal::digital:
         &mut self,
         threshold: embedded_sensors_hal_async::temperature::DegreesCelsius,
     ) -> Result<(), Self::Error> {
-        self.tmp108.set_low_limit(threshold).await.map_err(crate::Error::Bus)
+        let limit = Celsius::try_from_degrees(threshold).map_err(|_| crate::Error::InvalidInput)?;
+        self.tmp108.set_low_limit(limit).await.map_err(crate::Error::Bus)
     }
 
     async fn set_temperature_threshold_high(
         &mut self,
         threshold: embedded_sensors_hal_async::temperature::DegreesCelsius,
     ) -> Result<(), Self::Error> {
-        self.tmp108.set_high_limit(threshold).await.map_err(crate::Error::Bus)
+        let limit = Celsius::try_from_degrees(threshold).map_err(|_| crate::Error::InvalidInput)?;
+        self.tmp108.set_high_limit(limit).await.map_err(crate::Error::Bus)
     }
 }
 
@@ -352,7 +366,7 @@ impl<I2C: I2c, ALERT: embedded_hal_async::digital::Wait + embedded_hal::digital:
 
         // Return temperature at time of trigger for caller to determine which threshold was crossed.
         let temperature = self.tmp108.temperature().await.map_err(crate::Error::Bus)?;
-        Ok(temperature)
+        Ok(temperature.to_degrees())
     }
 }
 
@@ -494,7 +508,7 @@ mod tests {
             assert!(result.is_ok());
 
             let temp = result.unwrap();
-            assert_approx_eq!(temp, *t, 1e-4);
+            assert_eq!(temp, Celsius::try_from_degrees(*t).unwrap());
 
             let mut mock = tmp108.destroy();
             mock.done();
@@ -533,14 +547,14 @@ mod tests {
         let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
 
         for t in &temps {
-            let result = tmp108.set_high_limit(*t).await;
+            let result = tmp108.set_high_limit(Celsius::try_from_degrees(*t).unwrap()).await;
             assert!(result.is_ok());
 
             let result = tmp108.high_limit().await;
             assert!(result.is_ok());
 
             let temp = result.unwrap();
-            assert_approx_eq!(temp, *t, 1e-4);
+            assert_eq!(temp, Celsius::try_from_degrees(*t).unwrap());
         }
 
         let mut mock = tmp108.destroy();
@@ -579,14 +593,14 @@ mod tests {
         let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
 
         for t in &temps {
-            let result = tmp108.set_low_limit(*t).await;
+            let result = tmp108.set_low_limit(Celsius::try_from_degrees(*t).unwrap()).await;
             assert!(result.is_ok());
 
             let result = tmp108.low_limit().await;
             assert!(result.is_ok());
 
             let temp = result.unwrap();
-            assert_approx_eq!(temp, *t, 1e-4);
+            assert_eq!(temp, Celsius::try_from_degrees(*t).unwrap());
         }
 
         let mut mock = tmp108.destroy();

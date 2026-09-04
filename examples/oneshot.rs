@@ -10,7 +10,7 @@ fn main() -> Result<()> {
 
     let mut tmp = Tmp108::new_with_a0_gnd(i2c);
     let temperature = tmp.temperature().map_err(|_| anyhow!("Failed to read temperature"))?;
-    println!("Temperature: {temperature:.2} C");
+    println!("Temperature: {temperature:.4} C");
 
     Ok(())
 }
