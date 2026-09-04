@@ -246,7 +246,7 @@ what makes the coming blocking/async split readable."
 - Create: `src/interface.rs`
 - Modify: `src/lib.rs`
 
-- [ ] **Step 1: Create the new module**
+- [x] **Step 1: Create the new module**
 
 Create `src/interface.rs`:
 
@@ -332,7 +332,7 @@ impl<I2C: embedded_hal_async::i2c::I2c> device_driver::AsyncRegisterInterface fo
 }
 ```
 
-- [ ] **Step 2: Delete the old `Interface` from `lib.rs` and wire in the module**
+- [x] **Step 2: Delete the old `Interface` from `lib.rs` and wire in the module**
 
 In `src/lib.rs`, delete all four `Interface`-related `#[maybe_async_cfg::maybe(...)]` blocks: the `struct Interface`, the `impl Interface { fn new }`, the `impl RegisterInterfaceBase for Interface`, and the `impl AsyncRegisterInterface for Interface`.
 
@@ -359,7 +359,7 @@ use device_driver::RegisterInterface;
 
 Keep the `embedded_hal::{delay::DelayNs, i2c::I2c}` and `embedded_hal_async::{...}` imports; the driver still uses them.
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 Run each and expect PASS:
 
@@ -373,7 +373,7 @@ cargo +nightly fmt --check
 
 If `clippy` reports `REGISTER_BYTES` unused, the `data` slice length assumption is wrong; check `src/inner.rs` for `size-bytes` and adjust.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/interface.rs src/lib.rs

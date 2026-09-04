@@ -15,10 +15,6 @@
 #[cfg(feature = "async")]
 use core::future::Future;
 
-#[cfg(feature = "async")]
-use device_driver::AsyncRegisterInterface;
-#[cfg(not(feature = "async"))]
-use device_driver::RegisterInterface;
 #[cfg(not(feature = "async"))]
 use embedded_hal::{delay::DelayNs, i2c::I2c};
 #[cfg(feature = "async")]
@@ -30,7 +26,10 @@ use embedded_hal_async::{delay::DelayNs as AsyncDelayNs, i2c::I2c as AsyncI2c};
 #[allow(clippy::all, clippy::pedantic)]
 mod inner;
 
+mod interface;
+
 use crate::inner::{Configuration, ConversionRate, Hysteresis, Inner, Mode, Polarity, THigh, TLow, Thermostat};
+use crate::interface::Interface;
 
 /// A0 pin logic level representation.
 #[derive(Debug, Default)]
@@ -438,80 +437,6 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
         self.inner.t_high().write(|r| *r = THigh::from(raw))?;
 
         Ok(())
-    }
-}
-
-#[maybe_async_cfg::maybe(
-    sync(
-        cfg(not(feature = "async")),
-        self = "Interface",
-        idents(AsyncI2c(sync = "I2c"), AsyncRegisterInterface(sync = "RegisterInterface"))
-    ),
-    async(feature = "async", keep_self)
-)]
-struct Interface<I2C: AsyncI2c> {
-    i2c: I2C,
-    addr: u8,
-}
-
-#[maybe_async_cfg::maybe(
-    sync(
-        cfg(not(feature = "async")),
-        self = "Interface",
-        idents(AsyncI2c(sync = "I2c"), AsyncRegisterInterface(sync = "RegisterInterface"))
-    ),
-    async(feature = "async", keep_self)
-)]
-impl<I2C: AsyncI2c> Interface<I2C> {
-    /// Create a new Interface instance.
-    fn new(i2c: I2C, addr: u8) -> Self {
-        Self { i2c, addr }
-    }
-}
-
-#[maybe_async_cfg::maybe(
-    sync(
-        cfg(not(feature = "async")),
-        self = "Interface",
-        idents(AsyncI2c(sync = "I2c"), AsyncRegisterInterface(sync = "RegisterInterface"))
-    ),
-    async(feature = "async", keep_self)
-)]
-impl<I2C: AsyncI2c> device_driver::RegisterInterfaceBase for Interface<I2C> {
-    type Error = I2C::Error;
-    type AddressType = u8;
-}
-
-#[maybe_async_cfg::maybe(
-    sync(
-        cfg(not(feature = "async")),
-        self = "Interface",
-        idents(AsyncI2c(sync = "I2c"), AsyncRegisterInterface(sync = "RegisterInterface"))
-    ),
-    async(feature = "async", keep_self)
-)]
-impl<I2C: AsyncI2c> AsyncRegisterInterface for Interface<I2C> {
-    async fn write_register(
-        &mut self,
-        address: Self::AddressType,
-        data: &mut [u8],
-        _metadata: &device_driver::FieldsetMetadata,
-    ) -> Result<(), Self::Error> {
-        let mut buf = [0; 3];
-
-        buf[0] = address;
-        buf[1..].copy_from_slice(data);
-
-        self.i2c.write(self.addr, &buf).await
-    }
-
-    async fn read_register(
-        &mut self,
-        address: Self::AddressType,
-        data: &mut [u8],
-        _metadata: &device_driver::FieldsetMetadata,
-    ) -> Result<(), Self::Error> {
-        self.i2c.write_read(self.addr, &[address], data).await
     }
 }
 
