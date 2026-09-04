@@ -188,6 +188,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
+name = "embedded-io-async"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ff09972d4073aa8c299395be75161d582e7629cd663171d62af73c8d50dba3f"
+dependencies = [
+ "embedded-io 0.6.1",
+]
+
+[[package]]
 name = "embedded-sensors-hal"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -525,22 +534,25 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pico-de-gallo-hal"
-version = "0.1.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc9fc0623409958ece1636dec2e6f60b3c4843461de8a7bae08ac70b118d21f8"
+checksum = "2a5fccb5566578ce4edcfbdb33306a0038daae56501792e1affa65725af201e8"
 dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
+ "embedded-io 0.6.1",
+ "embedded-io-async",
  "pico-de-gallo-lib",
  "tokio",
 ]
 
 [[package]]
 name = "pico-de-gallo-internal"
-version = "0.2.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0010bfcc6737761e9a2e67a2438fdbdc6e66a6caf47d6634ec99059f201cf98"
+checksum = "c71c23157e5daece9b00120204c866581b542925982d81ecafe699113a9fd337"
 dependencies = [
+ "postcard",
  "postcard-rpc",
  "postcard-schema",
  "serde",
@@ -548,9 +560,9 @@ dependencies = [
 
 [[package]]
 name = "pico-de-gallo-lib"
-version = "0.2.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc0ad306056f7c097142ab77af01ab15a420c8d8dd707d92e4cff1c1026cd3c7"
+checksum = "f87a39f1b7fa81a949b08bf27a986296c1e3e7617e3b30f39a72e7ba9ef9b3b3"
 dependencies = [
  "embedded-hal 1.0.0",
  "nusb",
