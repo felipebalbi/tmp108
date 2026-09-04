@@ -147,6 +147,141 @@ mod tests {
         Configuration::from(0x1022u16.to_le_bytes())
     }
 
+    /// Bits of the configuration register that [`Config`] models: `tm` at 2,
+    /// `cr` at 6:5, `hys` at 13:12 and `pol` at 15.
+    ///
+    /// Everything outside this mask, including the reserved bits and the
+    /// `m`/`fl`/`fh`/`id` fields, must survive [`Config::apply`] untouched.
+    const MODELLED_BITS: u16 = (1 << 2) | (0b11 << 5) | (0b11 << 12) | (1 << 15);
+
+    /// Every value each modelled field can take. The field widths make these
+    /// exhaustive: 2 x 2 x 4 x 4 = 64 configurations, all of them legal.
+    const ALL_THERMOSTAT: [Thermostat; 2] = [Thermostat::Comparator, Thermostat::Interrupt];
+    const ALL_POLARITY: [Polarity; 2] = [Polarity::ActiveLow, Polarity::ActiveHigh];
+    const ALL_CONVERSION_RATE: [ConversionRate; 4] = [
+        ConversionRate::QuarterHz,
+        ConversionRate::OneHz,
+        ConversionRate::FourHz,
+        ConversionRate::SixteenHz,
+    ];
+    const ALL_HYSTERESIS: [Hysteresis; 4] = [Hysteresis::ZeroC, Hysteresis::OneC, Hysteresis::TwoC, Hysteresis::FourC];
+
+    /// All 64 configurations the type can express.
+    fn all_configs() -> impl Iterator<Item = Config> {
+        ALL_THERMOSTAT.into_iter().flat_map(|thermostat_mode| {
+            ALL_POLARITY.into_iter().flat_map(move |alert_polarity| {
+                ALL_CONVERSION_RATE.into_iter().flat_map(move |conversion_rate| {
+                    ALL_HYSTERESIS.into_iter().map(move |hysteresis| Config {
+                        thermostat_mode,
+                        alert_polarity,
+                        conversion_rate,
+                        hysteresis,
+                    })
+                })
+            })
+        })
+    }
+
+    #[test]
+    fn config_has_exactly_sixty_four_inhabitants() {
+        // Pins the count, so widening any field forces a look at these tests.
+        assert_eq!(all_configs().count(), 64);
+    }
+
+    #[test]
+    fn every_config_round_trips_through_a_fieldset() {
+        for config in all_configs() {
+            let mut fieldset = reset_configuration();
+            config.apply(&mut fieldset);
+
+            assert_eq!(Config::from(fieldset), config, "{config:?}");
+        }
+    }
+
+    #[test]
+    fn apply_preserves_every_unmodelled_bit() {
+        // Every starting register value. This is the invariant that justifies
+        // `Config::apply` not being a `From` impl: `Config` cannot describe
+        // `m`, `fl`, `fh` or `id`, and `configure` reaches the device through
+        // `modify`, so those must survive untouched.
+        //
+        // Two configurations bracket the field values, which is enough here
+        // because a setter that disturbed an unmodelled bit would do so
+        // regardless of the starting word. The complementary direction, that no
+        // field value spills outside its own bits, is exhausted separately over
+        // all 64 configurations below.
+        let extremes = [
+            Config {
+                thermostat_mode: Thermostat::Comparator,
+                alert_polarity: Polarity::ActiveLow,
+                conversion_rate: ConversionRate::QuarterHz,
+                hysteresis: Hysteresis::ZeroC,
+            },
+            Config {
+                thermostat_mode: Thermostat::Interrupt,
+                alert_polarity: Polarity::ActiveHigh,
+                conversion_rate: ConversionRate::SixteenHz,
+                hysteresis: Hysteresis::FourC,
+            },
+        ];
+
+        for word in 0..=u16::MAX {
+            let original = Configuration::from(word.to_le_bytes());
+
+            for config in extremes {
+                let mut fieldset = original;
+                config.apply(&mut fieldset);
+
+                let before = u16::from_le_bytes(original.into());
+                let after = u16::from_le_bytes(fieldset.into());
+
+                assert_eq!(
+                    after & !MODELLED_BITS,
+                    before & !MODELLED_BITS,
+                    "word {word:#06x} with {config:?} disturbed an unmodelled bit"
+                );
+                assert_eq!(Config::from(fieldset), config, "word {word:#06x}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_config_value_spills_outside_its_own_field() {
+        // All 64 configurations, against a word with every unmodelled bit clear
+        // and one with every unmodelled bit set. A setter with too wide a mask
+        // would corrupt a neighbour in one direction or the other.
+        for config in all_configs() {
+            for word in [0x0000_u16, 0xffff] {
+                let original = Configuration::from(word.to_le_bytes());
+                let mut fieldset = original;
+                config.apply(&mut fieldset);
+
+                let before = u16::from_le_bytes(original.into());
+                let after = u16::from_le_bytes(fieldset.into());
+
+                assert_eq!(
+                    after & !MODELLED_BITS,
+                    before & !MODELLED_BITS,
+                    "{config:?} spilled outside its fields from word {word:#06x}"
+                );
+                assert_eq!(Config::from(fieldset), config, "word {word:#06x}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_reserved_mode_encoding_is_the_only_thing_decoding_rejects() {
+        // `Mode` has three variants in a two-bit field, so encoding 3 is
+        // reserved and has no meaning. A part reporting it must surface an
+        // error rather than a fabricated mode -- and nothing else may fail.
+        for word in 0..=u16::MAX {
+            let fieldset = Configuration::from(word.to_le_bytes());
+            let reserved = word & 0b11 == 0b11;
+
+            assert_eq!(fieldset.m().is_err(), reserved, "word {word:#06x}");
+        }
+    }
+
     #[test]
     fn config_round_trips_through_fieldset() {
         let config = Config {

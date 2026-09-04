@@ -34,6 +34,11 @@ impl<I2C: embedded_hal::i2c::I2c> device_driver::RegisterInterface for Interface
         data: &mut [u8],
         _metadata: &FieldsetMetadata,
     ) -> Result<(), Self::Error> {
+        // `copy_from_slice` panics on a length mismatch. Every TMP108 register
+        // is 16 bits wide, so this holds for every register in `tmp108.ddsl`;
+        // the assertion names the assumption rather than leaving it implicit.
+        debug_assert_eq!(data.len(), REGISTER_BYTES, "every TMP108 register is 16 bits");
+
         let mut buf = [0; REGISTER_BYTES + 1];
 
         buf[0] = address;
@@ -60,6 +65,11 @@ impl<I2C: embedded_hal_async::i2c::I2c> device_driver::AsyncRegisterInterface fo
         data: &mut [u8],
         _metadata: &FieldsetMetadata,
     ) -> Result<(), Self::Error> {
+        // `copy_from_slice` panics on a length mismatch. Every TMP108 register
+        // is 16 bits wide, so this holds for every register in `tmp108.ddsl`;
+        // the assertion names the assumption rather than leaving it implicit.
+        debug_assert_eq!(data.len(), REGISTER_BYTES, "every TMP108 register is 16 bits");
+
         let mut buf = [0; REGISTER_BYTES + 1];
 
         buf[0] = address;
