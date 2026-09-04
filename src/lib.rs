@@ -30,7 +30,7 @@ use embedded_hal_async::{delay::DelayNs as AsyncDelayNs, i2c::I2c as AsyncI2c};
 #[allow(clippy::all, clippy::pedantic)]
 mod inner;
 
-use crate::inner::{ConversionRate, Hysteresis, Inner, Mode, Polarity, THigh, TLow, Thermostat};
+use crate::inner::{Configuration, ConversionRate, Hysteresis, Inner, Mode, Polarity, THigh, TLow, Thermostat};
 
 /// A0 pin logic level representation.
 #[derive(Debug, Default)]
@@ -79,6 +79,54 @@ impl Default for Config {
             hysteresis: Hysteresis::OneC,
         }
     }
+}
+
+impl From<Configuration> for Config {
+    fn from(c: Configuration) -> Self {
+        Self {
+            thermostat_mode: c.tm(),
+            alert_polarity: c.pol(),
+            conversion_rate: c.cr(),
+            hysteresis: c.hys(),
+        }
+    }
+}
+
+impl Config {
+    /// Write the modelled fields onto a configuration fieldset.
+    ///
+    /// Deliberately not a `From` impl: `Config` does not model the `m`, `fl`,
+    /// `fh` and `id` fields, and `configure` uses `modify`, so those must be
+    /// left untouched.
+    pub(crate) fn apply(self, r: &mut Configuration) {
+        r.set_tm(self.thermostat_mode);
+        r.set_pol(self.alert_polarity);
+        r.set_cr(self.conversion_rate);
+        r.set_hys(self.hysteresis);
+    }
+}
+
+impl ConversionRate {
+    /// Time to wait for one conversion to complete, in microseconds.
+    pub(crate) fn delay_us(self) -> u32 {
+        match self {
+            ConversionRate::QuarterHz => 4_000_000,
+            ConversionRate::OneHz => 1_000_000,
+            ConversionRate::FourHz => 250_000,
+            ConversionRate::SixteenHz => 62_500,
+        }
+    }
+}
+
+const CELSIUS_PER_BIT: f32 = 0.0625;
+
+pub(crate) fn to_celsius(t: i16) -> f32 {
+    f32::from(t / 16) * CELSIUS_PER_BIT
+}
+
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn to_raw(t: f32) -> i16 {
+    (t * 16.0 / CELSIUS_PER_BIT) as i16
 }
 
 /// Tmp108 device driver.
@@ -209,8 +257,6 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
     async(feature = "async", keep_self)
 )]
 impl<I2C: AsyncI2c> Tmp108<I2C> {
-    const CELSIUS_PER_BIT: f32 = 0.0625;
-
     /// Read configuration register
     ///
     /// # Errors
@@ -223,12 +269,7 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
         #[cfg(not(feature = "async"))]
         let c = self.inner.configuration().read()?;
 
-        Ok(Config {
-            thermostat_mode: c.tm(),
-            alert_polarity: c.pol(),
-            conversion_rate: c.cr(),
-            hysteresis: c.hys(),
-        })
+        Ok(c.into())
     }
 
     /// Configure device parameters.
@@ -238,24 +279,10 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
     /// `I2C::Error` when the I2C transaction fails
     pub async fn configure(&mut self, config: Config) -> Result<(), I2C::Error> {
         #[cfg(feature = "async")]
-        let res = self
-            .inner
-            .configuration()
-            .modify_async(|r| {
-                r.set_tm(config.thermostat_mode);
-                r.set_pol(config.alert_polarity);
-                r.set_cr(config.conversion_rate);
-                r.set_hys(config.hysteresis);
-            })
-            .await;
+        let res = self.inner.configuration().modify_async(|r| config.apply(r)).await;
 
         #[cfg(not(feature = "async"))]
-        let res = self.inner.configuration().modify(|r| {
-            r.set_tm(config.thermostat_mode);
-            r.set_pol(config.alert_polarity);
-            r.set_cr(config.conversion_rate);
-            r.set_hys(config.hysteresis);
-        });
+        let res = self.inner.configuration().modify(|r| config.apply(r));
 
         res
     }
@@ -273,7 +300,7 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
         let res = self.inner.temperature().read();
 
         let raw = res?;
-        Ok(Self::to_celsius(i16::from_be_bytes(raw.into())))
+        Ok(crate::to_celsius(i16::from_be_bytes(raw.into())))
     }
 
     /// Configure device for one-shot conversion
@@ -345,12 +372,7 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
     pub async fn wait_for_temperature<DELAY: AsyncDelayNs>(&mut self, delay: &mut DELAY) -> Result<f32, I2C::Error> {
         let config = self.read_configuration().await?;
 
-        let delay_time_us = match config.conversion_rate {
-            ConversionRate::QuarterHz => 4_000_000,
-            ConversionRate::OneHz => 1_000_000,
-            ConversionRate::FourHz => 250_000,
-            ConversionRate::SixteenHz => 62_500,
-        };
+        let delay_time_us = config.conversion_rate.delay_us();
 
         delay.delay_us(delay_time_us).await;
         self.temperature().await
@@ -367,7 +389,7 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
 
         #[cfg(not(feature = "async"))]
         let raw = self.inner.t_low().read()?;
-        Ok(Self::to_celsius(i16::from_be_bytes(raw.into())))
+        Ok(crate::to_celsius(i16::from_be_bytes(raw.into())))
     }
 
     /// Set temperature low limit register
@@ -376,7 +398,7 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
     ///
     /// `I2C::Error` when the I2C transaction fails
     pub async fn set_low_limit(&mut self, limit: f32) -> Result<(), I2C::Error> {
-        let raw = Self::to_raw(limit).to_be_bytes();
+        let raw = crate::to_raw(limit).to_be_bytes();
 
         #[cfg(feature = "async")]
         self.inner.t_low().write_async(|r| *r = TLow::from(raw)).await?;
@@ -398,7 +420,7 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
 
         #[cfg(not(feature = "async"))]
         let raw = self.inner.t_high().read()?;
-        Ok(Self::to_celsius(i16::from_be_bytes(raw.into())))
+        Ok(crate::to_celsius(i16::from_be_bytes(raw.into())))
     }
 
     /// Set temperature high limit register
@@ -407,7 +429,7 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
     ///
     /// `I2C::Error` when the I2C transaction fails
     pub async fn set_high_limit(&mut self, limit: f32) -> Result<(), I2C::Error> {
-        let raw = Self::to_raw(limit).to_be_bytes();
+        let raw = crate::to_raw(limit).to_be_bytes();
 
         #[cfg(feature = "async")]
         self.inner.t_high().write_async(|r| *r = THigh::from(raw)).await?;
@@ -416,15 +438,6 @@ impl<I2C: AsyncI2c> Tmp108<I2C> {
         self.inner.t_high().write(|r| *r = THigh::from(raw))?;
 
         Ok(())
-    }
-
-    fn to_celsius(t: i16) -> f32 {
-        f32::from(t / 16) * Self::CELSIUS_PER_BIT
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    fn to_raw(t: f32) -> i16 {
-        (t * 16.0 / Self::CELSIUS_PER_BIT) as i16
     }
 }
 
@@ -701,6 +714,54 @@ mod tests {
     /// applied by the register operation, so tests construct it explicitly.
     fn reset_configuration() -> Configuration {
         Configuration::from(0x1022u16.to_le_bytes())
+    }
+
+    #[test]
+    fn config_round_trips_through_fieldset() {
+        let config = Config {
+            thermostat_mode: Thermostat::Interrupt,
+            alert_polarity: Polarity::ActiveHigh,
+            conversion_rate: ConversionRate::SixteenHz,
+            hysteresis: Hysteresis::FourC,
+        };
+
+        let mut fieldset = reset_configuration();
+        config.apply(&mut fieldset);
+
+        assert_eq!(Config::from(fieldset), config);
+    }
+
+    #[test]
+    fn apply_preserves_unmodelled_fields() {
+        let mut fieldset = reset_configuration();
+        fieldset.set_m(Mode::OneShot);
+        fieldset.set_fl(true);
+        fieldset.set_fh(true);
+        fieldset.set_id(true);
+
+        Config::default().apply(&mut fieldset);
+
+        assert_eq!(fieldset.m().unwrap(), Mode::OneShot);
+        assert!(fieldset.fl());
+        assert!(fieldset.fh());
+        assert!(fieldset.id());
+    }
+
+    #[test]
+    fn conversion_rate_delays() {
+        assert_eq!(ConversionRate::QuarterHz.delay_us(), 4_000_000);
+        assert_eq!(ConversionRate::OneHz.delay_us(), 1_000_000);
+        assert_eq!(ConversionRate::FourHz.delay_us(), 250_000);
+        assert_eq!(ConversionRate::SixteenHz.delay_us(), 62_500);
+    }
+
+    #[test]
+    fn celsius_conversions() {
+        assert!((to_celsius(0x7ff0_u16.cast_signed()) - 127.9375).abs() < 1e-4);
+        assert!((to_celsius(0) - 0.0).abs() < 1e-4);
+        assert!((to_celsius(0xc900_u16.cast_signed()) + 55.0).abs() < 1e-4);
+        assert_eq!(to_raw(127.9375), 0x7ff0_u16.cast_signed());
+        assert_eq!(to_raw(-55.0), 0xc900_u16.cast_signed());
     }
 
     #[test]

@@ -36,7 +36,7 @@ Shrinks the driver method bodies so that duplicating them later is tolerable. `m
 **Files:**
 - Modify: `src/lib.rs`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add these to the existing `mod tests` in `src/lib.rs`, immediately after the `reset_configuration` helper:
 
@@ -90,13 +90,13 @@ Add these to the existing `mod tests` in `src/lib.rs`, immediately after the `re
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --lib config_round_trips_through_fieldset`
 
 Expected: FAIL to compile, `no method named 'apply' found for struct 'Config'`.
 
-- [ ] **Step 3: Add the helpers**
+- [x] **Step 3: Add the helpers**
 
 In `src/lib.rs`, extend the `inner` import to bring in `Configuration`:
 
@@ -156,13 +156,13 @@ pub(crate) fn to_raw(t: f32) -> i16 {
 }
 ```
 
-- [ ] **Step 4: Run the new tests to verify they pass**
+- [x] **Step 4: Run the new tests to verify they pass**
 
 Run: `cargo test --lib`
 
 Expected: PASS, 16 tests.
 
-- [ ] **Step 5: Rewrite the driver methods to use the helpers**
+- [x] **Step 5: Rewrite the driver methods to use the helpers**
 
 In `src/lib.rs`, delete the line `const CELSIUS_PER_BIT: f32 = 0.0625;` from the `impl<I2C: AsyncI2c> Tmp108<I2C>` block, and delete the `to_celsius` and `to_raw` associated functions at the end of that block.
 
@@ -206,7 +206,7 @@ Replace the `delay_time_us` match in `wait_for_temperature` with:
 
 Replace the four remaining `Self::to_celsius(...)` call sites with `crate::to_celsius(...)`, and the one `Self::to_raw(...)` call site in each of `set_low_limit` and `set_high_limit` with `crate::to_raw(...)`.
 
-- [ ] **Step 6: Verify the whole suite still passes in every mode**
+- [x] **Step 6: Verify the whole suite still passes in every mode**
 
 Run each and expect PASS:
 
@@ -218,7 +218,7 @@ cargo clippy --all-features --all-targets -- -W clippy::suspicious -W clippy::co
 cargo +nightly fmt --check
 ```
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/lib.rs
