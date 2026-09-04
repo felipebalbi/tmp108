@@ -1034,7 +1034,7 @@ The missing `pub use` was invisible to in-crate tests. Integration tests under `
 **Files:**
 - Create: `tests/public_api.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/public_api.rs`:
 
@@ -1070,13 +1070,13 @@ fn config_fields_are_matchable_by_downstream_users() {
 }
 ```
 
-- [ ] **Step 2: Run it**
+- [x] **Step 2: Run it**
 
 Run: `cargo test --locked --test public_api`
 
 Expected: PASS, because Task 3 Step 9 added the `pub use`. If it fails with `unresolved import`, the `pub use` line is missing from `src/lib.rs`.
 
-- [ ] **Step 3: Verify `Mode` is reachable too**
+- [x] **Step 3: Verify `Mode` is reachable too**
 
 Run: `cargo test --locked --test public_api`, after appending:
 
@@ -1089,7 +1089,7 @@ fn mode_is_reachable() {
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/public_api.rs
