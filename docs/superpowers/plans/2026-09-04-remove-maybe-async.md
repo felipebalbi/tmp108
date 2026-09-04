@@ -1202,7 +1202,7 @@ The usage block is `rust,ignore`, so it has never been compiled and no longer re
 **Files:**
 - Modify: `README.md`
 
-- [ ] **Step 1: Replace the usage section**
+- [x] **Step 1: Replace the usage section**
 
 Replace lines 27 to 72 of `README.md`, that is the `## Usage` heading and the whole fenced block, with:
 
@@ -1214,7 +1214,7 @@ use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
 use tmp108::blocking::Tmp108;
 use tmp108::{Config, ConversionRate, Hysteresis, Polarity, Thermostat};
 
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# fn main() -> Result<(), embedded_hal::i2c::ErrorKind> {
 # let expectations = [
 #     // read_configuration
 #     Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
@@ -1259,7 +1259,7 @@ The asynchronous driver lives in `tmp108::asynch` behind the `async`
 feature and mirrors the blocking API method for method.
 ````
 
-- [ ] **Step 2: Run the doctest to check the mock expectations**
+- [x] **Step 2: Run the doctest to check the mock expectations**
 
 Run: `cargo test --locked --doc`
 
@@ -1267,7 +1267,7 @@ Expected: PASS, 1 test.
 
 If it fails with an unexpected-transaction panic, the mock expectation bytes are wrong. Read the panic message, which prints the transaction actually attempted, and correct the byte sequence in the hidden `expectations` array. The four config bytes derive from `Config`, so recompute rather than guess: `0x66, 0xb0` is the existing value used by `change_configuration` in `src/blocking.rs`.
 
-- [ ] **Step 3: Fix the MSRV line**
+- [x] **Step 3: Fix the MSRV line**
 
 Replace lines 74 to 77 of `README.md`:
 
@@ -1278,13 +1278,13 @@ Currently, rust `1.94` and up is supported, but some previous versions
 may work.
 ```
 
-- [ ] **Step 4: Verify MSRV agreement**
+- [x] **Step 4: Verify MSRV agreement**
 
 Run: `Select-String -Path README.md,Cargo.toml,.github/workflows/check.yml -Pattern "1\.94|1\.85"`
 
 Expected: every hit says `1.94`; no hit says `1.85`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add README.md

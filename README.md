@@ -26,54 +26,58 @@ ensure that an invalid address is not attempted.
 
 ## Usage
 
-```rust,ignore
-let delay = DelayNs;
-let mut tmp = Tmp108::new_with_a0_gnd(i2c, delay);
-// let mut tmp = Tmp108::new_with_a0_vplus(i2c, delay);
-// let mut tmp = Tmp108::new_with_a0_sda(i2c, delay);
-// let mut tmp = Tmp108::new_with_a0_scl(i2c, delay);
-// let mut tmp = Tmp108::new(i2c, delay, A0::Gnd);
+```rust
+use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
+use tmp108::blocking::Tmp108;
+use tmp108::{Config, ConversionRate, Hysteresis, Polarity, Thermostat};
 
-let cfg = Default::default()
-    .with_cm(ConversionMode::OneShot)
-    .with_tm(ThermostatMode::Comparator)
-    .with_cr(ConversionRate::Hertz16)
-    .with_hysteresis(Hysteresis::FourCelsius)
-    .with_polarity(Polarity::ActiveLow);
+# fn main() -> Result<(), embedded_hal::i2c::ErrorKind> {
+# let expectations = [
+#     // read_configuration
+#     Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
+#     // configure -> modify: read, then write
+#     Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
+#     Transaction::write(0x48, vec![0x01, 0x66, 0xb0]),
+#     // set_low_limit(26.5) -> 26.5 * 256 = 0x1a80
+#     Transaction::write(0x48, vec![0x02, 0x1a, 0x80]),
+#     // set_high_limit(48.0) -> 48 * 256 = 0x3000
+#     Transaction::write(0x48, vec![0x03, 0x30, 0x00]),
+#     // temperature -> 0x1900 = 6400, 6400 / 16 * 0.0625 = 25.0
+#     Transaction::write_read(0x48, vec![0x00], vec![0x19, 0x00]),
+# ];
+# let i2c = Mock::new(&expectations);
+let mut tmp = Tmp108::new_with_a0_gnd(i2c);
+// let mut tmp = Tmp108::new_with_a0_vplus(i2c);
+// let mut tmp = Tmp108::new_with_a0_sda(i2c);
+// let mut tmp = Tmp108::new_with_a0_scl(i2c);
+// let mut tmp = Tmp108::new(i2c, A0::Gnd);
 
-tmp.set_configuration(cfg)?;
+let mut config = tmp.read_configuration()?;
 
-let temp = tmp.temperature()?;
+config.thermostat_mode = Thermostat::Interrupt;
+config.alert_polarity = Polarity::ActiveHigh;
+config.conversion_rate = ConversionRate::SixteenHz;
+config.hysteresis = Hysteresis::FourC;
 
-let cfg = cfg
-    .with_cm(ConversionMode::OneShot)
-    .with_tm(ThermostatMode::Interrupt)
-    .with_cr(ConversionRate::Hertz1)
-    .with_fl(true)
-    .with_fh(true);
+tmp.configure(config)?;
 
-tmp.set_configuration(cfg)?;
+tmp.set_low_limit(26.5)?;
+tmp.set_high_limit(48.0)?;
 
-let high_limit = 48.0;
-let low_limit = 26.5;
-
-tmp.set_low_limit(low_limit)?;
-tmp.set_high_limit(high_limit)?;
-
-tmp.continuous(Default::default(), |t| {
-	for _ in 0..10 {
-		let temp = tmp.wait_for_temperature()?;
-		info!("Temperature {}", temp);
-	}
-
-	Ok(())
-})?;
-
+let temperature = tmp.temperature()?;
+println!("Temperature: {temperature:.2} C");
+# let mut i2c = tmp.destroy();
+# i2c.done();
+# Ok(())
+# }
 ```
+
+The asynchronous driver lives in `tmp108::asynch` behind the `async`
+feature and mirrors the blocking API method for method.
 
 ## MSRV
 
-Currently, rust `1.85` and up is supported, but some previous versions
+Currently, rust `1.94` and up is supported, but some previous versions
 may work.
 
 ## License
