@@ -1111,7 +1111,7 @@ public fields."
 - Create: `examples/oneshot_async.rs`
 - Modify: `Cargo.toml`
 
-- [ ] **Step 1: Rewrite `examples/oneshot.rs` as blocking-only**
+- [x] **Step 1: Rewrite `examples/oneshot.rs` as blocking-only**
 
 ```rust
 //! TMP108 blocking temperature read example.
@@ -1132,7 +1132,7 @@ fn main() -> Result<()> {
 }
 ```
 
-- [ ] **Step 2: Create `examples/oneshot_async.rs`**
+- [x] **Step 2: Create `examples/oneshot_async.rs`**
 
 ```rust
 //! TMP108 asynchronous temperature read example.
@@ -1157,7 +1157,7 @@ async fn main() -> Result<()> {
 }
 ```
 
-- [ ] **Step 3: Declare the async example's feature requirement**
+- [x] **Step 3: Declare the async example's feature requirement**
 
 Append to `Cargo.toml`:
 
@@ -1167,7 +1167,7 @@ name = "oneshot_async"
 required-features = ["async"]
 ```
 
-- [ ] **Step 4: Verify both examples build**
+- [x] **Step 4: Verify both examples build**
 
 Run: `cargo build --locked --example oneshot`
 
@@ -1181,7 +1181,7 @@ Run: `cargo build --locked --examples`
 
 Expected: PASS, building only `oneshot`, since `async` is off.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add examples/oneshot.rs examples/oneshot_async.rs Cargo.toml
