@@ -401,7 +401,7 @@ The atomic part of the change. Both drivers must appear together, because `lib.r
 - Modify: `src/lib.rs`
 - Modify: `Cargo.toml`
 
-- [ ] **Step 1: Write the failing coexistence test**
+- [x] **Step 1: Write the failing coexistence test**
 
 Create `tests/coexistence.rs`. This is the new capability, and it cannot compile today:
 
@@ -432,13 +432,13 @@ async fn blocking_and_async_drivers_coexist() {
 }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo test --locked -F async --test coexistence`
 
 Expected: FAIL to compile, `could not find 'blocking' in 'tmp108'`.
 
-- [ ] **Step 3: Create `src/blocking.rs`**
+- [x] **Step 3: Create `src/blocking.rs`**
 
 ```rust
 //! Blocking TMP108 driver.
@@ -615,7 +615,7 @@ impl<I2C: I2c> embedded_sensors_hal::temperature::TemperatureSensor for Tmp108<I
 }
 ```
 
-- [ ] **Step 4: Move the blocking tests into `src/blocking.rs`**
+- [x] **Step 4: Move the blocking tests into `src/blocking.rs`**
 
 Cut the `mod blocking { ... }` block, and the `#[cfg(not(feature = "async"))]` attribute above it, out of `mod tests` in `src/lib.rs`. It starts at line 781 and runs to the line before `#[cfg(feature = "async")] mod asynchronous {` at line 978. Append it to `src/blocking.rs`, changing the header from
 
@@ -642,13 +642,13 @@ mod tests {
 
 Dedent the moved block by four spaces. The test bodies are otherwise unchanged.
 
-- [ ] **Step 5: Verify the blocking half**
+- [x] **Step 5: Verify the blocking half**
 
 Run: `cargo test --locked`
 
 Expected: PASS. The crate root still has the `maybe-async` driver at this point, so both exist; that is fine and temporary.
 
-- [ ] **Step 6: Create `src/asynch.rs`**
+- [x] **Step 6: Create `src/asynch.rs`**
 
 Move the async driver across. Take the body of every method from the current `lib.rs` `#[cfg(feature = "async")]` branches, dropping the `#[cfg(not(feature = "async"))]` branches:
 
@@ -854,7 +854,7 @@ impl<I2C: I2c> Tmp108<I2C> {
 }
 ```
 
-- [ ] **Step 7: Move `AlertTmp108` and the async sensor-hal impls into `src/asynch.rs`**
+- [x] **Step 7: Move `AlertTmp108` and the async sensor-hal impls into `src/asynch.rs`**
 
 Move these items from `src/lib.rs` verbatim. Line numbers are positions *before any edit in this task*, given for orientation only; match on the item signature, not the line:
 
@@ -896,7 +896,7 @@ impl<I2C: I2c, ALERT: embedded_hal_async::digital::Wait + embedded_hal::digital:
 
 Do **not** move `impl<E> embedded_sensors_hal_async::sensor::Error for Error<E>` (line 536). It is deleted in Step 9, because it duplicates the blocking impl of the same trait.
 
-- [ ] **Step 8: Move the async tests into `src/asynch.rs`**
+- [x] **Step 8: Move the async tests into `src/asynch.rs`**
 
 Cut the `mod asynchronous { ... }` block, and the `#[cfg(feature = "async")]` attribute above it, out of `mod tests` in `src/lib.rs`. It starts at line 978 and runs to the closing brace of `mod tests`. Append it to `src/asynch.rs` as:
 
@@ -912,7 +912,7 @@ mod tests {
 
 Dedent by four spaces. Leave the `#[cfg(feature = "embedded-sensors-hal-async")]` attribute on `handle_threshold_alerts_properly` in place; the module is behind `async` but not behind the sensor feature.
 
-- [ ] **Step 9: Strip the old driver out of `lib.rs`**
+- [x] **Step 9: Strip the old driver out of `lib.rs`**
 
 Delete from `src/lib.rs`, matching on item signature rather than line number since earlier steps have shifted things:
 
@@ -953,7 +953,7 @@ use crate::inner::Configuration;
 
 `Inner`, `THigh` and `TLow` are no longer referenced from `lib.rs`; the drivers import them directly.
 
-- [ ] **Step 10: Update `Cargo.toml`**
+- [x] **Step 10: Update `Cargo.toml`**
 
 Remove the dependency:
 
@@ -970,13 +970,13 @@ embedded-sensors-hal = [ "dep:embedded-sensors-hal" ]
 embedded-sensors-hal-async = [ "dep:embedded-sensors-hal-async", "embedded-sensors-hal", "async" ]
 ```
 
-- [ ] **Step 11: Run the coexistence test**
+- [x] **Step 11: Run the coexistence test**
 
 Run: `cargo test --locked -F async --test coexistence`
 
 Expected: PASS.
 
-- [ ] **Step 12: Verify every mode**
+- [x] **Step 12: Verify every mode**
 
 Run each and expect PASS:
 
@@ -990,13 +990,13 @@ cargo clippy --all-features --all-targets -- -W clippy::suspicious -W clippy::co
 cargo +nightly fmt --check
 ```
 
-- [ ] **Step 13: Confirm `maybe-async-cfg` is gone**
+- [x] **Step 13: Confirm `maybe-async-cfg` is gone**
 
 Run: `cargo tree --locked -i maybe-async-cfg`
 
 Expected: `error: package ID specification 'maybe-async-cfg' did not match any packages`.
 
-- [ ] **Step 14: Commit**
+- [x] **Step 14: Commit**
 
 ```bash
 git add src/lib.rs src/blocking.rs src/asynch.rs tests/coexistence.rs Cargo.toml Cargo.lock

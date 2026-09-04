@@ -2,10 +2,11 @@
 
 use anyhow::{Result, anyhow};
 use pico_de_gallo_hal::Hal;
-use tmp108::Tmp108;
 
 #[cfg(not(feature = "async"))]
 fn main() -> Result<()> {
+    use tmp108::blocking::Tmp108;
+
     let hal = Hal::new();
     let i2c = hal.i2c();
 
@@ -19,6 +20,8 @@ fn main() -> Result<()> {
 #[cfg(feature = "async")]
 #[tokio::main]
 async fn main() -> Result<()> {
+    use tmp108::asynch::Tmp108;
+
     let hal = Hal::new();
     let i2c = hal.i2c();
 
