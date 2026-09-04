@@ -43,6 +43,10 @@ tokio = { version = "1.47.0", features = ["rt", "macros", "rt-multi-thread", "ti
 name = "oneshot_async"
 required-features = ["async"]
 
+[[example]]
+name = "alert"
+required-features = ["embedded-sensors-hal-async"]
+
 [lints.rust]
 unsafe_code = "deny"
 missing_docs = "deny"
