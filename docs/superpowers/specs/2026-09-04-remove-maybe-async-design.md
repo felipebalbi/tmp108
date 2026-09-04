@@ -21,6 +21,15 @@ async API, it replaces the blocking one. Two crates in one dependency graph, one
 the blocking TMP108 and one wanting the async TMP108, cannot both be satisfied: Cargo
 unifies the feature and one of them silently loses the API it compiled against.
 
+A third problem surfaced while planning this work, and is fixed here because it concerns
+the same public surface. The crate contains no `pub use` at all. `Config` has four public
+fields whose types — `Thermostat`, `Polarity`, `ConversionRate` and `Hysteresis` — live in
+the private `inner` module and are never re-exported. A downstream user therefore cannot
+name those types, cannot match on the value returned by `read_configuration`, and cannot
+construct any `Config` other than `Config::default()`, which makes `configure` close to
+useless from outside the crate. The crate's own tests do not catch this because they run
+inside the crate, where `use crate::inner::...` makes the types visible.
+
 ## Decisions
 
 Four decisions were taken before the design was fixed.
@@ -70,9 +79,19 @@ The boundaries are vocabulary, transport, the two drivers, and generated code. T
 
 ### Shared vocabulary
 
-`A0`, `Config` and `Error` stay public in `lib.rs` with their current shape. They gain the
-pure logic extracted from the driver methods, which is what makes the duplicated methods
-short enough to be readable:
+`A0`, `Config` and `Error` stay public in `lib.rs` with their current shape. The five
+generated enums gain the `pub use` they should always have had, so that `Config` is
+constructible and inspectable from outside the crate:
+
+```rust
+pub use crate::inner::{ConversionRate, Hysteresis, Mode, Polarity, Thermostat};
+```
+
+This is additive and breaks nobody. A test that compiles as an external consumer guards
+against the regression, since in-crate tests cannot detect it.
+
+`lib.rs` also gains the pure logic extracted from the driver methods, which is what makes
+the duplicated methods short enough to be readable:
 
 ```rust
 impl From<Configuration> for Config             // reads tm/pol/cr/hys
@@ -168,6 +187,23 @@ separate change.
 - `tmp108::Tmp108` becomes `tmp108::blocking::Tmp108` or `tmp108::asynch::Tmp108`.
 - `tmp108::AlertTmp108` becomes `tmp108::asynch::AlertTmp108`.
 - `--features async` no longer removes the blocking API.
+
+## Additive changes
+
+- `ConversionRate`, `Hysteresis`, `Mode`, `Polarity` and `Thermostat` become nameable from
+  outside the crate for the first time.
+
+## Documentation debt
+
+The README usage example is marked `rust,ignore`, so it is never compiled and has rotted:
+it shows a builder API (`with_cm`, `with_tm`, `with_hysteresis`) that does not exist, a
+two-argument `new_with_a0_gnd`, and type names such as `ConversionMode`,
+`ConversionRate::Hertz16` and `Hysteresis::FourCelsius` that have no counterpart in the
+crate. The README also still claims an MSRV of 1.85, which the device-driver v2 migration
+raised to 1.94.
+
+The example is rewritten against the new API and made a compiled doctest, using
+`embedded-hal-mock` from dev-dependencies, so that it cannot rot again.
 
 ## Commit convention
 
