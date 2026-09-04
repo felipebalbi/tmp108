@@ -1,0 +1,28 @@
+# Release-plz configuration.
+#
+# This repository hand-writes `CHANGELOG.md` and hand-bumps the version in
+# the same pull request as the change. The changelog carries migration
+# guidance -- before/after snippets, datasheet citations, the reasoning
+# behind a behavior change -- that cannot be derived from commit subjects,
+# so generating it would be a downgrade.
+#
+# release-plz is therefore used for one job only: once a version that is not
+# yet on crates.io lands on `main`, publish it, tag it, and cut the GitHub
+# release. It does not open release pull requests and does not touch the
+# changelog.
+#
+# Docs: https://release-plz.dev/docs/config
+
+[workspace]
+# The changelog is written by hand. See AGENTS.md, "Releases".
+changelog_update = false
+
+# Publish whenever `main` carries a version that is not yet on crates.io,
+# rather than only when a release PR merges. Because the version is bumped
+# by hand in the PR that makes the change, there is no release PR to wait
+# for. A push that does not change the version is a no-op: the version is
+# already published.
+release_always = true
+
+# The release body is taken from the matching section of CHANGELOG.md.
+git_release_enable = true

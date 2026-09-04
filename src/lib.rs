@@ -43,7 +43,7 @@
 
 #[cfg(feature = "async")]
 use device_driver::AsyncRegisterInterface;
-use device_driver::RegisterInterface;
+use device_driver::{FieldsetMetadata, RegisterInterface, RegisterInterfaceBase};
 use embedded_hal::delay::DelayNs;
 use embedded_hal::i2c::I2c;
 #[cfg(feature = "async")]
@@ -58,9 +58,9 @@ use embedded_hal_async::i2c::I2c as AsyncI2c;
 #[allow(unused)]
 mod inner;
 
-use crate::inner::Inner;
-use crate::inner::field_sets::{THigh, TLow};
 pub use crate::inner::{ConversionRate, Hysteresis, Mode, Polarity, Thermostat};
+use crate::inner::{Inner, THigh, TLow};
+pub use crate::ops::{Celsius, OutOfRange};
 
 /// A0 pin logic level representation.
 #[derive(Debug, Default)]
@@ -105,78 +105,241 @@ impl Default for Config {
         Self {
             thermostat_mode: Thermostat::Comparator,
             alert_polarity: Polarity::ActiveLow,
-            conversion_rate: ConversionRate::_1Hz,
-            hysteresis: Hysteresis::_1C,
+            conversion_rate: ConversionRate::OneHz,
+            hysteresis: Hysteresis::OneC,
         }
     }
 }
 
 /// Pure-function register codec.
 ///
-/// All sync/async-agnostic chip logic lives here: scaling between °C
-/// and the chip's raw 12-bit fixed-point register encoding, validation
-/// of caller-supplied limits, snapping of continuous-f32 hysteresis
-/// values to the four discrete chip settings, and the conversion
-/// between the typed [`Config`] and the generated `Configuration`
-/// field-set.
+/// All sync/async-agnostic chip logic lives here: the [`Celsius`]
+/// temperature newtype and its register codec, snapping of
+/// continuous-f32 hysteresis values to the four discrete chip
+/// settings, and the conversion between the typed [`Config`] and the
+/// generated `Configuration` field-set.
 ///
 /// The blocking and async drivers both delegate to this module so the
 /// meaningful work lives in exactly one place; the per-driver methods
 /// are thin shells that perform I²C and call into `ops`.
+///
+/// This module is pure: no bus, no `async`, no HAL. Every function
+/// here is total or explicitly fallible, and the domains are small
+/// enough that the tests walk them exhaustively rather than sampling.
 pub(crate) mod ops {
     use crate::Config;
     #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
     use crate::Hysteresis;
-    use crate::inner::field_sets::Configuration;
-
-    /// Temperature register LSB, in °C, per the TMP108 datasheet.
-    pub(crate) const CELSIUS_PER_BIT: f32 = 0.0625;
+    use crate::inner::Configuration;
 
     /// Documented power-on reset value of the configuration register.
     /// Used by [`crate::Tmp108::probe`] to verify chip presence.
     pub(crate) const POR_CONFIG: u16 = 0x1022;
-
-    /// Minimum representable limit-register value, in °C
-    /// (12-bit signed left-aligned at the 0.0625 °C LSB).
-    pub(crate) const LIMIT_MIN_CELSIUS: f32 = -128.0;
-
-    /// Maximum representable limit-register value, in °C.
-    pub(crate) const LIMIT_MAX_CELSIUS: f32 = 127.937_5;
 
     /// Tolerance band for snapping continuous-f32 hysteresis input
     /// to the four discrete chip settings, in °C.
     #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
     pub(crate) const HYSTERESIS_TOLERANCE: f32 = 0.05;
 
-    /// Convert a raw 16-bit signed temperature/limit register value
-    /// to °C.
+    /// A temperature the TMP108 can represent.
     ///
-    /// Per the datasheet the temperature and limit registers are
-    /// left-aligned 12-bit signed values: the LSB is the bit at
-    /// position 4 (0.0625 °C/LSB) and bits 3..0 are reserved=0.
-    /// Computed as a single multiplication by `CELSIUS_PER_BIT/16`
-    /// (== `1/256` = `0.003_906_25`, exactly representable in `f32`)
-    /// rather than dividing by 16 first via integer division — the
-    /// latter is asymmetric for negative inputs with non-zero low
-    /// bits.
-    pub(crate) fn to_celsius(t: i16) -> f32 {
-        f32::from(t) * (CELSIUS_PER_BIT / 16.0)
+    /// Stored as sixteenths of a degree Celsius, which is the part's
+    /// native resolution: one LSB is 0.0625 °C. The representable
+    /// range is the span of the sensor's 12-bit two's complement
+    /// field, `-2048..=2047` sixteenths, or [`Celsius::MIN`] to
+    /// [`Celsius::MAX`].
+    ///
+    /// That is 4096 inhabitants, every one of them a temperature the
+    /// part can actually report or accept as a limit. An `f32` in the
+    /// same position would admit roughly four billion, including
+    /// `NaN`, both infinities, and −400 °C.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tmp108::Celsius;
+    /// let t = Celsius::try_from_degrees(25.0).unwrap();
+    /// assert_eq!(t.sixteenths(), 400);
+    /// assert_eq!(t.to_degrees(), 25.0);
+    /// ```
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Celsius(i16);
+
+    /// Why a value could not be converted into a [`Celsius`].
+    ///
+    /// This is the only fallible direction in the module. Bytes
+    /// arriving from the device are always a valid temperature, so the
+    /// failures here all come from the human-facing side of the
+    /// boundary.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[non_exhaustive]
+    pub enum OutOfRange {
+        /// The value was `NaN`.
+        NotANumber,
+        /// The value was below [`Celsius::MIN`].
+        TooLow,
+        /// The value was above [`Celsius::MAX`].
+        TooHigh,
     }
 
-    /// Convert a temperature in degrees Celsius to the raw 12-bit
-    /// signed fixed-point representation used by the chip's `TLow` /
-    /// `THigh` registers.
-    ///
-    /// Returns `None` for inputs that are NaN, ±∞, or outside the
-    /// representable range `[-128.0, 127.9375] °C`.
-    pub(crate) fn to_raw(t: f32) -> Option<i16> {
-        if !t.is_finite() || !(LIMIT_MIN_CELSIUS..=LIMIT_MAX_CELSIUS).contains(&t) {
-            return None;
+    impl core::fmt::Display for Celsius {
+        /// Renders as degrees Celsius, honouring precision: `{:.2}` works.
+        ///
+        /// This is the rendering edge the post-parse value is finally
+        /// allowed to become a float at.
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            core::fmt::Display::fmt(&self.to_degrees(), f)
+        }
+    }
+
+    impl core::fmt::Display for OutOfRange {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Self::NotANumber => f.write_str("temperature is not a number"),
+                Self::TooLow => f.write_str("temperature is below -128 C"),
+                Self::TooHigh => f.write_str("temperature is above 127.9375 C"),
+            }
+        }
+    }
+
+    /// Sixteenths of a degree in the lowest representable temperature.
+    pub(crate) const MIN_SIXTEENTHS: i16 = -2048;
+
+    /// Sixteenths of a degree in the highest representable temperature.
+    pub(crate) const MAX_SIXTEENTHS: i16 = 2047;
+
+    /// Bits the 12-bit temperature field is left-shifted by within the
+    /// register.
+    const REGISTER_SHIFT: u32 = 4;
+
+    /// Values in sixteenths at or below this round to something below
+    /// [`Celsius::MIN`].
+    pub(crate) const LOWEST_ACCEPTED: f32 = -2048.5;
+
+    /// Values in sixteenths at or above this round to something above
+    /// [`Celsius::MAX`].
+    pub(crate) const HIGHEST_ACCEPTED: f32 = 2047.5;
+
+    impl Celsius {
+        /// Lowest temperature the part can represent, −128 °C.
+        pub const MIN: Self = Self(MIN_SIXTEENTHS);
+
+        /// Highest temperature the part can represent, +127.9375 °C.
+        ///
+        /// Note this is one LSB short of +128 °C: two's complement
+        /// affords one more negative code than positive.
+        pub const MAX: Self = Self(MAX_SIXTEENTHS);
+
+        /// Zero degrees.
+        pub const ZERO: Self = Self(0);
+
+        /// Build a temperature from sixteenths of a degree.
+        ///
+        /// # Errors
+        ///
+        /// [`OutOfRange`] if `sixteenths` is outside `-2048..=2047`.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use tmp108::{Celsius, OutOfRange};
+        /// assert_eq!(Celsius::from_sixteenths(400).unwrap().to_degrees(), 25.0);
+        /// assert_eq!(Celsius::from_sixteenths(9999), Err(OutOfRange::TooHigh));
+        /// ```
+        pub const fn from_sixteenths(sixteenths: i16) -> Result<Self, OutOfRange> {
+            if sixteenths < MIN_SIXTEENTHS {
+                Err(OutOfRange::TooLow)
+            } else if sixteenths > MAX_SIXTEENTHS {
+                Err(OutOfRange::TooHigh)
+            } else {
+                Ok(Self(sixteenths))
+            }
         }
 
-        // Range-checked above; this cast cannot truncate.
-        #[allow(clippy::cast_possible_truncation)]
-        Some((t * 16.0 / CELSIUS_PER_BIT) as i16)
+        /// Parse a temperature in degrees Celsius.
+        ///
+        /// This is the boundary between what a human writes and what
+        /// the part can store. Values are rounded to the nearest
+        /// sixteenth of a degree, half away from zero.
+        ///
+        /// # Errors
+        ///
+        /// [`OutOfRange`] if `degrees` is `NaN`, infinite, or rounds to
+        /// a value outside [`Celsius::MIN`]`..=`[`Celsius::MAX`].
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use tmp108::{Celsius, OutOfRange};
+        /// assert_eq!(Celsius::try_from_degrees(-55.0).unwrap().sixteenths(), -880);
+        /// assert_eq!(Celsius::try_from_degrees(128.0), Err(OutOfRange::TooHigh));
+        /// assert_eq!(Celsius::try_from_degrees(f32::NAN), Err(OutOfRange::NotANumber));
+        /// ```
+        pub fn try_from_degrees(degrees: f32) -> Result<Self, OutOfRange> {
+            if degrees.is_nan() {
+                return Err(OutOfRange::NotANumber);
+            }
+
+            let scaled = degrees * 16.0;
+
+            // Rounding half away from zero then truncating means a value is
+            // representable exactly when it lies strictly inside this open
+            // interval. Checking `scaled` rather than the rounded value keeps
+            // the endpoints, -128.0 and 127.9375, inside the range where they
+            // belong.
+            if scaled <= LOWEST_ACCEPTED {
+                return Err(OutOfRange::TooLow);
+            }
+            if scaled >= HIGHEST_ACCEPTED {
+                return Err(OutOfRange::TooHigh);
+            }
+
+            // `f32::round` lives in `std`, and this crate is `no_std`. Adding
+            // a half and truncating toward zero rounds half away from zero.
+            let rounded = if scaled >= 0.0 { scaled + 0.5 } else { scaled - 0.5 };
+
+            // The bounds above guarantee this lands in `-2048..=2047`.
+            #[allow(clippy::cast_possible_truncation)]
+            Ok(Self(rounded as i16))
+        }
+
+        /// The temperature in sixteenths of a degree.
+        #[must_use]
+        pub const fn sixteenths(self) -> i16 {
+            self.0
+        }
+
+        /// The temperature in degrees Celsius.
+        ///
+        /// Exact: the scale factor is a power of two and the value
+        /// always fits in an `f32` mantissa, so nothing is rounded
+        /// here.
+        #[must_use]
+        pub fn to_degrees(self) -> f32 {
+            f32::from(self.0) * 0.0625
+        }
+
+        /// Decode a temperature or limit register.
+        ///
+        /// Total. The register holds a 12-bit two's complement value
+        /// left-justified in 16 bits, so every one of the 65,536
+        /// possible bit patterns names a temperature in range. The four
+        /// unused low bits are discarded — per the datasheet (Table 6
+        /// and Table 12) they are hardwired zero and "always read 0".
+        pub(crate) const fn from_register(raw: [u8; 2]) -> Self {
+            // Arithmetic shift: sign-extends, and floors rather than
+            // truncating toward zero, which matters only for the low bits the
+            // part never sets.
+            Self(i16::from_be_bytes(raw) >> REGISTER_SHIFT)
+        }
+
+        /// Encode into a temperature or limit register.
+        ///
+        /// Total. The invariant on the inner value guarantees the shift
+        /// cannot overflow.
+        pub(crate) const fn to_register(self) -> [u8; 2] {
+            (self.0 << REGISTER_SHIFT).to_be_bytes()
+        }
     }
 
     /// Snap a continuous-f32 hysteresis input to the nearest legal
@@ -188,10 +351,10 @@ pub(crate) mod ops {
     #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
     pub(crate) fn snap_hysteresis(input: f32) -> Option<Hysteresis> {
         const HYS_VALUES: &[(f32, Hysteresis)] = &[
-            (0.0, Hysteresis::_0C),
-            (1.0, Hysteresis::_1C),
-            (2.0, Hysteresis::_2C),
-            (4.0, Hysteresis::_4C),
+            (0.0, Hysteresis::ZeroC),
+            (1.0, Hysteresis::OneC),
+            (2.0, Hysteresis::TwoC),
+            (4.0, Hysteresis::FourC),
         ];
 
         if !input.is_finite() {
@@ -242,6 +405,7 @@ pub(crate) mod ops {
 /// For the asynchronous flavor, see [`AsyncTmp108`].
 pub struct Tmp108<I2C: I2c> {
     inner: Inner<Interface<I2C>>,
+    addr: u8,
 }
 
 /// Asynchronous TMP108 driver.
@@ -254,6 +418,7 @@ pub struct Tmp108<I2C: I2c> {
 #[cfg(feature = "async")]
 pub struct AsyncTmp108<I2C: AsyncI2c> {
     inner: Inner<AsyncInterface<I2C>>,
+    addr: u8,
 }
 
 impl<I2C: I2c> Tmp108<I2C> {
@@ -272,9 +437,10 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// ```
     pub fn new(i2c: I2C, a0: A0) -> Self {
         let interface = Interface::new(i2c, a0);
+        let addr = interface.addr;
         let inner = Inner::new(interface);
 
-        Self { inner }
+        Self { inner, addr }
     }
 
     /// Create a new TMP108 instance with A0 tied to GND, resulting in
@@ -363,7 +529,7 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// # i2c.done();
     /// ```
     pub fn addr(&self) -> u8 {
-        self.inner.interface.addr
+        self.addr
     }
 
     /// Destroy the driver instance, return the I2C bus instance.
@@ -379,7 +545,7 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// i2c.done();
     /// ```
     pub fn destroy(self) -> I2C {
-        self.inner.interface.i2c
+        self.inner.free().i2c
     }
 }
 
@@ -402,9 +568,10 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// ```
     pub fn new(i2c: I2C, a0: A0) -> Self {
         let interface = AsyncInterface::new(i2c, a0);
+        let addr = interface.addr;
         let inner = Inner::new(interface);
 
-        Self { inner }
+        Self { inner, addr }
     }
 
     /// Create a new TMP108 instance with A0 tied to GND, resulting in
@@ -503,7 +670,7 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// # });
     /// ```
     pub fn addr(&self) -> u8 {
-        self.inner.interface.addr
+        self.addr
     }
 
     /// Destroy the driver instance, return the I2C bus instance.
@@ -521,7 +688,7 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// # });
     /// ```
     pub fn destroy(self) -> I2C {
-        self.inner.interface.i2c
+        self.inner.free().i2c
     }
 
     /// Create a new [`AlertTmp108`] instance by consuming the original
@@ -910,8 +1077,8 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// tmp.configure(Config {
     ///     thermostat_mode: Thermostat::Interrupt,
     ///     alert_polarity: Polarity::ActiveHigh,
-    ///     conversion_rate: ConversionRate::_16Hz,
-    ///     hysteresis: Hysteresis::_4C,
+    ///     conversion_rate: ConversionRate::SixteenHz,
+    ///     hysteresis: Hysteresis::FourC,
     /// }).unwrap();
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
@@ -936,13 +1103,13 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// ]);
     /// let mut tmp = Tmp108::new_with_a0_gnd(i2c);
     /// let temp = tmp.temperature().unwrap();
-    /// assert!((temp - 50.0).abs() < 0.01);
+    /// assert_eq!(temp.to_degrees(), 50.0);
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
     /// ```
-    pub fn temperature(&mut self) -> Result<f32, I2C::Error> {
+    pub fn temperature(&mut self) -> Result<Celsius, I2C::Error> {
         let raw = self.inner.temperature().read()?;
-        Ok(ops::to_celsius(i16::from_be_bytes(raw.into())))
+        Ok(Celsius::from_register(raw.into()))
     }
 
     /// Configure device for one-shot conversion
@@ -1041,11 +1208,11 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// let mut tmp = Tmp108::new_with_a0_gnd(i2c);
     /// let mut delay = NoopDelay::new();
     /// let temp = tmp.wait_for_temperature(&mut delay).unwrap();
-    /// assert!((temp - 50.0).abs() < 0.01);
+    /// assert_eq!(temp.to_degrees(), 50.0);
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
     /// ```
-    pub fn wait_for_temperature<DELAY: DelayNs>(&mut self, delay: &mut DELAY) -> Result<f32, I2C::Error> {
+    pub fn wait_for_temperature<DELAY: DelayNs>(&mut self, delay: &mut DELAY) -> Result<Celsius, I2C::Error> {
         let config = self.read_configuration()?;
         delay.delay_us(conversion_period_us(config.conversion_rate));
         self.temperature()
@@ -1067,40 +1234,41 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// ]);
     /// let mut tmp = Tmp108::new_with_a0_gnd(i2c);
     /// let limit = tmp.low_limit().unwrap();
-    /// assert!((limit - 25.0).abs() < 0.01);
+    /// assert_eq!(limit.to_degrees(), 25.0);
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
     /// ```
-    pub fn low_limit(&mut self) -> Result<f32, I2C::Error> {
+    pub fn low_limit(&mut self) -> Result<Celsius, I2C::Error> {
         let raw = self.inner.t_low().read()?;
-        Ok(ops::to_celsius(i16::from_be_bytes(raw.into())))
+        Ok(Celsius::from_register(raw.into()))
     }
 
     /// Set temperature low limit register
     ///
+    /// Takes a [`Celsius`], which by construction is always
+    /// representable in the chip's 12-bit limit register, so the only
+    /// remaining failure mode is the bus. Build one with
+    /// [`Celsius::try_from_degrees`] or [`Celsius::from_sixteenths`].
+    ///
     /// # Errors
     ///
-    /// - `Error::InvalidInput` if `limit` is NaN, ±∞, or outside
-    ///   `[-128.0, 127.9375] °C` (the representable range of the chip's
-    ///   12-bit fixed-point limit register).
-    /// - `Error::Bus` when the I2C transaction fails.
+    /// `I2C::Error` when the I2C transaction fails
     ///
     /// # Examples
     ///
     /// ```
     /// # use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
-    /// use tmp108::Tmp108;
+    /// use tmp108::{Celsius, Tmp108};
     /// let i2c = Mock::new(&[
     ///     Transaction::write(0x48, vec![0x02, 0x19, 0x00]),
     /// ]);
     /// let mut tmp = Tmp108::new_with_a0_gnd(i2c);
-    /// tmp.set_low_limit(25.0).unwrap();
+    /// tmp.set_low_limit(Celsius::try_from_degrees(25.0).unwrap()).unwrap();
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
     /// ```
-    pub fn set_low_limit(&mut self, limit: f32) -> Result<(), Error<I2C::Error>> {
-        let raw = ops::to_raw(limit).ok_or(Error::InvalidInput)?.to_be_bytes();
-        self.inner.t_low().write(|r| *r = TLow::from(raw)).map_err(Error::Bus)
+    pub fn set_low_limit(&mut self, limit: Celsius) -> Result<(), I2C::Error> {
+        self.inner.t_low().write(|r| *r = TLow::from(limit.to_register()))
     }
 
     /// Read temperature high limit register
@@ -1119,40 +1287,41 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// ]);
     /// let mut tmp = Tmp108::new_with_a0_gnd(i2c);
     /// let limit = tmp.high_limit().unwrap();
-    /// assert!((limit - 80.0).abs() < 0.01);
+    /// assert_eq!(limit.to_degrees(), 80.0);
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
     /// ```
-    pub fn high_limit(&mut self) -> Result<f32, I2C::Error> {
+    pub fn high_limit(&mut self) -> Result<Celsius, I2C::Error> {
         let raw = self.inner.t_high().read()?;
-        Ok(ops::to_celsius(i16::from_be_bytes(raw.into())))
+        Ok(Celsius::from_register(raw.into()))
     }
 
     /// Set temperature high limit register
     ///
+    /// Takes a [`Celsius`], which by construction is always
+    /// representable in the chip's 12-bit limit register, so the only
+    /// remaining failure mode is the bus. Build one with
+    /// [`Celsius::try_from_degrees`] or [`Celsius::from_sixteenths`].
+    ///
     /// # Errors
     ///
-    /// - `Error::InvalidInput` if `limit` is NaN, ±∞, or outside
-    ///   `[-128.0, 127.9375] °C` (the representable range of the chip's
-    ///   12-bit fixed-point limit register).
-    /// - `Error::Bus` when the I2C transaction fails.
+    /// `I2C::Error` when the I2C transaction fails
     ///
     /// # Examples
     ///
     /// ```
     /// # use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
-    /// use tmp108::Tmp108;
+    /// use tmp108::{Celsius, Tmp108};
     /// let i2c = Mock::new(&[
     ///     Transaction::write(0x48, vec![0x03, 0x50, 0x00]),
     /// ]);
     /// let mut tmp = Tmp108::new_with_a0_gnd(i2c);
-    /// tmp.set_high_limit(80.0).unwrap();
+    /// tmp.set_high_limit(Celsius::try_from_degrees(80.0).unwrap()).unwrap();
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
     /// ```
-    pub fn set_high_limit(&mut self, limit: f32) -> Result<(), Error<I2C::Error>> {
-        let raw = ops::to_raw(limit).ok_or(Error::InvalidInput)?.to_be_bytes();
-        self.inner.t_high().write(|r| *r = THigh::from(raw)).map_err(Error::Bus)
+    pub fn set_high_limit(&mut self, limit: Celsius) -> Result<(), I2C::Error> {
+        self.inner.t_high().write(|r| *r = THigh::from(limit.to_register()))
     }
 }
 
@@ -1234,8 +1403,8 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// tmp.configure(Config {
     ///     thermostat_mode: Thermostat::Interrupt,
     ///     alert_polarity: Polarity::ActiveHigh,
-    ///     conversion_rate: ConversionRate::_16Hz,
-    ///     hysteresis: Hysteresis::_4C,
+    ///     conversion_rate: ConversionRate::SixteenHz,
+    ///     hysteresis: Hysteresis::FourC,
     /// }).await.unwrap();
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
@@ -1265,14 +1434,14 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// ]);
     /// let mut tmp = AsyncTmp108::new_with_a0_gnd(i2c);
     /// let temp = tmp.temperature().await.unwrap();
-    /// assert!((temp - 50.0).abs() < 0.01);
+    /// assert_eq!(temp.to_degrees(), 50.0);
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
     /// # });
     /// ```
-    pub async fn temperature(&mut self) -> Result<f32, I2C::Error> {
+    pub async fn temperature(&mut self) -> Result<Celsius, I2C::Error> {
         let raw = self.inner.temperature().read_async().await?;
-        Ok(ops::to_celsius(i16::from_be_bytes(raw.into())))
+        Ok(Celsius::from_register(raw.into()))
     }
 
     /// Configure device for one-shot conversion
@@ -1429,12 +1598,15 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// let mut tmp = AsyncTmp108::new_with_a0_gnd(i2c);
     /// let mut delay = NoopDelay::new();
     /// let temp = tmp.wait_for_temperature(&mut delay).await.unwrap();
-    /// assert!((temp - 50.0).abs() < 0.01);
+    /// assert_eq!(temp.to_degrees(), 50.0);
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
     /// # });
     /// ```
-    pub async fn wait_for_temperature<DELAY: AsyncDelayNs>(&mut self, delay: &mut DELAY) -> Result<f32, I2C::Error> {
+    pub async fn wait_for_temperature<DELAY: AsyncDelayNs>(
+        &mut self,
+        delay: &mut DELAY,
+    ) -> Result<Celsius, I2C::Error> {
         let config = self.read_configuration().await?;
         delay.delay_us(conversion_period_us(config.conversion_rate)).await;
         self.temperature().await
@@ -1457,47 +1629,47 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// ]);
     /// let mut tmp = AsyncTmp108::new_with_a0_gnd(i2c);
     /// let limit = tmp.low_limit().await.unwrap();
-    /// assert!((limit - 25.0).abs() < 0.01);
+    /// assert_eq!(limit.to_degrees(), 25.0);
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
     /// # });
     /// ```
-    pub async fn low_limit(&mut self) -> Result<f32, I2C::Error> {
+    pub async fn low_limit(&mut self) -> Result<Celsius, I2C::Error> {
         let raw = self.inner.t_low().read_async().await?;
-        Ok(ops::to_celsius(i16::from_be_bytes(raw.into())))
+        Ok(Celsius::from_register(raw.into()))
     }
 
     /// Set temperature low limit register
     ///
+    /// Takes a [`Celsius`], which by construction is always
+    /// representable in the chip's 12-bit limit register, so the only
+    /// remaining failure mode is the bus. Build one with
+    /// [`Celsius::try_from_degrees`] or [`Celsius::from_sixteenths`].
+    ///
     /// # Errors
     ///
-    /// - `Error::InvalidInput` if `limit` is NaN, ±∞, or outside
-    ///   `[-128.0, 127.9375] °C` (the representable range of the chip's
-    ///   12-bit fixed-point limit register).
-    /// - `Error::Bus` when the I2C transaction fails.
+    /// `I2C::Error` when the I2C transaction fails
     ///
     /// # Examples
     ///
     /// ```
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// # use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
-    /// use tmp108::AsyncTmp108;
+    /// use tmp108::{AsyncTmp108, Celsius};
     /// let i2c = Mock::new(&[
     ///     Transaction::write(0x48, vec![0x02, 0x19, 0x00]),
     /// ]);
     /// let mut tmp = AsyncTmp108::new_with_a0_gnd(i2c);
-    /// tmp.set_low_limit(25.0).await.unwrap();
+    /// tmp.set_low_limit(Celsius::try_from_degrees(25.0).unwrap()).await.unwrap();
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
     /// # });
     /// ```
-    pub async fn set_low_limit(&mut self, limit: f32) -> Result<(), Error<I2C::Error>> {
-        let raw = ops::to_raw(limit).ok_or(Error::InvalidInput)?.to_be_bytes();
+    pub async fn set_low_limit(&mut self, limit: Celsius) -> Result<(), I2C::Error> {
         self.inner
             .t_low()
-            .write_async(|r| *r = TLow::from(raw))
+            .write_async(|r| *r = TLow::from(limit.to_register()))
             .await
-            .map_err(Error::Bus)
     }
 
     /// Read temperature high limit register
@@ -1517,57 +1689,57 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// ]);
     /// let mut tmp = AsyncTmp108::new_with_a0_gnd(i2c);
     /// let limit = tmp.high_limit().await.unwrap();
-    /// assert!((limit - 80.0).abs() < 0.01);
+    /// assert_eq!(limit.to_degrees(), 80.0);
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
     /// # });
     /// ```
-    pub async fn high_limit(&mut self) -> Result<f32, I2C::Error> {
+    pub async fn high_limit(&mut self) -> Result<Celsius, I2C::Error> {
         let raw = self.inner.t_high().read_async().await?;
-        Ok(ops::to_celsius(i16::from_be_bytes(raw.into())))
+        Ok(Celsius::from_register(raw.into()))
     }
 
     /// Set temperature high limit register
     ///
+    /// Takes a [`Celsius`], which by construction is always
+    /// representable in the chip's 12-bit limit register, so the only
+    /// remaining failure mode is the bus. Build one with
+    /// [`Celsius::try_from_degrees`] or [`Celsius::from_sixteenths`].
+    ///
     /// # Errors
     ///
-    /// - `Error::InvalidInput` if `limit` is NaN, ±∞, or outside
-    ///   `[-128.0, 127.9375] °C` (the representable range of the chip's
-    ///   12-bit fixed-point limit register).
-    /// - `Error::Bus` when the I2C transaction fails.
+    /// `I2C::Error` when the I2C transaction fails
     ///
     /// # Examples
     ///
     /// ```
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// # use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
-    /// use tmp108::AsyncTmp108;
+    /// use tmp108::{AsyncTmp108, Celsius};
     /// let i2c = Mock::new(&[
     ///     Transaction::write(0x48, vec![0x03, 0x50, 0x00]),
     /// ]);
     /// let mut tmp = AsyncTmp108::new_with_a0_gnd(i2c);
-    /// tmp.set_high_limit(80.0).await.unwrap();
+    /// tmp.set_high_limit(Celsius::try_from_degrees(80.0).unwrap()).await.unwrap();
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
     /// # });
     /// ```
-    pub async fn set_high_limit(&mut self, limit: f32) -> Result<(), Error<I2C::Error>> {
-        let raw = ops::to_raw(limit).ok_or(Error::InvalidInput)?.to_be_bytes();
+    pub async fn set_high_limit(&mut self, limit: Celsius) -> Result<(), I2C::Error> {
         self.inner
             .t_high()
-            .write_async(|r| *r = THigh::from(raw))
+            .write_async(|r| *r = THigh::from(limit.to_register()))
             .await
-            .map_err(Error::Bus)
     }
 }
 
 /// Compute the chip's conversion period (1/CR) in microseconds.
 const fn conversion_period_us(rate: ConversionRate) -> u32 {
     match rate {
-        ConversionRate::_0_25Hz => 4_000_000,
-        ConversionRate::_1Hz => 1_000_000,
-        ConversionRate::_4Hz => 250_000,
-        ConversionRate::_16Hz => 62_500,
+        ConversionRate::QuarterHz => 4_000_000,
+        ConversionRate::OneHz => 1_000_000,
+        ConversionRate::FourHz => 250_000,
+        ConversionRate::SixteenHz => 62_500,
     }
 }
 
@@ -1587,11 +1759,18 @@ impl<I2C: I2c> Interface<I2C> {
     }
 }
 
-impl<I2C: I2c> RegisterInterface for Interface<I2C> {
+impl<I2C: I2c> RegisterInterfaceBase for Interface<I2C> {
     type Error = I2C::Error;
     type AddressType = u8;
+}
 
-    fn write_register(&mut self, address: Self::AddressType, _size_bits: u32, data: &[u8]) -> Result<(), Self::Error> {
+impl<I2C: I2c> RegisterInterface for Interface<I2C> {
+    fn write_register(
+        &mut self,
+        address: Self::AddressType,
+        data: &mut [u8],
+        _metadata: &FieldsetMetadata,
+    ) -> Result<(), Self::Error> {
         debug_assert_eq!(data.len(), 2, "TMP108 registers are 16-bit");
         let mut buf = [0; 3];
         buf[0] = address;
@@ -1602,8 +1781,8 @@ impl<I2C: I2c> RegisterInterface for Interface<I2C> {
     fn read_register(
         &mut self,
         address: Self::AddressType,
-        _size_bits: u32,
         data: &mut [u8],
+        _metadata: &FieldsetMetadata,
     ) -> Result<(), Self::Error> {
         self.i2c.write_read(self.addr, &[address], data)
     }
@@ -1628,15 +1807,18 @@ impl<I2C: AsyncI2c> AsyncInterface<I2C> {
 }
 
 #[cfg(feature = "async")]
-impl<I2C: AsyncI2c> AsyncRegisterInterface for AsyncInterface<I2C> {
+impl<I2C: AsyncI2c> RegisterInterfaceBase for AsyncInterface<I2C> {
     type Error = I2C::Error;
     type AddressType = u8;
+}
 
+#[cfg(feature = "async")]
+impl<I2C: AsyncI2c> AsyncRegisterInterface for AsyncInterface<I2C> {
     async fn write_register(
         &mut self,
         address: Self::AddressType,
-        _size_bits: u32,
-        data: &[u8],
+        data: &mut [u8],
+        _metadata: &FieldsetMetadata,
     ) -> Result<(), Self::Error> {
         debug_assert_eq!(data.len(), 2, "TMP108 registers are 16-bit");
         let mut buf = [0; 3];
@@ -1648,8 +1830,8 @@ impl<I2C: AsyncI2c> AsyncRegisterInterface for AsyncInterface<I2C> {
     async fn read_register(
         &mut self,
         address: Self::AddressType,
-        _size_bits: u32,
         data: &mut [u8],
+        _metadata: &FieldsetMetadata,
     ) -> Result<(), Self::Error> {
         self.i2c.write_read(self.addr, &[address], data).await
     }
@@ -1726,7 +1908,7 @@ impl<I2C: embedded_hal::i2c::I2c> embedded_sensors_hal::sensor::ErrorType for Tm
 #[cfg(all(feature = "embedded-sensors-hal", not(feature = "async")))]
 impl<I2C: embedded_hal::i2c::I2c> embedded_sensors_hal::temperature::TemperatureSensor for Tmp108<I2C> {
     fn temperature(&mut self) -> Result<embedded_sensors_hal::temperature::DegreesCelsius, Self::Error> {
-        self.temperature().map_err(Error::Bus)
+        self.temperature().map(Celsius::to_degrees).map_err(Error::Bus)
     }
 }
 
@@ -1749,7 +1931,7 @@ impl<I2C: embedded_hal_async::i2c::I2c> embedded_sensors_hal_async::temperature:
     for AsyncTmp108<I2C>
 {
     async fn temperature(&mut self) -> Result<embedded_sensors_hal_async::temperature::DegreesCelsius, Self::Error> {
-        self.temperature().await.map_err(Error::Bus)
+        self.temperature().await.map(Celsius::to_degrees).map_err(Error::Bus)
     }
 }
 
@@ -1765,7 +1947,11 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
     embedded_sensors_hal_async::temperature::TemperatureSensor for AlertTmp108<I2C, ALERT>
 {
     async fn temperature(&mut self) -> Result<embedded_sensors_hal_async::temperature::DegreesCelsius, Self::Error> {
-        self.tmp108.temperature().await.map_err(Error::Bus)
+        self.tmp108
+            .temperature()
+            .await
+            .map(Celsius::to_degrees)
+            .map_err(Error::Bus)
     }
 }
 
@@ -1777,14 +1963,19 @@ impl<I2C: embedded_hal_async::i2c::I2c> embedded_sensors_hal_async::temperature:
         &mut self,
         threshold: embedded_sensors_hal_async::temperature::DegreesCelsius,
     ) -> Result<(), Self::Error> {
-        self.set_low_limit(threshold).await
+        // The trait takes a continuous f32; the chip takes a 12-bit
+        // fixed-point value. Parse at the boundary and reject anything
+        // the part cannot hold.
+        let limit = Celsius::try_from_degrees(threshold).map_err(|_| Error::InvalidInput)?;
+        self.set_low_limit(limit).await.map_err(Error::Bus)
     }
 
     async fn set_temperature_threshold_high(
         &mut self,
         threshold: embedded_sensors_hal_async::temperature::DegreesCelsius,
     ) -> Result<(), Self::Error> {
-        self.set_high_limit(threshold).await
+        let limit = Celsius::try_from_degrees(threshold).map_err(|_| Error::InvalidInput)?;
+        self.set_high_limit(limit).await.map_err(Error::Bus)
     }
 }
 
@@ -1796,16 +1987,16 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
         &mut self,
         threshold: embedded_sensors_hal_async::temperature::DegreesCelsius,
     ) -> Result<(), Self::Error> {
-        // Bare-AsyncTmp108 set_*_limit returns Error<I2C::Error>; widen the Pin
-        // type parameter to the AlertTmp108-flavored Error.
-        self.tmp108.set_low_limit(threshold).await.map_err(widen_pin_err)
+        let limit = Celsius::try_from_degrees(threshold).map_err(|_| Error::InvalidInput)?;
+        self.tmp108.set_low_limit(limit).await.map_err(Error::Bus)
     }
 
     async fn set_temperature_threshold_high(
         &mut self,
         threshold: embedded_sensors_hal_async::temperature::DegreesCelsius,
     ) -> Result<(), Self::Error> {
-        self.tmp108.set_high_limit(threshold).await.map_err(widen_pin_err)
+        let limit = Celsius::try_from_degrees(threshold).map_err(|_| Error::InvalidInput)?;
+        self.tmp108.set_high_limit(limit).await.map_err(Error::Bus)
     }
 }
 
@@ -1850,7 +2041,7 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
 
         // Return temperature at time of trigger for caller to determine which threshold was crossed.
         let temperature = self.tmp108.temperature().await.map_err(Error::Bus)?;
-        Ok(temperature)
+        Ok(temperature.to_degrees())
     }
 }
 
@@ -1907,18 +2098,34 @@ fn widen_pin_err<E: embedded_hal_async::i2c::Error, P: embedded_hal::digital::Er
 
 #[cfg(test)]
 mod tests {
-    use super::inner::field_sets::Configuration;
+    use super::inner::Configuration;
     use super::*;
+
+    /// A `Configuration` initialized to the chip's power-on reset
+    /// value.
+    ///
+    /// In device-driver 2.x a fieldset's `Default` is all-zeroes; the
+    /// documented reset value is carried by the *register operation*
+    /// instead. This helper reads it back out of the generated
+    /// register operation so the tests below stay pinned to the DDSL
+    /// manifest rather than to a hand-written constant.
+    fn por_configuration() -> Configuration {
+        let mut tmp = Tmp108::new_with_a0_gnd(embedded_hal_mock::eh1::i2c::Mock::new(&[]));
+        let cfg = tmp.inner.configuration().reset_value();
+        let mut i2c = tmp.destroy();
+        i2c.done();
+        cfg
+    }
 
     #[test]
     fn default_configuration() {
-        let cfg = Configuration::new();
+        let cfg = por_configuration();
         assert_eq!(u16::from_le_bytes(cfg.into()), 0x1022);
     }
 
     #[test]
     fn modify_mode() {
-        let mut cfg = Configuration::new();
+        let mut cfg = por_configuration();
         cfg.set_m(Mode::Shutdown);
         assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1020);
         cfg.set_m(Mode::OneShot);
@@ -1929,7 +2136,7 @@ mod tests {
 
     #[test]
     fn modify_thermostat_mode() {
-        let mut cfg = Configuration::new();
+        let mut cfg = por_configuration();
         cfg.set_tm(Thermostat::Comparator);
         assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
         cfg.set_tm(Thermostat::Interrupt);
@@ -1938,7 +2145,7 @@ mod tests {
 
     #[test]
     fn modify_watchdog_temperature_flags() {
-        let mut cfg = Configuration::new();
+        let mut cfg = por_configuration();
         cfg.set_fl(true);
         cfg.set_fh(false);
         assert_eq!(u16::from_ne_bytes(cfg.into()), 0x102a);
@@ -1952,33 +2159,33 @@ mod tests {
 
     #[test]
     fn modify_conversion_rate() {
-        let mut cfg = Configuration::new();
-        cfg.set_cr(ConversionRate::_0_25Hz);
+        let mut cfg = por_configuration();
+        cfg.set_cr(ConversionRate::QuarterHz);
         assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1002);
-        cfg.set_cr(ConversionRate::_1Hz);
+        cfg.set_cr(ConversionRate::OneHz);
         assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
-        cfg.set_cr(ConversionRate::_4Hz);
+        cfg.set_cr(ConversionRate::FourHz);
         assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1042);
-        cfg.set_cr(ConversionRate::_16Hz);
+        cfg.set_cr(ConversionRate::SixteenHz);
         assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1062);
     }
 
     #[test]
     fn modify_hysteresis() {
-        let mut cfg = Configuration::new();
-        cfg.set_hys(Hysteresis::_0C);
+        let mut cfg = por_configuration();
+        cfg.set_hys(Hysteresis::ZeroC);
         assert_eq!(u16::from_ne_bytes(cfg.into()), 0x0022);
-        cfg.set_hys(Hysteresis::_1C);
+        cfg.set_hys(Hysteresis::OneC);
         assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
-        cfg.set_hys(Hysteresis::_2C);
+        cfg.set_hys(Hysteresis::TwoC);
         assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2022);
-        cfg.set_hys(Hysteresis::_4C);
+        cfg.set_hys(Hysteresis::FourC);
         assert_eq!(u16::from_ne_bytes(cfg.into()), 0x3022);
     }
 
     #[test]
     fn modify_polarity() {
-        let mut cfg = Configuration::new();
+        let mut cfg = por_configuration();
         cfg.set_pol(Polarity::ActiveLow);
         assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
         cfg.set_pol(Polarity::ActiveHigh);
@@ -1986,68 +2193,163 @@ mod tests {
     }
 
     mod ops_tests {
-        use assert_approx_eq::assert_approx_eq;
-
         use super::*;
 
-        #[test]
-        fn to_celsius_legal_and_low_bits() {
-            // Datasheet-conforming inputs (bits 3..0 == 0).
-            let legal: &[(i16, f32)] = &[
-                (0x0000, 0.0),
-                (0x0010, 0.0625),
-                (0xFFF0_u16.cast_signed(), -0.0625),
-                (0x7FF0, 127.9375),
-                (0xC900_u16.cast_signed(), -55.0),
-            ];
-            for (raw, expected) in legal {
-                assert_approx_eq!(ops::to_celsius(*raw), *expected, 1e-5);
+        /// Exhaustive tests for the [`Celsius`] newtype and its
+        /// register codec.
+        mod celsius {
+            // Exactness is the property under test. The scale factor is a
+            // power of two and every value fits an `f32` mantissa, so these
+            // conversions are lossless. Comparing approximately would weaken
+            // the assertions, not strengthen them.
+            #![allow(clippy::float_cmp)]
+
+            use super::*;
+            use crate::ops::{HIGHEST_ACCEPTED, LOWEST_ACCEPTED, MAX_SIXTEENTHS, MIN_SIXTEENTHS};
+
+            /// Every temperature the type can hold. 4096 of them.
+            fn all() -> impl Iterator<Item = Celsius> {
+                (MIN_SIXTEENTHS..=MAX_SIXTEENTHS)
+                    .map(|s| Celsius::from_sixteenths(s).expect("in range by construction"))
             }
 
-            // Non-zero low bits: symmetric resolution (no integer-division
-            // truncation toward zero).
-            let symmetric: &[(i16, f32)] = &[(0x0001, 0.003_906_25), (0xFFFF_u16.cast_signed(), -0.003_906_25)];
-            for (raw, expected) in symmetric {
-                assert_approx_eq!(ops::to_celsius(*raw), *expected, 1e-5);
+            #[test]
+            fn decoding_a_register_is_total() {
+                // All 65,536 bit patterns, not a sample of them.
+                for word in 0..=u16::MAX {
+                    let c = Celsius::from_register(word.to_be_bytes());
+                    assert!(
+                        (MIN_SIXTEENTHS..=MAX_SIXTEENTHS).contains(&c.sixteenths()),
+                        "word {word:#06x} decoded out of range: {c:?}"
+                    );
+                }
             }
-        }
 
-        #[test]
-        fn to_raw_round_trips_legal_inputs() {
-            for celsius in [127.9375_f32, 80.0, 0.25, 0.0, -0.25, -55.0, -128.0] {
-                let raw = ops::to_raw(celsius).expect("legal input should encode");
-                assert_approx_eq!(ops::to_celsius(raw), celsius, 1e-4);
+            #[test]
+            fn every_temperature_roundtrips_through_a_register() {
+                for c in all() {
+                    assert_eq!(Celsius::from_register(c.to_register()), c);
+                }
             }
-        }
 
-        #[test]
-        fn to_raw_rejects_out_of_range_and_non_finite() {
-            for bad in [128.0_f32, 127.94, -128.001, 200.0, -200.0] {
-                assert_eq!(ops::to_raw(bad), None, "input {bad} should be rejected");
+            #[test]
+            fn every_temperature_roundtrips_through_sixteenths() {
+                for c in all() {
+                    assert_eq!(Celsius::from_sixteenths(c.sixteenths()), Ok(c));
+                }
             }
-            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-                assert_eq!(ops::to_raw(bad), None, "input {bad} should be rejected");
-            }
-        }
 
-        #[test]
-        fn to_raw_accepts_range_boundary() {
-            assert_eq!(ops::to_raw(-128.0), Some(-32768));
-            assert_eq!(ops::to_raw(127.9375), Some(32752));
+            #[test]
+            fn every_temperature_roundtrips_through_degrees() {
+                for c in all() {
+                    assert_eq!(Celsius::try_from_degrees(c.to_degrees()), Ok(c));
+                }
+            }
+
+            #[test]
+            fn sixteenths_outside_the_range_are_rejected() {
+                assert_eq!(Celsius::from_sixteenths(MIN_SIXTEENTHS - 1), Err(OutOfRange::TooLow));
+                assert_eq!(Celsius::from_sixteenths(MAX_SIXTEENTHS + 1), Err(OutOfRange::TooHigh));
+                assert_eq!(Celsius::from_sixteenths(i16::MIN), Err(OutOfRange::TooLow));
+                assert_eq!(Celsius::from_sixteenths(i16::MAX), Err(OutOfRange::TooHigh));
+            }
+
+            #[test]
+            fn degrees_the_part_cannot_hold_are_rejected() {
+                // The values that silently became 0 C, 127.9375 C and -128 C before.
+                assert_eq!(Celsius::try_from_degrees(f32::NAN), Err(OutOfRange::NotANumber));
+                assert_eq!(Celsius::try_from_degrees(f32::INFINITY), Err(OutOfRange::TooHigh));
+                assert_eq!(Celsius::try_from_degrees(f32::NEG_INFINITY), Err(OutOfRange::TooLow));
+                assert_eq!(Celsius::try_from_degrees(1000.0), Err(OutOfRange::TooHigh));
+                assert_eq!(Celsius::try_from_degrees(-500.0), Err(OutOfRange::TooLow));
+                assert_eq!(Celsius::try_from_degrees(128.0), Err(OutOfRange::TooHigh));
+            }
+
+            #[test]
+            fn the_extremes_are_exactly_representable() {
+                assert_eq!(Celsius::MIN.to_degrees(), -128.0);
+                assert_eq!(Celsius::MAX.to_degrees(), 127.9375);
+                assert_eq!(Celsius::ZERO.to_degrees(), 0.0);
+
+                // One LSB short of +128, not +128. Two's complement is lopsided.
+                assert_eq!(Celsius::try_from_degrees(127.9375), Ok(Celsius::MAX));
+                assert_eq!(Celsius::try_from_degrees(-128.0), Ok(Celsius::MIN));
+            }
+
+            #[test]
+            fn rounding_bounds_bracket_the_representable_range() {
+                // The accepted interval is open and sits exactly half an LSB
+                // outside the representable range at each end.
+                assert_eq!(LOWEST_ACCEPTED, f32::from(MIN_SIXTEENTHS) - 0.5);
+                assert_eq!(HIGHEST_ACCEPTED, f32::from(MAX_SIXTEENTHS) + 0.5);
+
+                // Just inside rounds back to the endpoint; exactly on the
+                // bound does not.
+                assert_eq!(Celsius::try_from_degrees(-128.03).unwrap(), Celsius::MIN);
+                assert_eq!(Celsius::try_from_degrees(-128.04), Err(OutOfRange::TooLow));
+                assert_eq!(Celsius::try_from_degrees(127.96).unwrap(), Celsius::MAX);
+                assert_eq!(Celsius::try_from_degrees(127.97), Err(OutOfRange::TooHigh));
+            }
+
+            #[test]
+            fn degrees_round_to_the_nearest_sixteenth() {
+                // 0.0625 C per LSB, so 0.03 rounds down to 0 and 0.04 rounds up to 1.
+                assert_eq!(Celsius::try_from_degrees(0.03).unwrap().sixteenths(), 0);
+                assert_eq!(Celsius::try_from_degrees(0.04).unwrap().sixteenths(), 1);
+                assert_eq!(Celsius::try_from_degrees(-0.03).unwrap().sixteenths(), 0);
+                assert_eq!(Celsius::try_from_degrees(-0.04).unwrap().sixteenths(), -1);
+            }
+
+            #[test]
+            fn known_datasheet_values_decode() {
+                // Table 7 of the datasheet, as register words.
+                for (word, degrees) in [
+                    (0x7ff0_u16, 127.9375_f32),
+                    (0x6400, 100.0),
+                    (0x5000, 80.0),
+                    (0x3200, 50.0),
+                    (0x1900, 25.0),
+                    (0x0040, 0.25),
+                    (0x0000, 0.0),
+                    (0xffc0, -0.25),
+                    (0xe700, -25.0),
+                    (0xc900, -55.0),
+                    (0x8000, -128.0),
+                ] {
+                    let c = Celsius::from_register(word.to_be_bytes());
+                    assert_eq!(c.to_degrees(), degrees, "word {word:#06x}");
+                    assert_eq!(c.to_register(), word.to_be_bytes(), "word {word:#06x}");
+                }
+            }
+
+            #[test]
+            fn unused_low_bits_are_discarded_not_truncated_toward_zero() {
+                // Per the datasheet (Table 6 / Table 12) bits 3..0 of the low
+                // byte are hardwired zero and "always read 0". `from_register`
+                // is nonetheless total and must floor rather than truncate
+                // toward zero for negatives.
+                assert_eq!(Celsius::from_register(0xffff_u16.to_be_bytes()).sixteenths(), -1);
+                assert_eq!(Celsius::from_register(0x0001_u16.to_be_bytes()).sixteenths(), 0);
+
+                // The power-on T_HIGH value, which the datasheet quotes as
+                // 0x7FF8 (+127.9375 C) — it carries a stray bit 3 that the
+                // register cannot store once written.
+                assert_eq!(Celsius::from_register(0x7ff8_u16.to_be_bytes()), Celsius::MAX);
+            }
         }
 
         #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
         #[test]
         fn snap_hysteresis_accepts_within_tolerance() {
             let cases: &[(f32, Hysteresis)] = &[
-                (0.0, Hysteresis::_0C),
-                (1.0, Hysteresis::_1C),
-                (2.0, Hysteresis::_2C),
-                (4.0, Hysteresis::_4C),
-                (0.04, Hysteresis::_0C),
-                (0.1_f32 + 0.9_f32, Hysteresis::_1C),
-                (1.95, Hysteresis::_2C),
-                (3.97, Hysteresis::_4C),
+                (0.0, Hysteresis::ZeroC),
+                (1.0, Hysteresis::OneC),
+                (2.0, Hysteresis::TwoC),
+                (4.0, Hysteresis::FourC),
+                (0.04, Hysteresis::ZeroC),
+                (0.1_f32 + 0.9_f32, Hysteresis::OneC),
+                (1.95, Hysteresis::TwoC),
+                (3.97, Hysteresis::FourC),
             ];
             for (input, expected) in cases {
                 assert_eq!(
@@ -2077,22 +2379,211 @@ mod tests {
             let cfg = Config {
                 thermostat_mode: Thermostat::Interrupt,
                 alert_polarity: Polarity::ActiveHigh,
-                conversion_rate: ConversionRate::_16Hz,
-                hysteresis: Hysteresis::_4C,
+                conversion_rate: ConversionRate::SixteenHz,
+                hysteresis: Hysteresis::FourC,
             };
 
-            let mut reg = Configuration::new();
+            let mut reg = por_configuration();
             ops::apply_config(&mut reg, cfg);
             assert_eq!(ops::decode_config(reg), cfg);
+        }
+
+        /// Exhaustive tests for the `Config` <-> configuration-register
+        /// codec.
+        ///
+        /// Every domain here is small enough to walk in full: `Config`
+        /// has 64 inhabitants (1 + 1 + 2 + 2 bits) and the register is
+        /// a single 16-bit word, so 65,536 covers every bit pattern the
+        /// part could ever hand back. Nothing is sampled.
+        mod config_bits {
+            use super::*;
+
+            /// Every `Thermostat`, in encoding order.
+            const THERMOSTATS: [Thermostat; 2] = [Thermostat::Comparator, Thermostat::Interrupt];
+
+            /// Every `Polarity`, in encoding order.
+            const POLARITIES: [Polarity; 2] = [Polarity::ActiveLow, Polarity::ActiveHigh];
+
+            /// Every `ConversionRate`, in encoding order.
+            const CONVERSION_RATES: [ConversionRate; 4] = [
+                ConversionRate::QuarterHz,
+                ConversionRate::OneHz,
+                ConversionRate::FourHz,
+                ConversionRate::SixteenHz,
+            ];
+
+            /// Every `Hysteresis`, in encoding order.
+            const HYSTERESES: [Hysteresis; 4] =
+                [Hysteresis::ZeroC, Hysteresis::OneC, Hysteresis::TwoC, Hysteresis::FourC];
+
+            /// The number of `Config` inhabitants the four modelled
+            /// fields admit: 2 * 2 * 4 * 4.
+            const CONFIG_INHABITANTS: usize = 64;
+
+            /// Bits of the configuration register that `Config` models:
+            /// `tm` (bit 2), `cr` (6:5), `hys` (13:12) and `pol` (bit
+            /// 15). Everything else — `m` (1:0), `fl` (bit 3), `fh`
+            /// (bit 4), `id` (bit 7) and the reserved bits 11:8 and 14
+            /// — must survive `apply_config` untouched.
+            const MODELLED_MASK: u16 = 0b1011_0000_0110_0100;
+
+            /// The `m` field, 1:0. Encoding 3 is reserved.
+            const MODE_MASK: u16 = 0b11;
+
+            /// The reserved `m` encoding: three variants in two bits.
+            const RESERVED_MODE: u16 = 3;
+
+            /// The 64 `Config` values, applied to `f` one at a time.
+            ///
+            /// Returns how many it produced so callers can pin the
+            /// count.
+            fn for_each_config(mut f: impl FnMut(Config)) -> usize {
+                let mut count = 0;
+                for thermostat_mode in THERMOSTATS {
+                    for alert_polarity in POLARITIES {
+                        for conversion_rate in CONVERSION_RATES {
+                            for hysteresis in HYSTERESES {
+                                f(Config {
+                                    thermostat_mode,
+                                    alert_polarity,
+                                    conversion_rate,
+                                    hysteresis,
+                                });
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+                count
+            }
+
+            /// A `Config` with all four modelled fields at their lowest
+            /// encoding — every modelled bit clear.
+            const fn all_min() -> Config {
+                Config {
+                    thermostat_mode: Thermostat::Comparator,
+                    alert_polarity: Polarity::ActiveLow,
+                    conversion_rate: ConversionRate::QuarterHz,
+                    hysteresis: Hysteresis::ZeroC,
+                }
+            }
+
+            /// A `Config` with all four modelled fields at their highest
+            /// encoding — every modelled bit set.
+            const fn all_max() -> Config {
+                Config {
+                    thermostat_mode: Thermostat::Interrupt,
+                    alert_polarity: Polarity::ActiveHigh,
+                    conversion_rate: ConversionRate::SixteenHz,
+                    hysteresis: Hysteresis::FourC,
+                }
+            }
+
+            /// The register word after applying `cfg` to `word`.
+            fn applied(word: u16, cfg: Config) -> u16 {
+                let mut reg = Configuration::from(word.to_le_bytes());
+                ops::apply_config(&mut reg, cfg);
+                u16::from_le_bytes(reg.into())
+            }
+
+            #[test]
+            fn every_config_roundtrips_through_the_register() {
+                let mut checked = 0;
+                let produced = for_each_config(|cfg| {
+                    let mut reg = por_configuration();
+                    ops::apply_config(&mut reg, cfg);
+                    assert_eq!(ops::decode_config(reg), cfg, "roundtrip failed for {cfg:?}");
+                    checked += 1;
+                });
+
+                assert_eq!(
+                    produced, CONFIG_INHABITANTS,
+                    "Config has {produced} inhabitants, not {CONFIG_INHABITANTS}. A modelled \
+                     field was widened or narrowed: revisit this test, MODELLED_MASK, and the \
+                     bit-preservation tests below before changing the expected count."
+                );
+                assert_eq!(checked, produced);
+            }
+
+            #[test]
+            fn apply_config_preserves_every_unmodelled_bit() {
+                // Bracket the field values: a Config with every modelled
+                // bit clear and one with every modelled bit set. A mask
+                // that is too wide in the clearing direction fails on
+                // all_min; too wide in the setting direction fails on
+                // all_max.
+                // First pin MODELLED_MASK itself, two-sidedly, so it
+                // cannot be quietly too wide: clearing every modelled
+                // field on an all-ones word must leave exactly the
+                // complement, and setting every modelled field on an
+                // all-zeroes word must produce exactly the mask.
+                assert_eq!(applied(0xffff, all_min()), !MODELLED_MASK);
+                assert_eq!(applied(0x0000, all_max()), MODELLED_MASK);
+
+                for cfg in [all_min(), all_max()] {
+                    for word in 0..=u16::MAX {
+                        let out = applied(word, cfg);
+                        assert_eq!(
+                            out & !MODELLED_MASK,
+                            word & !MODELLED_MASK,
+                            "apply_config({cfg:?}) disturbed unmodelled bits of {word:#06x}: \
+                             got {out:#06x}"
+                        );
+                    }
+                }
+            }
+
+            #[test]
+            fn every_config_applied_to_the_extreme_words() {
+                // 0x0000 and 0xffff are where an over-wide setter mask
+                // shows up: it either fails to set a bit it owns or
+                // clobbers one it does not.
+                for word in [0x0000_u16, 0xffff_u16] {
+                    let produced = for_each_config(|cfg| {
+                        let out = applied(word, cfg);
+
+                        assert_eq!(
+                            out & !MODELLED_MASK,
+                            word & !MODELLED_MASK,
+                            "apply_config({cfg:?}) on {word:#06x} disturbed unmodelled bits: \
+                             got {out:#06x}"
+                        );
+
+                        let reg = Configuration::from(out.to_le_bytes());
+                        assert_eq!(
+                            ops::decode_config(reg),
+                            cfg,
+                            "apply_config({cfg:?}) on {word:#06x} did not read back"
+                        );
+                    });
+                    assert_eq!(produced, CONFIG_INHABITANTS);
+                }
+            }
+
+            #[test]
+            fn the_mode_getter_fails_exactly_on_the_reserved_encoding() {
+                // Two-sided: reserved encodings must fail, and nothing
+                // else may. A getter that widened its failure set would
+                // reject perfectly legal words.
+                for word in 0..=u16::MAX {
+                    let reg = Configuration::from(word.to_le_bytes());
+                    let reserved = (word & MODE_MASK) == RESERVED_MODE;
+                    assert_eq!(
+                        reg.m().is_err(),
+                        reserved,
+                        "word {word:#06x}: m() error state disagrees with the reserved encoding"
+                    );
+                }
+            }
         }
 
         #[test]
         fn por_config_matches_default_configuration() {
             // ops::POR_CONFIG must match the chip's documented POR value
-            // (0x1022) and the generated Configuration field-set's
-            // default. If the device-driver TOML changes the reset value,
+            // (0x1022) and the generated configuration register's reset
+            // value. If the DDSL manifest changes the reset value,
             // probe()'s contract changes too — this test pins it.
-            let cfg = Configuration::new();
+            let cfg = por_configuration();
             assert_eq!(u16::from_le_bytes(cfg.into()), ops::POR_CONFIG);
         }
 
@@ -2190,8 +2681,8 @@ mod tests {
             let config = Config {
                 thermostat_mode: Thermostat::Interrupt,
                 alert_polarity: Polarity::ActiveHigh,
-                conversion_rate: ConversionRate::_16Hz,
-                hysteresis: Hysteresis::_4C,
+                conversion_rate: ConversionRate::SixteenHz,
+                hysteresis: Hysteresis::FourC,
             };
 
             let result = tmp108.configure(config);
@@ -2231,7 +2722,7 @@ mod tests {
                 assert!(result.is_ok());
 
                 let temp = result.unwrap();
-                assert_approx_eq!(temp, *t, 1e-4);
+                assert_approx_eq!(temp.to_degrees(), *t, 1e-4);
 
                 let mut mock = tmp108.destroy();
                 mock.done();
@@ -2270,14 +2761,15 @@ mod tests {
             let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
 
             for t in &temps {
-                let result = tmp108.set_low_limit(*t);
+                let limit = Celsius::try_from_degrees(*t).expect("datasheet value is representable");
+                let result = tmp108.set_low_limit(limit);
                 assert!(result.is_ok());
 
                 let result = tmp108.low_limit();
                 assert!(result.is_ok());
 
                 let temp = result.unwrap();
-                assert_approx_eq!(temp, *t, 1e-4);
+                assert_approx_eq!(temp.to_degrees(), *t, 1e-4);
             }
 
             let mut mock = tmp108.destroy();
@@ -2316,37 +2808,15 @@ mod tests {
             let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
 
             for t in &temps {
-                let result = tmp108.set_high_limit(*t);
+                let limit = Celsius::try_from_degrees(*t).expect("datasheet value is representable");
+                let result = tmp108.set_high_limit(limit);
                 assert!(result.is_ok());
 
                 let result = tmp108.high_limit();
                 assert!(result.is_ok());
 
                 let temp = result.unwrap();
-                assert_approx_eq!(temp, *t, 1e-4);
-            }
-
-            let mut mock = tmp108.destroy();
-            mock.done();
-        }
-
-        #[test]
-        fn reject_invalid_set_limit_inputs() {
-            // No I2C transactions are expected; out-of-range / non-finite
-            // inputs must be rejected before any bus traffic.
-            let mock = Mock::new(&[]);
-            let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
-
-            // Values just outside the representable [-128.0, 127.9375] range.
-            for bad in [128.0_f32, 127.940_f32, -128.001_f32, -200.0_f32, 200.0_f32] {
-                assert!(matches!(tmp108.set_low_limit(bad), Err(Error::InvalidInput)));
-                assert!(matches!(tmp108.set_high_limit(bad), Err(Error::InvalidInput)));
-            }
-
-            // Non-finite values.
-            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-                assert!(matches!(tmp108.set_low_limit(bad), Err(Error::InvalidInput)));
-                assert!(matches!(tmp108.set_high_limit(bad), Err(Error::InvalidInput)));
+                assert_approx_eq!(temp.to_degrees(), *t, 1e-4);
             }
 
             let mut mock = tmp108.destroy();
@@ -2452,8 +2922,8 @@ mod tests {
             let config = Config {
                 thermostat_mode: Thermostat::Interrupt,
                 alert_polarity: Polarity::ActiveHigh,
-                conversion_rate: ConversionRate::_16Hz,
-                hysteresis: Hysteresis::_4C,
+                conversion_rate: ConversionRate::SixteenHz,
+                hysteresis: Hysteresis::FourC,
             };
 
             let result = tmp108.configure(config).await;
@@ -2493,7 +2963,7 @@ mod tests {
                 assert!(result.is_ok());
 
                 let temp = result.unwrap();
-                assert_approx_eq!(temp, *t, 1e-4);
+                assert_approx_eq!(temp.to_degrees(), *t, 1e-4);
 
                 let mut mock = tmp108.destroy();
                 mock.done();
@@ -2532,14 +3002,15 @@ mod tests {
             let mut tmp108 = AsyncTmp108::new_with_a0_gnd(mock);
 
             for t in &temps {
-                let result = tmp108.set_high_limit(*t).await;
+                let limit = Celsius::try_from_degrees(*t).expect("datasheet value is representable");
+                let result = tmp108.set_high_limit(limit).await;
                 assert!(result.is_ok());
 
                 let result = tmp108.high_limit().await;
                 assert!(result.is_ok());
 
                 let temp = result.unwrap();
-                assert_approx_eq!(temp, *t, 1e-4);
+                assert_approx_eq!(temp.to_degrees(), *t, 1e-4);
             }
 
             let mut mock = tmp108.destroy();
@@ -2578,37 +3049,59 @@ mod tests {
             let mut tmp108 = AsyncTmp108::new_with_a0_gnd(mock);
 
             for t in &temps {
-                let result = tmp108.set_low_limit(*t).await;
+                let limit = Celsius::try_from_degrees(*t).expect("datasheet value is representable");
+                let result = tmp108.set_low_limit(limit).await;
                 assert!(result.is_ok());
 
                 let result = tmp108.low_limit().await;
                 assert!(result.is_ok());
 
                 let temp = result.unwrap();
-                assert_approx_eq!(temp, *t, 1e-4);
+                assert_approx_eq!(temp.to_degrees(), *t, 1e-4);
             }
 
             let mut mock = tmp108.destroy();
             mock.done();
         }
 
+        /// The `set_*_limit` methods can no longer reject their input —
+        /// [`Celsius`] carries the range invariant. The remaining
+        /// f32 boundary is the `TemperatureThresholdSet` trait, which
+        /// must still reject unrepresentable degrees before any bus
+        /// traffic occurs.
+        #[cfg(feature = "embedded-sensors-hal-async")]
         #[tokio::test]
-        async fn reject_invalid_set_limit_inputs() {
-            // No I2C transactions are expected; out-of-range / non-finite
-            // inputs must be rejected before any bus traffic.
+        async fn threshold_set_rejects_unrepresentable_degrees() {
+            use embedded_sensors_hal_async::temperature::TemperatureThresholdSet;
+
+            // No I2C transactions are expected.
             let mock = Mock::new(&[]);
             let mut tmp108 = AsyncTmp108::new_with_a0_gnd(mock);
 
-            // Values just outside the representable [-128.0, 127.9375] range.
-            for bad in [128.0_f32, 127.940_f32, -128.001_f32, -200.0_f32, 200.0_f32] {
-                assert!(matches!(tmp108.set_low_limit(bad).await, Err(Error::InvalidInput)));
-                assert!(matches!(tmp108.set_high_limit(bad).await, Err(Error::InvalidInput)));
+            // Values outside the representable [-128.0, 127.9375] range.
+            // Note 127.940 now *rounds* to 127.9375 and is accepted, so the
+            // rejection cases start half an LSB beyond the endpoints.
+            for bad in [128.0_f32, 127.98_f32, -128.05_f32, -200.0_f32, 200.0_f32] {
+                assert!(matches!(
+                    tmp108.set_temperature_threshold_low(bad).await,
+                    Err(Error::InvalidInput)
+                ));
+                assert!(matches!(
+                    tmp108.set_temperature_threshold_high(bad).await,
+                    Err(Error::InvalidInput)
+                ));
             }
 
             // Non-finite values.
             for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-                assert!(matches!(tmp108.set_low_limit(bad).await, Err(Error::InvalidInput)));
-                assert!(matches!(tmp108.set_high_limit(bad).await, Err(Error::InvalidInput)));
+                assert!(matches!(
+                    tmp108.set_temperature_threshold_low(bad).await,
+                    Err(Error::InvalidInput)
+                ));
+                assert!(matches!(
+                    tmp108.set_temperature_threshold_high(bad).await,
+                    Err(Error::InvalidInput)
+                ));
             }
 
             let mut mock = tmp108.destroy();
@@ -2773,10 +3266,10 @@ mod tests {
             // succeed and program the corresponding chip setting (no I2C
             // mismatch). Each acceptance path performs: read cfg, write cfg.
             //
-            // - 0.0 °C snaps to Hysteresis::_0C => HYS bits 0b00 => cfg word 0x0022 -> bytes [0x22, 0x00]
-            // - 1.0 °C snaps to Hysteresis::_1C => HYS bits 0b01 => cfg word 0x1022 -> bytes [0x22, 0x10]
-            // - 2.0 °C snaps to Hysteresis::_2C => HYS bits 0b10 => cfg word 0x2022 -> bytes [0x22, 0x20]
-            // - 4.0 °C snaps to Hysteresis::_4C => HYS bits 0b11 => cfg word 0x3022 -> bytes [0x22, 0x30]
+            // - 0.0 °C snaps to Hysteresis::ZeroC => HYS bits 0b00 => cfg word 0x0022 -> bytes [0x22, 0x00]
+            // - 1.0 °C snaps to Hysteresis::OneC => HYS bits 0b01 => cfg word 0x1022 -> bytes [0x22, 0x10]
+            // - 2.0 °C snaps to Hysteresis::TwoC => HYS bits 0b10 => cfg word 0x2022 -> bytes [0x22, 0x20]
+            // - 4.0 °C snaps to Hysteresis::FourC => HYS bits 0b11 => cfg word 0x3022 -> bytes [0x22, 0x30]
             //
             // For each accepted input we expect: write-read of cfg, then a
             // write of the new cfg. The chip's POR is 0x1022 (HYS=01).
