@@ -3122,9 +3122,15 @@ pub enum OneShotError<E> {
     /// field: both `0b10` and `0b11` are reported as
     /// [`Mode::Continuous`].
     PreparationNotShutdown(Mode),
-    /// A completion poll found the part in a continuous mode, which a
-    /// one-shot sequence never asks for. Something else wrote the
-    /// configuration register while the conversion was in flight.
+    /// A completion poll found the part in a continuous conversion
+    /// mode rather than still converting or complete. The sequence
+    /// aborts immediately: no further writes are issued and the
+    /// temperature register is not read.
+    ///
+    /// A configuration write through another device handle or bus
+    /// master is one way to reach this state. The driver cannot
+    /// determine the cause, and does not attempt to restore the mode
+    /// it found.
     ///
     /// Reports the decoded operating mode, not the raw two-bit M
     /// field: both `0b10` and `0b11` are reported as
@@ -4292,8 +4298,13 @@ mod tests {
             }
         }
 
-        // The fake has no I/O to await, so these return a ready
-        // future rather than being `async fn`s that never suspend.
+        // The access is recorded from *inside* the returned future,
+        // when it is first polled. Running the transaction eagerly
+        // and returning `ready(Ok(()))` would timestamp the access at
+        // the point the method was called, so a caller that builds
+        // this future early and awaits it late would be logged in the
+        // order it wrote its futures rather than the order it ran
+        // them.
         #[cfg(feature = "async")]
         impl embedded_hal_async::i2c::I2c for Bus {
             fn transaction(
@@ -4301,12 +4312,15 @@ mod tests {
                 _address: u8,
                 operations: &mut [embedded_hal::i2c::Operation<'_>],
             ) -> impl core::future::Future<Output = Result<(), Self::Error>> {
-                self.run(operations);
-                core::future::ready(Ok(()))
+                core::future::poll_fn(move |_| {
+                    self.run(operations);
+                    core::task::Poll::Ready(Ok(()))
+                })
             }
         }
 
-        /// A delay that takes no time and records what was asked for.
+        /// A delay that takes no wall-clock time, suspends its caller
+        /// once, and records what was asked for when it completes.
         pub struct Clock {
             log: Log,
         }
@@ -4330,16 +4344,65 @@ mod tests {
             }
         }
 
+        /// The future [`Clock`] hands back on the async path.
+        ///
+        /// Two properties, both load-bearing. It records its event
+        /// when it is *polled to completion*, not when it is created,
+        /// so building the future early and awaiting it late is
+        /// logged as what it is. And it returns [`Poll::Pending`]
+        /// once before completing, so awaiting it really does suspend
+        /// the caller — a delay that is always immediately ready
+        /// cannot tell "awaited in order" apart from "constructed in
+        /// order".
+        ///
+        /// [`Poll::Pending`]: core::task::Poll::Pending
+        #[cfg(feature = "async")]
+        pub struct Pause {
+            log: Log,
+            ms: u32,
+            suspended: bool,
+        }
+
+        #[cfg(feature = "async")]
+        impl Pause {
+            fn new(log: &Log, ms: u32) -> Self {
+                Self {
+                    log: log.clone(),
+                    ms,
+                    suspended: false,
+                }
+            }
+        }
+
+        #[cfg(feature = "async")]
+        impl core::future::Future for Pause {
+            type Output = ();
+
+            fn poll(
+                mut self: core::pin::Pin<&mut Self>,
+                cx: &mut core::task::Context<'_>,
+            ) -> core::task::Poll<Self::Output> {
+                if self.suspended {
+                    record(&self.log, Event::Delay(self.ms));
+                    core::task::Poll::Ready(())
+                } else {
+                    self.suspended = true;
+                    // Nothing external will ever wake this task, so
+                    // the pause has to schedule its own resumption.
+                    cx.waker().wake_by_ref();
+                    core::task::Poll::Pending
+                }
+            }
+        }
+
         #[cfg(feature = "async")]
         impl embedded_hal_async::delay::DelayNs for Clock {
             fn delay_ns(&mut self, ns: u32) -> impl core::future::Future<Output = ()> {
-                record(&self.log, Event::Delay(ns / 1_000_000));
-                core::future::ready(())
+                Pause::new(&self.log, ns / 1_000_000)
             }
 
             fn delay_ms(&mut self, ms: u32) -> impl core::future::Future<Output = ()> {
-                record(&self.log, Event::Delay(ms));
-                core::future::ready(())
+                Pause::new(&self.log, ms)
             }
         }
 
@@ -4384,6 +4447,76 @@ mod tests {
             [0x20, 0x10],
             [0x32, 0x00],
         ];
+
+        /// The fakes themselves, under test.
+        ///
+        /// `every_step_happens_in_the_documented_order` is only as
+        /// sharp as [`Bus`] and [`Clock`] are. An async fake that
+        /// records when its method is *called*, before handing back
+        /// the future, timestamps every effect at construction — and
+        /// then a poll loop that creates its delay first and awaits
+        /// it last logs in the documented order while executing in
+        /// the opposite one. These two tests write out that exact
+        /// shape and require the log to show what really happened,
+        /// so a regression in the fakes fails here rather than
+        /// silently unpinning the driver's ordering test.
+        #[cfg(feature = "async")]
+        mod fakes {
+            use embedded_hal_async::delay::DelayNs;
+            use embedded_hal_async::i2c::I2c;
+
+            use super::*;
+
+            /// One read, scripted for the write-read below.
+            const ONE_REPLY: &[[u8; 2]] = &[[0x20, 0x10]];
+
+            #[tokio::test]
+            async fn a_delay_constructed_first_but_awaited_last_is_logged_last() {
+                let log = log();
+                let mut bus = Bus::new(&log, ONE_REPLY);
+                let mut clock = Clock::new(&log);
+
+                let waiting = clock.delay_ms(5);
+                let mut word = [0u8; 2];
+                bus.write_read(0x48, &[0x01], &mut word).await.unwrap();
+                waiting.await;
+
+                assert_eq!(
+                    events(&log),
+                    vec![Event::Read(0x01), Event::Delay(5)],
+                    "the read ran first, so it must be logged first"
+                );
+            }
+
+            #[tokio::test]
+            async fn a_delay_awaited_before_a_read_is_logged_before_it() {
+                let log = log();
+                let mut bus = Bus::new(&log, ONE_REPLY);
+                let mut clock = Clock::new(&log);
+
+                clock.delay_ms(5).await;
+                let mut word = [0u8; 2];
+                bus.write_read(0x48, &[0x01], &mut word).await.unwrap();
+
+                assert_eq!(events(&log), vec![Event::Delay(5), Event::Read(0x01)]);
+            }
+
+            /// A bus access that is never awaited never reaches the
+            /// log — the corollary of recording on poll, and what
+            /// makes the log a record of execution rather than of
+            /// intent.
+            #[tokio::test]
+            async fn a_transaction_that_is_never_awaited_does_nothing() {
+                let log = log();
+                let mut bus = Bus::new(&log, ONE_REPLY);
+                let mut word = [0u8; 2];
+
+                let unawaited = bus.write_read(0x48, &[0x01], &mut word);
+                drop(unawaited);
+
+                assert_eq!(events(&log), Vec::new());
+            }
+        }
     }
 
     #[cfg(not(feature = "async"))]
