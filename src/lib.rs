@@ -536,9 +536,43 @@ pub(crate) mod ops {
         }
     }
 
-    /// Apply a typed [`Config`] to a configuration-register snapshot,
-    /// preserving untouched bits (M, FL, FH, ID).
+    /// Apply a typed [`Config`] to a configuration-register snapshot.
+    ///
+    /// FL, FH, ID and the reserved bits are preserved: `Config` does
+    /// not model them, and a read-modify-write must hand them back
+    /// exactly as sampled.
+    ///
+    /// `M` is different. It is a *command* field, not state: writing
+    /// `0b01` is what triggers a one-shot conversion (datasheet
+    /// SBOS663A, "One-Shot Mode"), and the chip clears the field back
+    /// to `0b00` once that conversion completes. A snapshot that still
+    /// reads `0b01` therefore describes a conversion **in flight**, and
+    /// echoing those bits would retrigger it — a caller changing an
+    /// unrelated setting would silently start a conversion it never
+    /// asked for. So a sampled `0b01` is normalised to `0b00`, the
+    /// state the chip reaches by itself the moment the in-flight
+    /// conversion lands.
+    ///
+    /// Every other raw encoding of `M` — `0b00`, `0b10` and `0b11` —
+    /// is written back bit-for-bit. In particular `0b11` is **not**
+    /// canonicalised to `0b10`, even though both decode to
+    /// [`Mode::Continuous`] (issue #62).
+    ///
+    /// [`Mode::Continuous`]: crate::Mode::Continuous
     pub(crate) fn apply_config(r: &mut Configuration, cfg: Config) {
+        // The raw M field lives in bits 1:0 of the low byte. Read it
+        // raw rather than through `r.m()`: `Mode` has no inhabitant
+        // for raw 0b11, so getting and re-setting it through the enum
+        // would rewrite 0b11 as 0b10. `set_m` is called only for the
+        // one encoding that must change.
+        const M_MASK: u8 = 0b11;
+        const M_ONE_SHOT: u8 = 0b01;
+
+        let raw: [u8; 2] = (*r).into();
+        if raw[0] & M_MASK == M_ONE_SHOT {
+            r.set_m(crate::Mode::Shutdown);
+        }
+
         r.set_tm(cfg.thermostat_mode);
         r.set_pol(cfg.alert_polarity);
         r.set_cr(cfg.conversion_rate);
@@ -1674,6 +1708,19 @@ impl<I2C: I2c> Tmp108<I2C> {
 
     /// Configure device parameters.
     ///
+    /// This is a read-modify-write: the flags and mode bits the chip
+    /// reports are read back and preserved, with one deliberate
+    /// exception. The `M` field is a *command*, not a setting, so a
+    /// sampled in-flight one-shot is stood down rather than echoed —
+    /// otherwise changing an unrelated setting would retrigger the
+    /// conversion.
+    ///
+    /// The consequence for callers hand-rolling a one-shot: do **not**
+    /// call `configure` between triggering the conversion and reading
+    /// its result. `configure` clears the in-flight trigger, so the
+    /// conversion you are waiting on will never be reported as
+    /// complete. Configure first, then trigger.
+    ///
     /// # Errors
     ///
     /// `I2C::Error` when the I2C transaction fails
@@ -1998,6 +2045,19 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     }
 
     /// Configure device parameters.
+    ///
+    /// This is a read-modify-write: the flags and mode bits the chip
+    /// reports are read back and preserved, with one deliberate
+    /// exception. The `M` field is a *command*, not a setting, so a
+    /// sampled in-flight one-shot is stood down rather than echoed —
+    /// otherwise changing an unrelated setting would retrigger the
+    /// conversion.
+    ///
+    /// The consequence for callers hand-rolling a one-shot: do **not**
+    /// call `configure` between triggering the conversion and reading
+    /// its result. `configure` clears the in-flight trigger, so the
+    /// conversion you are waiting on will never be reported as
+    /// complete. Configure first, then trigger.
     ///
     /// # Errors
     ///
@@ -3152,13 +3212,37 @@ mod tests {
 
             /// Bits of the configuration register that `Config` models:
             /// `tm` (bit 2), `cr` (6:5), `hys` (13:12) and `pol` (bit
-            /// 15). Everything else — `m` (1:0), `fl` (bit 3), `fh`
-            /// (bit 4), `id` (bit 7) and the reserved bits 11:8 and 14
-            /// — must survive `apply_config` untouched.
+            /// 15). Everything outside it that is not `m` — `fl` (bit
+            /// 3), `fh` (bit 4), `id` (bit 7) and the reserved bits
+            /// 11:8 and 14 — must survive `apply_config` untouched.
+            /// `m` (1:0) is outside the mask too but is *not*
+            /// preserved unconditionally; see [`expected_mode_field`].
             const MODELLED_MASK: u16 = 0b1011_0000_0110_0100;
 
             /// The `m` field, bits 1:0 of the configuration register.
             const MODE_FIELD: u16 = 0b11;
+
+            /// Every bit `apply_config` must hand back exactly as
+            /// sampled: neither a modelled setting nor the `m` command
+            /// field.
+            const PRESERVED: u16 = !MODELLED_MASK & !MODE_FIELD;
+
+            /// The raw `m` value `apply_config` must write back for a
+            /// sampled raw `m`.
+            ///
+            /// `m` is a command field, not state. Raw `0b01` on a
+            /// snapshot means a one-shot the chip has not finished
+            /// yet, so writing it back would retrigger the conversion;
+            /// `apply_config` normalises it to `0b00`. Every other
+            /// encoding is echoed bit-for-bit — including `0b11`,
+            /// which must **not** be canonicalised to `0b10` even
+            /// though both decode to [`Mode::Continuous`] (issue #62).
+            const fn expected_mode_field(sampled: u16) -> u16 {
+                match sampled {
+                    0b01 => 0b00,
+                    other => other,
+                }
+            }
 
             /// The 64 `Config` values, applied to `f` one at a time.
             ///
@@ -3244,16 +3328,95 @@ mod tests {
                 // field on an all-ones word must leave exactly the
                 // complement, and setting every modelled field on an
                 // all-zeroes word must produce exactly the mask.
+                //
+                // Both bracket words are safe from M normalisation:
+                // 0xffff has M = 0b11 and 0x0000 has M = 0b00, neither
+                // of which apply_config rewrites. If that ever stops
+                // holding, say so — do not widen MODELLED_MASK.
                 assert_eq!(applied(0xffff, all_min()), !MODELLED_MASK);
                 assert_eq!(applied(0x0000, all_max()), MODELLED_MASK);
 
+                // The sweep covers every non-setting bit except M,
+                // whose mapping is pinned separately by
+                // apply_config_normalises_only_an_in_flight_one_shot.
                 for cfg in [all_min(), all_max()] {
                     for word in 0..=u16::MAX {
                         let out = applied(word, cfg);
                         assert_eq!(
-                            out & !MODELLED_MASK,
-                            word & !MODELLED_MASK,
+                            out & PRESERVED,
+                            word & PRESERVED,
                             "apply_config({cfg:?}) disturbed unmodelled bits of {word:#06x}: \
+                             got {out:#06x}"
+                        );
+                    }
+                }
+            }
+
+            #[test]
+            fn apply_config_normalises_only_an_in_flight_one_shot() {
+                // The mapping, stated explicitly: an in-flight one-shot
+                // is stood down, every other encoding is echoed.
+                assert_eq!(expected_mode_field(0b00), 0b00);
+                assert_eq!(expected_mode_field(0b01), 0b00);
+                assert_eq!(expected_mode_field(0b10), 0b10);
+                assert_eq!(expected_mode_field(0b11), 0b11);
+
+                // ...and enforced on every word the part could hand
+                // back, for both extreme Configs.
+                for cfg in [all_min(), all_max()] {
+                    for word in 0..=u16::MAX {
+                        let out = applied(word, cfg);
+                        assert_eq!(
+                            out & MODE_FIELD,
+                            expected_mode_field(word & MODE_FIELD),
+                            "apply_config({cfg:?}) mapped M of {word:#06x} wrongly: \
+                             got {out:#06x}"
+                        );
+                    }
+                }
+            }
+
+            #[test]
+            fn apply_config_stands_down_an_in_flight_one_shot() {
+                // A sampled M of 0b01 is a conversion the chip has not
+                // finished. Writing those bits back would retrigger it,
+                // so apply_config writes 0b00 instead — while the four
+                // settings still land exactly as asked.
+                let cfg = all_max();
+                let out = applied(0x0001, cfg);
+
+                assert_eq!(out & MODE_FIELD, 0b00, "in-flight one-shot re-armed: {out:#06x}");
+                assert_eq!(
+                    ops::decode_config(Configuration::from(out.to_le_bytes())),
+                    cfg,
+                    "settings did not land: {out:#06x}"
+                );
+
+                // Same on a word where every other bit is set: 0xffff
+                // with M forced to 0b01.
+                let out = applied(0xfffd, all_min());
+                assert_eq!(out & MODE_FIELD, 0b00, "in-flight one-shot re-armed: {out:#06x}");
+                assert_eq!(
+                    ops::decode_config(Configuration::from(out.to_le_bytes())),
+                    all_min(),
+                    "settings did not land: {out:#06x}"
+                );
+            }
+
+            #[test]
+            fn apply_config_does_not_canonicalise_mode_three() {
+                // Guard against the naive `set_m(if m == OneShot {...}
+                // else { m })` shape: raw 0b11 decodes to
+                // Mode::Continuous, so round-tripping it through the
+                // enum would silently rewrite it as 0b10. Only raw
+                // 0b01 may ever be rewritten.
+                for cfg in [all_min(), all_max()] {
+                    for word in [0x0003_u16, 0xffff, 0x00f3, 0x1023] {
+                        let out = applied(word, cfg);
+                        assert_eq!(
+                            out & MODE_FIELD,
+                            0b11,
+                            "apply_config({cfg:?}) canonicalised M of {word:#06x}: \
                              got {out:#06x}"
                         );
                     }
@@ -3486,6 +3649,44 @@ mod tests {
 
             let mut mock = tmp108.destroy();
             mock.done();
+        }
+
+        /// `configure` is a read-modify-write. Bits 1:0 of
+        /// configuration byte 0 are `M`, a *command* field: a sampled
+        /// `0b01` is a one-shot still in flight, and writing it back
+        /// would retrigger a conversion the caller never asked for.
+        /// Only that encoding is rewritten; `0b00`, `0b10` and `0b11`
+        /// go back on the wire unchanged.
+        #[test]
+        fn configure_stands_down_an_in_flight_one_shot() {
+            // The applied Config encodes to byte 0 = 0x66 / byte 1 =
+            // 0xb0, whose own M bits are 0b10; each case differs only
+            // in the M bits echoed from the sampled byte.
+            for (sampled, written) in [
+                (0x20_u8, 0x64_u8), // shutdown, echoed
+                (0x21, 0x64),       // one-shot in flight -> shutdown
+                (0x22, 0x66),       // continuous, echoed
+                (0x23, 0x67),       // continuous (M = 0b11), echoed verbatim
+            ] {
+                let expectations = vec![
+                    Transaction::write_read(0x48, vec![0x01], vec![sampled, 0x10]),
+                    Transaction::write(0x48, vec![0x01, written, 0xb0]),
+                ];
+
+                let mock = Mock::new(&expectations);
+                let mut tmp108 = Tmp108::new_with_a0_gnd(mock);
+                tmp108
+                    .configure(Config {
+                        thermostat_mode: Thermostat::Interrupt,
+                        alert_polarity: Polarity::ActiveHigh,
+                        conversion_rate: ConversionRate::SixteenHz,
+                        hysteresis: Hysteresis::FourC,
+                    })
+                    .unwrap();
+
+                let mut mock = tmp108.destroy();
+                mock.done();
+            }
         }
 
         #[test]
@@ -3727,6 +3928,45 @@ mod tests {
 
             let mut mock = tmp108.destroy();
             mock.done();
+        }
+
+        /// `configure` is a read-modify-write. Bits 1:0 of
+        /// configuration byte 0 are `M`, a *command* field: a sampled
+        /// `0b01` is a one-shot still in flight, and writing it back
+        /// would retrigger a conversion the caller never asked for.
+        /// Only that encoding is rewritten; `0b00`, `0b10` and `0b11`
+        /// go back on the wire unchanged.
+        #[tokio::test]
+        async fn configure_stands_down_an_in_flight_one_shot() {
+            // The applied Config encodes to byte 0 = 0x66 / byte 1 =
+            // 0xb0, whose own M bits are 0b10; each case differs only
+            // in the M bits echoed from the sampled byte.
+            for (sampled, written) in [
+                (0x20_u8, 0x64_u8), // shutdown, echoed
+                (0x21, 0x64),       // one-shot in flight -> shutdown
+                (0x22, 0x66),       // continuous, echoed
+                (0x23, 0x67),       // continuous (M = 0b11), echoed verbatim
+            ] {
+                let expectations = vec![
+                    Transaction::write_read(0x48, vec![0x01], vec![sampled, 0x10]),
+                    Transaction::write(0x48, vec![0x01, written, 0xb0]),
+                ];
+
+                let mock = Mock::new(&expectations);
+                let mut tmp108 = AsyncTmp108::new_with_a0_gnd(mock);
+                tmp108
+                    .configure(Config {
+                        thermostat_mode: Thermostat::Interrupt,
+                        alert_polarity: Polarity::ActiveHigh,
+                        conversion_rate: ConversionRate::SixteenHz,
+                        hysteresis: Hysteresis::FourC,
+                    })
+                    .await
+                    .unwrap();
+
+                let mut mock = tmp108.destroy();
+                mock.done();
+            }
         }
 
         #[tokio::test]
