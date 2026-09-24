@@ -788,28 +788,56 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
 ///
 /// Reading the configuration register is not a side-effect-free status
 /// query: per TMP108 datasheet SBOS663A §7.5.3.4, it clears both the
-/// FL/FH flags and the ALERT pin. In Interrupt mode the waiter
-/// therefore reads configuration **once** at entry, keeps the FL/FH it
-/// consumed, and completes immediately — performing no GPIO operation
-/// at all — when either flag was set. Only when the entry snapshot is
-/// clear does it await the asserted level and then acknowledge that
-/// subsequent assertion with a second configuration read.
+/// FL/FH flags and the ALERT pin. The waiter first checks for a retained
+/// interrupt delivery from an earlier call. If one exists, it performs
+/// **only one temperature read**: no configuration read, GPIO wait, or
+/// acknowledgment. Otherwise it starts a **fresh acquisition**. In
+/// Interrupt mode, that entry configuration read captures FL/FH; either
+/// flag makes it proceed to temperature without GPIO or a second
+/// acknowledgment. Only a clear entry snapshot leads to an asserted-level
+/// wait followed by a second configuration read acknowledging that alert.
 ///
 /// The chip's `Polarity` (active-low vs active-high) is read from the
-/// configuration register on every call to `wait_for_temperature_threshold`.
+/// configuration register on each fresh acquisition, not on retained
+/// delivery attempts.
 /// Do **not** reconfigure polarity while a `wait_for_temperature_threshold`
 /// future is pending — the awaiting future will continue to wait for the
 /// old polarity while the chip's ALERT output follows the new one.
 ///
-/// In Comparator mode the ALERT pin remains asserted as long as the
-/// temperature is outside the `[TLow + HYS, THigh − HYS]` band; calling
+/// On a fresh Comparator-mode acquisition the ALERT pin remains asserted
+/// as long as the temperature is outside the `[TLow + HYS, THigh − HYS]` band; calling
 /// `wait_for_temperature_threshold` in a tight loop while the chip is
 /// still over-temperature will return immediately on every iteration
 /// (because [`wait_for_low`][3] / [`wait_for_high`][4] return
 /// immediately when the pin is already at the requested level). For
 /// repeated-trigger workflows prefer Interrupt mode, or apply
-/// application-level backoff between iterations. Comparator mode never
-/// consults FL/FH and never performs a post-wait acknowledgment.
+/// application-level backoff between iterations. Fresh Comparator acquisition
+/// never consults FL/FH and never performs a post-wait acknowledgment.
+///
+/// # Retained interrupt delivery
+///
+/// After a successful interrupt acknowledgment, the wrapper records a
+/// **delivery obligation** before awaiting temperature. This applies both
+/// to the entry-flag fast path and to the post-wait acknowledgment, whose
+/// flags are discarded even when zero. Temperature-read failure returns
+/// [`Error::Bus`] and leaves the obligation pending; cancellation during
+/// that read also leaves it pending. A successful temperature read clears
+/// it synchronously, with no intervening await, before returning `Ok`.
+/// There is no internal retry: each delivery attempt reads temperature once.
+///
+/// The obligation survives [`sensor_mut`][Self::sensor_mut], direct
+/// temperature reads, and reconfiguration. **Retained delivery takes
+/// precedence over the current mode**, even after switching to Comparator
+/// mode. Fresh Comparator acquisition never creates an obligation.
+///
+/// Retention is wrapper-local: [`into_inner`][Self::into_inner],
+/// [`destroy`][Self::destroy], or dropping the wrapper abandons it without
+/// driver I/O. Re-wrapping starts empty; it does not restore this state.
+///
+/// **Liveness:** with a retained obligation and a permanently failing bus
+/// that returns immediately, a loop awaiting this method receives an
+/// immediately-ready `Err` each time and need not yield. Callers must
+/// provide their own backoff or bounded retries.
 ///
 /// # What the returned temperature is
 ///
@@ -817,6 +845,10 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
 /// conversion**, read from the temperature register *after* an alert
 /// was observed. It is not a sample captured at the moment the
 /// threshold was crossed, and the driver does not retain one.
+/// A retained delivery is a debt, **not a cached sample**: its temperature
+/// is read at retry time. There is no bound on the time since the crossing,
+/// nor on the age of the conversion in the register. The value may be
+/// outside or inside the band; it does not reconstruct the historical event.
 ///
 /// Consequently:
 ///
@@ -840,10 +872,12 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
 /// type cannot express a partially completed event delivery. Callers
 /// that need durable, exactly-once threshold notifications require a
 /// separate delivery design — one this driver does not currently
-/// provide, and which cannot be reconstructed by a caller: once an
-/// interrupt's evidence has been irreversibly discarded, no
-/// caller-side retry or queue can restore it. Closing that gap is
-/// deferred to issue #58.
+/// provide. Failure or cancellation during the entry or acknowledging
+/// configuration read can consume hardware evidence before the driver
+/// records an obligation; no caller-side retry or queue can reconstruct
+/// that lost evidence. Only the subsequent temperature stage is retryable.
+/// Relatching or sustained Comparator assertion can still produce more
+/// than one `Ok` for a single physical excursion.
 ///
 /// Specifically:
 ///
@@ -856,14 +890,16 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
 ///   survived, nor that no interrupt occurred. An error must never be
 ///   read as "nothing happened".
 /// - Cancelling this future — by dropping it, or by racing it against a
-///   timeout or a `select!` — can consume an event without returning
-///   either a temperature or an error. No asynchronous cleanup runs on
+///   timeout or a `select!` — during a configuration read can consume an
+///   event unrecoverably, without returning a temperature or an error.
+///   Cancellation during a retained interrupt's temperature read instead
+///   preserves the delivery obligation. No asynchronous cleanup runs on
 ///   drop; in particular no cleanup configuration read is performed,
 ///   because such a read would itself consume a later event.
-/// - Retrying after a failure or a cancellation starts a **fresh
-///   observation**. It does not replay the original event. If the
-///   excursion has ended and the latch was already consumed, the retry
-///   may wait indefinitely for a different event that never comes.
+/// - Retrying with a retained delivery performs temperature only. Without
+///   an obligation, retrying starts a **fresh observation**. If an entry
+///   or acknowledging read consumed the latch without returning success,
+///   that fresh retry may wait indefinitely for a different event.
 /// - Whether the bus and the pin are usable after cancellation depends
 ///   entirely on the underlying HAL's cancellation and recovery
 ///   guarantees for an in-flight I2C transaction or GPIO wait. The
@@ -874,9 +910,10 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
 ///
 /// ## Recovery contract, by phase — Interrupt mode
 ///
-/// The table below applies to **Interrupt mode only**, because only
-/// Interrupt mode latches FL/FH and only there does a configuration
-/// read consume an event. Recovery differs by *where* the call
+/// The table below applies to **interrupt acquisition and retained
+/// interrupt delivery**, including delivery after reconfiguration to
+/// Comparator mode. Only Interrupt mode latches FL/FH and consumes an
+/// event on a configuration read. Recovery differs by *where* the call
 /// stopped, and in two of the four phases the driver cannot tell you
 /// whether an event was consumed:
 ///
@@ -885,19 +922,20 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
 /// | Entry configuration read | **Unknown** | The chip may or may not have latched, and may or may not have been acknowledged before the failure. Treat any pending event as possibly lost. |
 /// | GPIO level wait ([`Error::Pin`]) | **Nothing** | No acknowledgment was performed after the entry read. A still-latched event remains visible to the next call's entry snapshot. |
 /// | Post-wait acknowledgment | **Unknown** | ALERT was observed asserted, but whether the acknowledging read reached the chip is not determinable from the error. |
-/// | Temperature read | **Definitely acknowledged** | An interrupt was acknowledged and its evidence is gone. That *latched* event cannot be recovered; only a new latch will be reported. |
+/// | Temperature read (initial or retained attempt) | **Definitely acknowledged** | Hardware flags are gone, but delivery remains pending after failure or cancellation. Retrying on this wrapper reads temperature once, with no configuration read, GPIO wait, or acknowledgment, even after switching to Comparator mode. |
 ///
 /// ## Recovery contract — Comparator mode
 ///
-/// Comparator mode has no latch and no acknowledgment: the entry
-/// configuration read is used solely to learn the configured mode and
+/// This section applies to **fresh Comparator acquisition**, with no
+/// retained interrupt delivery. Comparator mode has no latch and no
+/// acknowledgment: the entry configuration read is used solely to learn the configured mode and
 /// polarity, no FL/FH is consulted, and there is deliberately no
 /// post-wait acknowledging read. Consequently **nothing is ever
 /// consumed** on this path, and none of the "evidence is gone" rows
 /// above apply.
 ///
-/// A retry after any failure — including a failure of the temperature
-/// read, after the level wait already succeeded — performs a fresh
+/// On this fresh Comparator path, a retry after any failure — including
+/// a temperature-read failure after the level wait succeeded — performs a fresh
 /// *level observation*. If the temperature is still outside the
 /// `[TLow + HYS, THigh − HYS]` band, ALERT is still asserted, and the
 /// retry may legitimately complete immediately for the **same
@@ -1088,6 +1126,8 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
 
     /// Mutably borrow the inner [`AsyncTmp108`] for sensor operations.
     /// See [`sensor`][Self::sensor].
+    /// Direct reads and reconfiguration do not clear a retained interrupt
+    /// delivery obligation; it takes precedence on the next threshold wait.
     ///
     /// # Examples
     ///
@@ -1113,11 +1153,14 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
     }
 
     /// Destructure the wrapper back into its [`AsyncTmp108`] sensor and
-    /// ALERT pin halves. The inverse of [`AsyncTmp108::into_alert`].
+    /// ALERT pin halves, without I/O.
     ///
     /// Unlike [`destroy`][Self::destroy] (which returns the raw I2C
     /// bus, dropping the sensor's typed wrapper), this preserves the
     /// sensor's state so the caller can continue using it directly.
+    /// It abandons any wrapper-local delivery obligation, however:
+    /// re-wrapping with [`AsyncTmp108::into_alert`] starts empty and is
+    /// not a state-preserving round trip for retained interrupt delivery.
     ///
     /// # Examples
     ///
@@ -1142,6 +1185,7 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
     }
 
     /// Destroy the driver instance, return the I2C bus instance and ALERT pin instance.
+    /// Any retained delivery obligation is abandoned without I/O.
     ///
     /// # Examples
     ///
@@ -1168,11 +1212,14 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
     /// This is a **destructive read and an acknowledgment**, not a
     /// non-destructive status query. Per TMP108 datasheet SBOS663A
     /// §7.5.3.4, reading the configuration register clears FL, FH, and
-    /// the ALERT pin. The returned snapshot is therefore the *only*
-    /// remaining record of any interrupt that was latched when this
-    /// transaction ran: if the caller drops it, or overwrites it with a
-    /// later snapshot, that event is lost with no way to recover it
-    /// from the chip. Call this exactly as often as the protocol
+    /// the ALERT pin. The returned snapshot holds evidence no longer
+    /// recoverable from the chip. The waiter transfers notification
+    /// evidence into its delivery obligation before awaiting temperature:
+    /// nonzero entry flags or a successful level wait plus acknowledgment
+    /// qualify it. FL/FH direction is still discarded (issue #58, gap 1),
+    /// including all flags from the post-wait acknowledgment. Failure or
+    /// cancellation during this read can lose evidence before that transfer.
+    /// Call this exactly as often as the protocol
     /// requires — never speculatively, and never as "cleanup".
     async fn read_alert_snapshot(&mut self) -> Result<ops::AlertSnapshot, I2C::Error> {
         let c = self.sensor_mut().inner.configuration().read_async().await?;
@@ -2199,12 +2246,16 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
 impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait + embedded_hal::digital::InputPin>
     embedded_sensors_hal_async::temperature::TemperatureThresholdWait for AlertTmp108<I2C, ALERT>
 {
-    /// Wait for the ALERT pin to report a threshold crossing, then
-    /// return the latest temperature conversion.
+    /// Deliver a retained interrupt, or acquire a fresh ALERT notification,
+    /// then return the latest temperature conversion.
     ///
     /// The returned value is **not** a trigger-time sample, the error
     /// type cannot express a partially delivered event, and this future
-    /// is not event-delivery cancel-safe. See [`AlertTmp108`]'s "What
+    /// is not event-delivery cancel-safe during configuration reads.
+    /// After successful interrupt acknowledgment, temperature failure or
+    /// cancellation retains a delivery obligation: the next call reads
+    /// temperature only, even if the mode has since changed. See
+    /// [`AlertTmp108`]'s "Retained interrupt delivery", "What
     /// the returned temperature is" and "Errors and cancellation"
     /// sections for the full contract before relying on either.
     ///

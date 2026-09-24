@@ -23,6 +23,20 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   original event. Calls no longer need that later event to complete.
   This is a behavioral bug fix; no public API or caller signature changes
   are required.
+- Preserve an acknowledged interrupt's delivery obligation when the threshold
+  waiter's temperature read fails or is cancelled (#58, Gap 2). The next call
+  on the same wrapper reads temperature once, without configuration reads,
+  GPIO waiting, or acknowledgment. Success clears the obligation; repeated
+  failures retain it. Fresh comparator acquisition never retains delivery.
+  **Upgrade behavior from 0.6.0:** a retry can now deliver an earlier interrupt
+  instead of waiting for a new one, even after switching to Comparator mode.
+  Direct sensor reads do not clear the obligation; decomposition or dropping
+  the wrapper abandons it, and re-wrapping starts empty. Apply caller-side
+  backoff or bounded retries: an immediately failing bus can make retries
+  return errors without yielding. The driver does not retry internally.
+  This is a **behaviour change to a documented contract, but not a
+  source-breaking change**: no public API, signature, trait bound, or error
+  variant changed.
 
 ### Documentation
 
@@ -35,12 +49,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   pending-edge guarantee described under 0.6.0 is superseded by the
   snapshot-and-level behavior above.
 - Document that the threshold waiter is **not event-delivery cancel-safe**.
-  A configuration read may acknowledge an interrupt before the call
-  returns. If the subsequent temperature read fails, or the future is
-  dropped, an event can be consumed without being delivered. `Error::Bus`
-  is not proof that no alert occurred. Retrying starts a fresh observation;
-  it does not replay the original event. Awaiting completion avoids
-  intentional cancellation but does not eliminate bus failures.
+  Failure or cancellation during the entry or acknowledging configuration
+  read can still consume an interrupt unrecoverably. Only the temperature
+  stage after successful interrupt acknowledgment retains delivery for retry.
+  `Error::Bus` does not identify the failed stage or prove no alert occurred.
+  Retention is a delivery debt, not a cached or trigger-time sample: a retry
+  reads the latest conversion, possibly inside the band and arbitrarily
+  removed in time from the crossing. This is not exactly-once delivery;
+  relatching or sustained comparator assertion can produce multiple `Ok`
+  results for one physical excursion. Gap 1's status-bearing API remains open.
 
 ## [0.6.0] - 2026-09-04
 

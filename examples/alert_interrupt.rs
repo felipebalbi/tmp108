@@ -16,7 +16,8 @@
 //! # Behavior
 //!
 //! Setup updates the configuration register and writes the low/high limit
-//! registers. Each `wait_for_temperature_threshold` call reads configuration,
+//! registers. A retained interrupt delivery makes `wait_for_temperature_threshold`
+//! read temperature only, once. Otherwise fresh acquisition reads configuration,
 //! capturing FL/FH while acknowledging the interrupt and clearing the pin.
 //! If either flag was set, it skips GPIO waiting and any second acknowledgment.
 //! Otherwise it waits for the asserted pin level, then reads configuration
@@ -26,9 +27,15 @@
 //! A latched transient can be reported after temperature returns inside the
 //! band. The returned reading cannot identify which threshold caused it.
 //! A persistent condition can relatch, so repeated calls need not correspond
-//! to distinct threshold crossings. A bus failure or cancellation after
-//! acknowledgment can consume an event without delivering it; retries do not
-//! replay that event.
+//! to distinct threshold crossings. After successful interrupt acknowledgment,
+//! a temperature-read failure or cancellation leaves a delivery obligation in
+//! this wrapper. Retrying reads temperature at retry time, not a cached sample,
+//! even after reconfiguration to Comparator mode. Direct sensor reads do not
+//! clear the obligation; decomposition or dropping the wrapper abandons it.
+//! Entry/acknowledging-read failure or cancellation can still lose an event
+//! unrecoverably. The waiter is not fully cancel-safe or exactly-once.
+//! It never retries internally: retrying callers need backoff or a bound,
+//! since repeated immediately-ready bus errors need not yield.
 //!
 //! # Usage
 //!
