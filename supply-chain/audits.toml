@@ -323,6 +323,27 @@ user-id = 3618 # David Tolnay (dtolnay)
 start = "2019-03-19"
 end = "2027-05-16"
 
+[[trusted.pico-de-gallo-hal]]
+criteria = "safe-to-run"
+trusted-publisher = "github:OpenDevicePartnership/pico-de-gallo"
+start = "2026-08-27"
+end = "2027-09-24"
+notes = "Trusted publisher: OpenDevicePartnership/pico-de-gallo GitHub Actions. Dev-dependency, used only by the hardware examples."
+
+[[trusted.pico-de-gallo-internal]]
+criteria = "safe-to-run"
+trusted-publisher = "github:OpenDevicePartnership/pico-de-gallo"
+start = "2026-08-27"
+end = "2027-09-24"
+notes = "Trusted publisher: OpenDevicePartnership/pico-de-gallo GitHub Actions. Dev-dependency, used only by the hardware examples."
+
+[[trusted.pico-de-gallo-lib]]
+criteria = "safe-to-run"
+trusted-publisher = "github:OpenDevicePartnership/pico-de-gallo"
+start = "2026-08-27"
+end = "2027-09-24"
+notes = "Trusted publisher: OpenDevicePartnership/pico-de-gallo GitHub Actions. Dev-dependency, used only by the hardware examples."
+
 [[trusted.prettyplease]]
 criteria = "safe-to-deploy"
 user-id = 3618 # David Tolnay (dtolnay)
