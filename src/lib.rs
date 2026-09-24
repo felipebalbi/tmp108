@@ -2634,6 +2634,44 @@ mod tests {
         use super::*;
 
         #[test]
+        fn limit_registers_reset_to_the_documented_window() {
+            // Datasheet §7.5.4: THIGH = +127.9375 °C (0x7FF8) and
+            // TLOW = -128 °C (0x8000), sent MSB first. Before these were
+            // declared in the DDSL both registers advertised a reset value
+            // of 0 — a zero-width limit window at 0 °C, which is not what
+            // the part does.
+            //
+            // The reset value lives on the *register operation*, not on the
+            // fieldset: `TLow::default()` is still `Fieldset::ZERO`. The only
+            // path where the reset value is observable is a `write()` whose
+            // closure changes nothing, which transmits it verbatim. That is
+            // also why the wrong defaults stayed latent — every public setter
+            // replaces the whole fieldset and never reads the reset value.
+            //
+            // Asserted against explicit wire bytes rather than against
+            // `Fieldset::ZERO`, because comparing against ZERO is precisely
+            // what let the wrong defaults through.
+            //
+            // THIGH is the value the datasheet contradicts itself about: the
+            // §7.5.4 prose says 0x7FF8, Table 11 shows the low nibble fixed
+            // at zero (implying 0x7FF0). Measured on real hardware the part
+            // resets to 0x7FF8, bit 3 set inside the reserved nibble. The
+            // prose is right.
+            let expectations = vec![
+                Transaction::write(0x48, vec![0x02, 0x80, 0x00]),
+                Transaction::write(0x48, vec![0x03, 0x7f, 0xf8]),
+            ];
+            let mock = Mock::new(&expectations);
+            let mut tmp = Tmp108::new_with_a0_gnd(mock);
+
+            tmp.inner.t_low().write(|_| {}).unwrap();
+            tmp.inner.t_high().write(|_| {}).unwrap();
+
+            let mut mock = tmp.destroy();
+            mock.done();
+        }
+
+        #[test]
         fn handle_a0_pin_accordingly() {
             let expectations = vec![];
 

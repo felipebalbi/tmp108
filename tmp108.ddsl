@@ -72,6 +72,10 @@ device Inner {
     /// Temperature low register
     register t-low {
         address: 2,
+        // Power-on value is -128 C, wire bytes [0x80, 0x00] (MSB first,
+        // datasheet 7.5.4). `reset` is a little-endian word, so the first
+        // wire byte is the LOW byte here: 0x0080.
+        reset: 0x0080,
         fields: fieldset _ {
             size-bytes: 2,
         },
@@ -80,6 +84,15 @@ device Inner {
     /// Temperature high register
     register t-high {
         address: 3,
+        // Power-on value is +127.9375 C. The datasheet contradicts itself
+        // about the encoding: 7.5.4 prose says 0x7FF8, while Table 11 shows
+        // the low nibble as fixed zero, implying 0x7FF0. Measured on a real
+        // TMP108: the part resets to 0x7FF8, with bit 3 set inside the
+        // reserved nibble. The prose is correct; Table 11 is not.
+        //
+        // Wire bytes are [0x7F, 0xF8]; as a little-endian word that is
+        // 0xF87F.
+        reset: 0xF87F,
         fields: fieldset _ {
             size-bytes: 2,
         },

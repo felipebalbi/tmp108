@@ -55,27 +55,27 @@ impl<I> Inner<I> {
     ///
     /// Register operation:
     /// - Address: `2`
-    /// - Reset value: `0`
+    /// - Reset value: `0x0080`
     #[doc(alias = "t-low")]
     pub fn t_low(&mut self) -> ::device_driver::RegisterOperation<'_, Self, TLow, u8, ::device_driver::RW, ()>
     where
         I: ::device_driver::RegisterInterfaceBase<AddressType = u8>,
     {
         let address = self.base_address + 2;
-        ::device_driver::RegisterOperation::new(self, address as u8, TLow::default)
+        ::device_driver::RegisterOperation::new(self, address as u8, || TLow::from([128, 0]))
     }
     /// Temperature high register
     ///
     /// Register operation:
     /// - Address: `3`
-    /// - Reset value: `0`
+    /// - Reset value: `0xF87F`
     #[doc(alias = "t-high")]
     pub fn t_high(&mut self) -> ::device_driver::RegisterOperation<'_, Self, THigh, u8, ::device_driver::RW, ()>
     where
         I: ::device_driver::RegisterInterfaceBase<AddressType = u8>,
     {
         let address = self.base_address + 3;
-        ::device_driver::RegisterOperation::new(self, address as u8, THigh::default)
+        ::device_driver::RegisterOperation::new(self, address as u8, || THigh::from([127, 248]))
     }
 }
 impl<I> ::device_driver::Block for Inner<I> {
