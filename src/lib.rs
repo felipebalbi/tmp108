@@ -751,7 +751,11 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
         self,
         alert: ALERT,
     ) -> AlertTmp108<I2C, ALERT> {
-        AlertTmp108 { tmp108: self, alert }
+        AlertTmp108 {
+            tmp108: self,
+            alert,
+            interrupt_sample_pending: false,
+        }
     }
 }
 
@@ -921,6 +925,17 @@ pub struct AlertTmp108<
 > {
     tmp108: AsyncTmp108<I2C>,
     alert: ALERT,
+    /// An interrupt-mode event that has been acknowledged on the chip
+    /// (C0 or C1 consumed its FL/FH and released ALERT) but whose
+    /// temperature sample was never handed to the caller, because the
+    /// read failed or the future was dropped.
+    ///
+    /// The chip cannot re-report it, so the driver owes the caller one
+    /// delivery: while this is set, `wait_for_temperature_threshold`
+    /// performs the temperature read and nothing else. Only a
+    /// successful delivery clears it (issue #58, gap 2). Comparator
+    /// mode never sets it — it acknowledges nothing.
+    interrupt_sample_pending: bool,
 }
 
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
@@ -947,7 +962,11 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
     /// ```
     pub fn new(i2c: I2C, a0: A0, alert: ALERT) -> Self {
         let tmp108 = AsyncTmp108::new(i2c, a0);
-        Self { tmp108, alert }
+        Self {
+            tmp108,
+            alert,
+            interrupt_sample_pending: false,
+        }
     }
 
     /// Create a new ALERTTMP108 instance with A0 tied to GND, resulting in an
@@ -2197,53 +2216,72 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
     async fn wait_for_temperature_threshold(
         &mut self,
     ) -> Result<embedded_sensors_hal_async::temperature::DegreesCelsius, Self::Error> {
-        // C0. This single transaction both tells us how the chip is
-        // configured and consumes whatever FL/FH it had latched. The
-        // binding is immutable on purpose: the flags captured here are
-        // the only surviving evidence of an already-pending interrupt,
-        // and nothing below may clobber them.
-        let entry_snapshot = self.read_alert_snapshot().await.map_err(Error::Bus)?;
-        let config = entry_snapshot.config;
+        // A previous call already acknowledged an interrupt on the chip
+        // but never managed to complete delivery. The chip has no copy
+        // left, so the delivery obligation is this driver's to settle:
+        // no C0 (there is nothing to collect and a read would destroy a
+        // *newer* latch), no GPIO wait (the pin was released by the
+        // acknowledgment), no C1. Just T. See issue #58, gap 2.
+        if !self.interrupt_sample_pending {
+            // C0. This single transaction both tells us how the chip is
+            // configured and consumes whatever FL/FH it had latched. The
+            // binding is immutable on purpose: the flags captured here are
+            // evidence of an already-pending interrupt until transferred
+            // into the delivery obligation; nothing below may clobber them.
+            let entry_snapshot = self.read_alert_snapshot().await.map_err(Error::Bus)?;
+            let config = entry_snapshot.config;
 
-        match (config.thermostat_mode, config.alert_polarity) {
-            // Comparator mode does not latch, so FL/FH are not evidence
-            // of anything the caller is waiting for — the pin level is.
-            // Deliberately no fast path and no acknowledgment here.
-            //
-            // The ALERT pin stays asserted while the temperature is
-            // outside (Tlow + HYS)..(Thigh - HYS), so calling this in a
-            // tight loop returns immediately on every iteration.
-            (Thermostat::Comparator, Polarity::ActiveLow) => {
-                self.alert.wait_for_low().await.map_err(Error::Pin)?;
-            }
-            (Thermostat::Comparator, Polarity::ActiveHigh) => {
-                self.alert.wait_for_high().await.map_err(Error::Pin)?;
-            }
+            match (config.thermostat_mode, config.alert_polarity) {
+                // Comparator mode does not latch, so FL/FH are not evidence
+                // of anything the caller is waiting for — the pin level is.
+                // Deliberately no fast path and no acknowledgment here.
+                //
+                // The ALERT pin stays asserted while the temperature is
+                // outside (Tlow + HYS)..(Thigh - HYS), so calling this in a
+                // tight loop returns immediately on every iteration.
+                //
+                // Nothing is acknowledged, so nothing can be owed: these
+                // two arms must never arm `interrupt_sample_pending`.
+                (Thermostat::Comparator, Polarity::ActiveLow) => {
+                    self.alert.wait_for_low().await.map_err(Error::Pin)?;
+                }
+                (Thermostat::Comparator, Polarity::ActiveHigh) => {
+                    self.alert.wait_for_high().await.map_err(Error::Pin)?;
+                }
 
-            // Interrupt mode latches into FL/FH and releases the pin on
-            // a configuration read. C0 above has therefore already
-            // collected — and destroyed — any pending event. If it found
-            // one, that *is* the notification: waiting on the pin now
-            // would wait for a transition that has already been consumed
-            // and that may never recur (issue #59).
-            //
-            // Otherwise we await the asserted level. A level wait, not
-            // an edge wait: an assertion can land between C0 and the
-            // moment the wait is armed, and `Wait`'s edge methods do not
-            // return for an already-active pin.
-            (Thermostat::Interrupt, polarity) => {
-                if !(entry_snapshot.low || entry_snapshot.high) {
-                    match polarity {
-                        Polarity::ActiveLow => self.alert.wait_for_low().await.map_err(Error::Pin)?,
-                        Polarity::ActiveHigh => self.alert.wait_for_high().await.map_err(Error::Pin)?,
+                // Interrupt mode latches into FL/FH and releases the pin on
+                // a configuration read. C0 above has therefore already
+                // collected — and destroyed — any pending event. If it found
+                // one, that *is* the notification: waiting on the pin now
+                // would wait for a transition that has already been consumed
+                // and that may never recur (issue #59).
+                //
+                // Otherwise we await the asserted level. A level wait, not
+                // an edge wait: an assertion can land between C0 and the
+                // moment the wait is armed, and `Wait`'s edge methods do not
+                // return for an already-active pin.
+                (Thermostat::Interrupt, polarity) => {
+                    if !(entry_snapshot.low || entry_snapshot.high) {
+                        match polarity {
+                            Polarity::ActiveLow => self.alert.wait_for_low().await.map_err(Error::Pin)?,
+                            Polarity::ActiveHigh => self.alert.wait_for_high().await.map_err(Error::Pin)?,
+                        }
+
+                        // C1: acknowledge the assertion we just observed.
+                        // Its own flags are intentionally discarded — the
+                        // successful level wait is the qualifying evidence,
+                        // and requiring nonzero flags here would reintroduce
+                        // a lost-event loop. That includes the zero-flag
+                        // case: it still qualifies, so it still arms
+                        // retention below.
+                        let _acknowledgment = self.read_alert_snapshot().await.map_err(Error::Bus)?;
                     }
 
-                    // C1: acknowledge the assertion we just observed.
-                    // Its own flags are intentionally discarded — the
-                    // successful level wait is the qualifying evidence,
-                    // and requiring nonzero flags here would reintroduce
-                    // a lost-event loop.
-                    let _acknowledgment = self.read_alert_snapshot().await.map_err(Error::Bus)?;
+                    // The event is now acknowledged on the chip and owed to
+                    // the caller. Arm retention *before* awaiting T, so that
+                    // a failure or a drop at any point from here on leaves
+                    // the debt recorded.
+                    self.interrupt_sample_pending = true;
                 }
             }
         }
@@ -2252,6 +2290,13 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
         // the temperature at the moment the threshold was crossed, and
         // possibly back inside the configured band.
         let temperature = self.sensor_mut().temperature().await.map_err(Error::Bus)?;
+
+        // Delivery succeeded, so the debt is settled. This runs in the
+        // same poll that resolved T, with no `.await` in between: there
+        // is no suspension point the caller could cancel at, so the
+        // clear cannot be skipped on the success path. On the error
+        // path the `?` above returns first and the flag stays set.
+        self.interrupt_sample_pending = false;
         Ok(temperature.to_degrees())
     }
 }
@@ -4817,8 +4862,13 @@ mod tests {
                 );
             }
 
+            /// A failed T on the interrupt fast path is reported as
+            /// [`Error::Bus`] — but the acknowledged event is *retained*,
+            /// because C0 has already destroyed the only copy the chip had
+            /// (issue #58, gap 2). The retry therefore re-reads the
+            /// temperature and nothing else.
             #[test]
-            fn temperature_error_on_the_pending_fast_path_is_bus_error() {
+            fn temperature_error_on_the_pending_fast_path_retains_the_event() {
                 let (shared, mut tmp) = build(Setup {
                     level_high: false,
                     fh: true,
@@ -4841,14 +4891,24 @@ mod tests {
                     "a failed T must not retry or read configuration again"
                 );
 
-                // The acknowledged event is gone; a second call must wait.
-                push_steps(&shared, vec![cfg(INTERRUPT, ACTIVE_LOW)]);
-                shared.lock().unwrap().strict_pin = false;
-                let mut fut = pin!(tmp.wait_for_temperature_threshold());
-                assert!(
-                    poll_once(fut.as_mut()).is_pending(),
-                    "no replay is promised: the second call must wait for a new event"
+                // The event was acknowledged but never delivered, so it is
+                // retained: the next call must deliver it with T alone. No
+                // C0 (the chip has nothing left to report) and no GPIO
+                // (`strict_pin` stays armed to prove it).
+                push_steps(&shared, vec![temp(T80)]);
+                take_log(&shared);
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x00]],
+                    "the retained sample is delivered by T alone — no second C0"
                 );
+                assert!(pin_calls(&shared).is_empty());
+                assert_eq!(steps_left(&shared), 0);
             }
 
             #[test]
@@ -4869,6 +4929,11 @@ mod tests {
                 };
                 assert_eq!(pin_calls(&shared), vec![PinOp::WaitLow]);
                 expect_bus(&shared, result, I2cError::Other);
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x01], vec![0x01], vec![0x00]],
+                    "the slow path performs exactly C0, C1 and T before failing"
+                );
                 assert_eq!(steps_left(&shared), 0);
             }
 
@@ -4886,6 +4951,28 @@ mod tests {
                 };
                 assert_eq!(pin_calls(&shared), vec![PinOp::WaitLow]);
                 expect_bus(&shared, result, I2cError::Other);
+                assert_eq!(steps_left(&shared), 0);
+
+                // Comparator mode acknowledges nothing, so there is nothing
+                // to retain: the retry is a *fresh* observation — C0, one
+                // level wait, then T.
+                push_steps(&shared, vec![cfg(COMPARATOR, ACTIVE_LOW), temp(T25)]);
+                take_log(&shared);
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                assert_approx_eq!(degrees(result), 25.0, 1e-4);
+                assert_eq!(
+                    take_log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![COMPARATOR, ACTIVE_LOW]),
+                        Op::PinCall(PinOp::WaitLow),
+                        Op::PinDone(PinOp::WaitLow),
+                        Op::WriteRead(vec![0x00], T25.to_vec()),
+                    ],
+                    "a comparator retry must re-observe the pin, never replay a retained sample"
+                );
                 assert_eq!(steps_left(&shared), 0);
             }
 
@@ -5236,8 +5323,12 @@ mod tests {
             // R5 — a new event survives a T failure or cancellation.
             // ===============================================================
 
+            /// Event A is acknowledged by C0, then T fails. Its delivery
+            /// obligation is retained; the next call reads a new temperature
+            /// to settle it. Event B, latched meanwhile, is collected
+            /// by the call *after* that, on a fresh C0.
             #[test]
-            fn new_event_survives_a_temperature_failure() {
+            fn new_event_survives_a_temperature_failure_behind_the_retained_sample() {
                 let (shared, mut tmp) = build(Setup {
                     level_high: false,
                     fh: true,
@@ -5265,7 +5356,25 @@ mod tests {
                 }
                 push_steps(
                     &shared,
-                    vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high), temp(T25)],
+                    vec![
+                        // The retained delivery: T alone.
+                        temp(T80),
+                        // Only then is event B collected, on a fresh C0.
+                        cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high),
+                        temp(T25),
+                    ],
+                );
+                take_log(&shared);
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x00]],
+                    "event A's retained sample is delivered first, by T alone"
                 );
                 take_log(&shared);
 
@@ -5282,8 +5391,11 @@ mod tests {
                 assert_eq!(steps_left(&shared), 0);
             }
 
+            /// As above, with the temperature read cancelled rather than
+            /// failed. Cancellation after C0 has acknowledged is the same
+            /// loss, so it retains the same way.
             #[test]
-            fn new_event_survives_cancellation_during_the_temperature_read() {
+            fn new_event_survives_cancellation_behind_the_retained_sample() {
                 let (shared, mut tmp) = build(Setup {
                     level_high: false,
                     fh: true,
@@ -5310,7 +5422,23 @@ mod tests {
 
                 push_steps(
                     &shared,
-                    vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high), temp(T25)],
+                    vec![
+                        temp(T80),
+                        cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high),
+                        temp(T25),
+                    ],
+                );
+                take_log(&shared);
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x00]],
+                    "the cancelled event is retained and delivered by T alone"
                 );
                 take_log(&shared);
 
@@ -5319,7 +5447,393 @@ mod tests {
                     poll_once(fut.as_mut())
                 };
                 assert_approx_eq!(degrees(result), 25.0, 1e-4);
+                assert_eq!(i2c_writes(&shared), vec![vec![0x01], vec![0x00]]);
                 assert_eq!(steps_left(&shared), 0);
+            }
+
+            // ===============================================================
+            // Issue #58, gap 2 — an acknowledged-but-undelivered event is
+            // retained across a failed or cancelled temperature read.
+            //
+            // Every test below turns on `strict_pin` for the retry, so a
+            // retained delivery that touches GPIO panics with a named
+            // diagnostic instead of parking.
+            // ===============================================================
+
+            /// Drive the waiter through the interrupt **fast path** with a
+            /// failing T, leaving exactly one acknowledged-but-undelivered
+            /// event retained. `strict_pin` is left armed.
+            fn arm_retained_fast_path(byte1: u8) -> (Shared, AlertTmp108<FakeI2c, FakePin>) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let release: fn(&mut World) = if asserted_high {
+                    ack_release_low
+                } else {
+                    ack_release_high
+                };
+
+                let (shared, mut tmp) = build(Setup {
+                    level_high: asserted_high,
+                    fh: true,
+                    strict_pin: true,
+                    steps: vec![cfg(INTERRUPT, byte1).effect(release), temp(T80).err(I2cError::Other)],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                expect_bus(&shared, result, I2cError::Other);
+                assert_eq!(i2c_writes(&shared), vec![vec![0x01], vec![0x00]]);
+                assert_eq!(steps_left(&shared), 0);
+                take_log(&shared);
+                (shared, tmp)
+            }
+
+            /// As above via the **slow path**: C0 with no flags, one level
+            /// wait, then C1. `latch` selects whether C1 reports nonzero
+            /// flags; per the design the retention decision must not depend
+            /// on it.
+            fn arm_retained_slow_path(byte1: u8, latch: bool) -> (Shared, AlertTmp108<FakeI2c, FakePin>) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let want = if asserted_high { PinOp::WaitHigh } else { PinOp::WaitLow };
+                let release: fn(&mut World) = if asserted_high {
+                    ack_release_low
+                } else {
+                    ack_release_high
+                };
+
+                let (shared, mut tmp) = build(Setup {
+                    level_high: !asserted_high,
+                    steps: vec![
+                        cfg(INTERRUPT, byte1),
+                        cfg(INTERRUPT, byte1).effect(release),
+                        temp(T80).err(I2cError::Other),
+                    ],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    assert!(poll_once(fut.as_mut()).is_pending(), "must park until ALERT asserts");
+                    assert_eq!(pin_calls(&shared), vec![want]);
+                    {
+                        let mut w = shared.lock().unwrap();
+                        w.fh = latch;
+                        w.set_level(asserted_high);
+                    }
+                    poll_once(fut.as_mut())
+                };
+                expect_bus(&shared, result, I2cError::Other);
+
+                let c1_flags = if latch { 0x10 } else { 0x00 };
+                assert_eq!(
+                    take_log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![INTERRUPT, byte1]),
+                        Op::PinCall(want),
+                        Op::PinDone(want),
+                        Op::WriteRead(vec![0x01], vec![INTERRUPT | c1_flags, byte1]),
+                        Op::WriteRead(vec![0x00], T80.to_vec()),
+                    ],
+                    "the slow path must be C0, one level wait, C1 (flags {c1_flags:#04x}), T"
+                );
+                assert_eq!(steps_left(&shared), 0);
+                shared.lock().unwrap().strict_pin = true;
+                (shared, tmp)
+            }
+
+            /// Assert that one call delivers `want` °C using T and nothing
+            /// else: no configuration read, no GPIO.
+            fn expect_retained_delivery(
+                shared: &Shared,
+                tmp: &mut AlertTmp108<FakeI2c, FakePin>,
+                bytes: [u8; 2],
+                want: f32,
+            ) {
+                push_steps(shared, vec![temp(bytes)]);
+                take_log(shared);
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                assert_approx_eq!(degrees(result), want, 1e-4);
+                assert_eq!(
+                    i2c_writes(shared),
+                    vec![vec![0x00]],
+                    "a retained event is delivered by T alone — no C0, no C1"
+                );
+                assert!(
+                    pin_calls(shared).is_empty(),
+                    "a retained event must not touch GPIO, saw {:?}",
+                    pin_calls(shared)
+                );
+                assert_eq!(steps_left(shared), 0);
+            }
+
+            fn retained_fast_path_case(byte1: u8) {
+                let (shared, mut tmp) = arm_retained_fast_path(byte1);
+                expect_retained_delivery(&shared, &mut tmp, T80, 80.0);
+            }
+
+            #[test]
+            fn retained_fast_path_active_low_retry_reads_temperature_only() {
+                retained_fast_path_case(ACTIVE_LOW);
+            }
+
+            #[test]
+            fn retained_fast_path_active_high_retry_reads_temperature_only() {
+                retained_fast_path_case(ACTIVE_HIGH);
+            }
+
+            fn retained_slow_path_case(byte1: u8, latch: bool) {
+                let (shared, mut tmp) = arm_retained_slow_path(byte1, latch);
+                expect_retained_delivery(&shared, &mut tmp, T25, 25.0);
+            }
+
+            #[test]
+            fn retained_slow_path_active_low_retry_reads_temperature_only() {
+                retained_slow_path_case(ACTIVE_LOW, true);
+            }
+
+            #[test]
+            fn retained_slow_path_active_high_retry_reads_temperature_only() {
+                retained_slow_path_case(ACTIVE_HIGH, true);
+            }
+
+            /// Design rule: C1's flags are discarded, *including when they
+            /// are zero*. A zero-flag C1 still qualifies the event, so it
+            /// must still arm retention.
+            #[test]
+            fn retained_slow_path_with_zero_flag_c1_active_low_still_retains() {
+                retained_slow_path_case(ACTIVE_LOW, false);
+            }
+
+            #[test]
+            fn retained_slow_path_with_zero_flag_c1_active_high_still_retains() {
+                retained_slow_path_case(ACTIVE_HIGH, false);
+            }
+
+            /// Retention is not consumed by a failed delivery attempt: it
+            /// survives an unbounded number of them and is consumed only by
+            /// the one that succeeds.
+            #[test]
+            fn repeated_temperature_failures_keep_the_event_retained() {
+                let (shared, mut tmp) = arm_retained_fast_path(ACTIVE_LOW);
+
+                for attempt in 0..3 {
+                    push_steps(&shared, vec![temp(T80).err(I2cError::Other)]);
+                    take_log(&shared);
+                    let result = {
+                        let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                        poll_once(fut.as_mut())
+                    };
+                    expect_bus(&shared, result, I2cError::Other);
+                    assert_eq!(
+                        i2c_writes(&shared),
+                        vec![vec![0x00]],
+                        "failed retry {attempt} must retry T alone and stay retained"
+                    );
+                }
+
+                expect_retained_delivery(&shared, &mut tmp, T80, 80.0);
+            }
+
+            /// Cancelling the delivery attempt retains the event just as a
+            /// failure does — the acknowledgment already happened.
+            #[test]
+            fn cancelling_the_temperature_read_keeps_the_event_retained() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: false,
+                    fh: true,
+                    strict_pin: true,
+                    steps: vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high), temp(T80).pending()],
+                    ..Default::default()
+                });
+
+                {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    assert!(poll_once(fut.as_mut()).is_pending());
+                }
+                assert_eq!(i2c_writes(&shared), vec![vec![0x01], vec![0x00]]);
+                assert_eq!(steps_left(&shared), 0);
+
+                expect_retained_delivery(&shared, &mut tmp, T25, 25.0);
+            }
+
+            /// A successful delivery consumes the retention exactly once:
+            /// the following call is a fresh full observation.
+            #[test]
+            fn a_successful_retained_delivery_is_consumed_exactly_once() {
+                let (shared, mut tmp) = arm_retained_fast_path(ACTIVE_LOW);
+                expect_retained_delivery(&shared, &mut tmp, T80, 80.0);
+
+                // Nothing is latched and the pin is released, so a fresh
+                // observation must read C0 and then park on the level wait.
+                push_steps(&shared, vec![cfg(INTERRUPT, ACTIVE_LOW)]);
+                shared.lock().unwrap().strict_pin = false;
+                take_log(&shared);
+
+                let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                assert!(
+                    poll_once(fut.as_mut()).is_pending(),
+                    "retention is single-use: the next call must observe the chip afresh"
+                );
+                assert_eq!(i2c_writes(&shared), vec![vec![0x01]], "a fresh C0 is mandatory");
+                assert_eq!(pin_calls(&shared), vec![PinOp::WaitLow]);
+            }
+
+            /// Retained delivery takes precedence over the *current* mode.
+            /// The delivery obligation comes from an already-acknowledged
+            /// interrupt, not a cached sample; reconfiguring to comparator
+            /// mode afterwards does not retroactively cancel the obligation.
+            #[test]
+            fn reconfiguring_to_comparator_does_not_discard_a_retained_event() {
+                let (shared, mut tmp) = arm_retained_fast_path(ACTIVE_LOW);
+
+                push_steps(
+                    &shared,
+                    vec![cfg(INTERRUPT, ACTIVE_LOW), write(vec![0x01, COMPARATOR, ACTIVE_LOW])],
+                );
+                let configured = {
+                    let mut fut = pin!(tmp.sensor_mut().configure(Config {
+                        thermostat_mode: Thermostat::Comparator,
+                        alert_polarity: Polarity::ActiveLow,
+                        ..Default::default()
+                    }));
+                    poll_once(fut.as_mut())
+                };
+                assert!(matches!(configured, Poll::Ready(Ok(()))));
+                assert_eq!(steps_left(&shared), 0);
+
+                // Still T only: no comparator C0, no level wait.
+                expect_retained_delivery(&shared, &mut tmp, T25, 25.0);
+            }
+
+            /// A direct temperature read through `sensor_mut()` is not a
+            /// delivery, so it must not consume the retained event.
+            #[test]
+            fn a_direct_temperature_read_does_not_consume_a_retained_event() {
+                let (shared, mut tmp) = arm_retained_fast_path(ACTIVE_LOW);
+
+                push_steps(&shared, vec![temp(T25)]);
+                let direct = {
+                    let mut fut = pin!(tmp.sensor_mut().temperature());
+                    poll_once(fut.as_mut())
+                };
+                match direct {
+                    Poll::Ready(Ok(t)) => assert_approx_eq!(t.to_degrees(), 25.0, 1e-4),
+                    other => panic!("expected a direct temperature, got {other:?}"),
+                }
+                assert_eq!(steps_left(&shared), 0);
+
+                expect_retained_delivery(&shared, &mut tmp, T80, 80.0);
+            }
+
+            /// Cancelling a *retained retry* must not discard the debt.
+            ///
+            /// The distinction from
+            /// [`cancelling_the_temperature_read_keeps_the_event_retained`]
+            /// is which attempt is cancelled: there it is the original
+            /// delivery, here it is a later replay of an already-retained
+            /// event. An implementation that cleared the flag on entry to
+            /// the retained branch and only restored it on T's `Err` arm
+            /// would pass every other test here and silently lose the
+            /// event at exactly this point.
+            #[test]
+            fn cancelling_a_retained_retry_keeps_the_event_retained() {
+                let (shared, mut tmp) = arm_retained_fast_path(ACTIVE_LOW);
+
+                // First replay: T parks, then the waiter is dropped.
+                push_steps(&shared, vec![temp(T80).pending()]);
+                take_log(&shared);
+                {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    assert!(poll_once(fut.as_mut()).is_pending());
+                }
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x00]],
+                    "a retained retry retries T alone — no C0, no C1"
+                );
+                assert!(
+                    pin_calls(&shared).is_empty(),
+                    "a retained retry must not touch GPIO, saw {:?}",
+                    pin_calls(&shared)
+                );
+                assert_eq!(steps_left(&shared), 0);
+
+                // Second replay: the debt must still be there to settle.
+                expect_retained_delivery(&shared, &mut tmp, T80, 80.0);
+            }
+
+            /// As above, for an event retained from the **slow path**.
+            #[test]
+            fn cancelling_a_retained_retry_on_the_slow_path_keeps_the_event_retained() {
+                let (shared, mut tmp) = arm_retained_slow_path(ACTIVE_LOW, true);
+
+                push_steps(&shared, vec![temp(T80).pending()]);
+                take_log(&shared);
+                {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    assert!(poll_once(fut.as_mut()).is_pending());
+                }
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x00]],
+                    "a retained retry retries T alone — no C0, no C1"
+                );
+                assert!(
+                    pin_calls(&shared).is_empty(),
+                    "a retained retry must not touch GPIO, saw {:?}",
+                    pin_calls(&shared)
+                );
+                assert_eq!(steps_left(&shared), 0);
+
+                expect_retained_delivery(&shared, &mut tmp, T25, 25.0);
+            }
+
+            /// The slow-path analogue of
+            /// [`cancelling_the_temperature_read_keeps_the_event_retained`]:
+            /// the *first* T is cancelled rather than failed, after the
+            /// event was acknowledged by C1 rather than by C0.
+            #[test]
+            fn cancelling_the_temperature_read_on_the_slow_path_keeps_the_event_retained() {
+                let (shared, mut tmp) = build(Setup {
+                    // ALERT inactive and nothing latched: the waiter must
+                    // take the level-wait path.
+                    level_high: true,
+                    steps: vec![
+                        cfg(INTERRUPT, ACTIVE_LOW),
+                        cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high),
+                        temp(T80).pending(),
+                    ],
+                    ..Default::default()
+                });
+
+                {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    assert!(poll_once(fut.as_mut()).is_pending(), "must park until ALERT asserts");
+                    assert_eq!(pin_calls(&shared), vec![PinOp::WaitLow]);
+
+                    {
+                        let mut w = shared.lock().unwrap();
+                        w.fh = true;
+                        w.set_level(false);
+                    }
+
+                    // C1 acknowledges, T parks — and the waiter is dropped.
+                    assert!(poll_once(fut.as_mut()).is_pending());
+                }
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x01], vec![0x01], vec![0x00]],
+                    "C0, C1 and the cancelled T — and no cleanup read"
+                );
+                assert_eq!(steps_left(&shared), 0);
+
+                shared.lock().unwrap().strict_pin = true;
+                expect_retained_delivery(&shared, &mut tmp, T25, 25.0);
             }
         }
     }
