@@ -111,6 +111,101 @@ impl Default for Config {
     }
 }
 
+/// Direction information available for an observed TMP108 alert.
+///
+/// The named directions report FL/FH returned by the configuration read
+/// servicing an interrupt. They do not describe the current temperature.
+///
+/// In Interrupt mode, the flags record threshold excursions since they
+/// were last observed and cleared, rather than a live temperature
+/// comparison. Reading configuration clears them and releases ALERT;
+/// reset also limits the retained history. See TMP108 datasheet SBOS663A,
+/// sections 7.5.3.4 and 7.5.4.
+///
+/// This is an observation result, not the raw flag pair: `Unknown` means
+/// direction is unavailable, not that no alert occurred. Multiple
+/// excursions can coalesce into one observation. No count, order, or
+/// trigger-time sample is supplied.
+///
+/// This type is always available, but the driver's only current producer
+/// of it — `AlertTmp108::wait_for_alert` — requires the
+/// `embedded-sensors-hal-async` feature.
+///
+/// # Examples
+///
+/// ```
+/// use tmp108::AlertCause;
+///
+/// let description = match AlertCause::Both {
+///     AlertCause::BelowLow => "FL observed",
+///     AlertCause::AboveHigh => "FH observed",
+///     AlertCause::Both => "FL and FH observed",
+///     AlertCause::Unknown => "direction unavailable",
+/// };
+/// assert_eq!(description, "FL and FH observed");
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AlertCause {
+    /// FL was set and FH was clear in the servicing interrupt snapshot.
+    BelowLow,
+    /// FH was set and FL was clear in the servicing interrupt snapshot.
+    AboveHigh,
+    /// FL and FH were both set in the servicing interrupt snapshot.
+    ///
+    /// This does not establish the number or order of excursions.
+    Both,
+    /// An alert was observed, but its direction cannot be established.
+    ///
+    /// Fresh comparator observations always report this. Interrupt
+    /// observations report it when the post-wait acknowledgment returns
+    /// both flags clear. It is not an error and does not mean "no alert".
+    Unknown,
+}
+
+/// An alert observation paired with a subsequently read temperature.
+///
+/// The fields are not an atomic measurement. The cause records the
+/// evidence captured while servicing an interrupt, if available; the
+/// temperature is the latest conversion available when the sample
+/// transaction runs (TMP108 datasheet SBOS663A, sections 7.5.3.4 and 7.5.2).
+///
+/// A retained cause can describe an earlier interrupt even if another
+/// interrupt has since latched in the opposite direction. The returned
+/// sample need not support the retained direction: it may be inside the
+/// limits or beyond the opposite limit. This is expected, not grounds to
+/// replace the cause or reject the event.
+///
+/// In Comparator mode the observation is of an asserted level, not
+/// necessarily a new crossing. Repeated calls can report the same
+/// continuously asserted condition.
+///
+/// # Examples
+///
+/// ```
+/// use tmp108::{AlertCause, AlertEvent, Celsius};
+///
+/// let event = AlertEvent {
+///     cause: AlertCause::AboveHigh,
+///     temperature: Celsius::try_from_degrees(25.0).unwrap(),
+/// };
+/// // Historical direction and a later sample are separate facts.
+/// assert_eq!(event.cause, AlertCause::AboveHigh);
+/// assert_eq!(event.temperature.sixteenths(), 400);
+/// ```
+#[cfg(feature = "embedded-sensors-hal-async")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AlertEvent {
+    /// Direction evidence captured while servicing the alert, if available.
+    pub cause: AlertCause,
+    /// Latest available conversion read after observing the alert.
+    ///
+    /// This is not a trigger-time sample. A retained delivery reads this
+    /// at retry time; neither conversion age nor time since the crossing
+    /// is bounded. Do not infer direction from this value or discard an
+    /// alert because this value is back inside the configured limits.
+    pub temperature: Celsius,
+}
+
 /// Pure-function register codec.
 ///
 /// All sync/async-agnostic chip logic lives here: the [`Celsius`]
@@ -127,6 +222,8 @@ impl Default for Config {
 /// here is total or explicitly fallible, and the domains are small
 /// enough that the tests walk them exhaustively rather than sampling.
 pub(crate) mod ops {
+    #[cfg(feature = "embedded-sensors-hal-async")]
+    use crate::AlertCause;
     use crate::Config;
     #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
     use crate::Hysteresis;
@@ -418,6 +515,26 @@ pub(crate) mod ops {
             config: decode_config(c),
             low: c.fl(),
             high: c.fh(),
+        }
+    }
+
+    /// Interpret the FL/FH pair of an **already-qualified** interrupt
+    /// notification as an [`AlertCause`].
+    ///
+    /// Pure, total, and allocation-free. `(false, false)` maps to
+    /// [`AlertCause::Unknown`]: the notification was already qualified
+    /// elsewhere — by nonzero entry flags, or by a successful level wait
+    /// followed by a successful acknowledgment — and this function only
+    /// reports what direction evidence that snapshot carried. It is
+    /// **not** a test for whether an alert occurred, and converting an
+    /// arbitrary empty snapshot through it must never create an event.
+    #[cfg(feature = "embedded-sensors-hal-async")]
+    pub(crate) fn interrupt_alert_cause(low: bool, high: bool) -> AlertCause {
+        match (low, high) {
+            (false, false) => AlertCause::Unknown,
+            (true, false) => AlertCause::BelowLow,
+            (false, true) => AlertCause::AboveHigh,
+            (true, true) => AlertCause::Both,
         }
     }
 
@@ -754,7 +871,7 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
         AlertTmp108 {
             tmp108: self,
             alert,
-            interrupt_sample_pending: false,
+            interrupt_sample_pending: None,
         }
     }
 }
@@ -819,11 +936,21 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
 /// After a successful interrupt acknowledgment, the wrapper records a
 /// **delivery obligation** before awaiting temperature. This applies both
 /// to the entry-flag fast path and to the post-wait acknowledgment, whose
-/// flags are discarded even when zero. Temperature-read failure returns
+/// flags supply direction when nonzero but never requalify the event: a
+/// zero-flag acknowledgment still arms the obligation, with
+/// [`AlertCause::Unknown`]. Temperature-read failure returns
 /// [`Error::Bus`] and leaves the obligation pending; cancellation during
 /// that read also leaves it pending. A successful temperature read clears
 /// it synchronously, with no intervening await, before returning `Ok`.
 /// There is no internal retry: each delivery attempt reads temperature once.
+///
+/// [`wait_for_alert`][Self::wait_for_alert] and
+/// [`wait_for_temperature_threshold`][1] are two views of **one
+/// consumptive stream**, not two subscribers: they share this single
+/// obligation. Either may arm it, and a successful delivery through
+/// either settles it. The trait deliberately discards the cause, so a
+/// cause consumed by a successful scalar delivery cannot be retrieved
+/// afterwards.
 ///
 /// The obligation survives [`sensor_mut`][Self::sensor_mut], direct
 /// temperature reads, and reconfiguration. **Retained delivery takes
@@ -860,7 +987,10 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
 /// - it cannot identify whether FL, FH, or both caused the event. The
 ///   chip can set both flags, and it coalesces multiple excursions into
 ///   one latched state. Comparing the returned value against the limits
-///   is a heuristic, not a receipt.
+///   is a heuristic, not a receipt. Use
+///   [`wait_for_alert`][Self::wait_for_alert], which reports the
+///   observed [`AlertCause`] alongside the sample, instead of inferring
+///   direction from the temperature.
 ///
 /// Reading the configuration register acknowledges the interrupt before
 /// the temperature transaction is even issued, so the acknowledgment is
@@ -969,11 +1099,29 @@ pub struct AlertTmp108<
     /// read failed or the future was dropped.
     ///
     /// The chip cannot re-report it, so the driver owes the caller one
-    /// delivery: while this is set, `wait_for_temperature_threshold`
-    /// performs the temperature read and nothing else. Only a
-    /// successful delivery clears it (issue #58, gap 2). Comparator
-    /// mode never sets it — it acknowledges nothing.
-    interrupt_sample_pending: bool,
+    /// delivery: while this is `Some`, both
+    /// [`wait_for_alert`][Self::wait_for_alert] and
+    /// `wait_for_temperature_threshold` perform the temperature read and
+    /// nothing else. Only a successful delivery through either of them
+    /// clears it (issue #58, gap 2). Comparator mode never sets it — it
+    /// acknowledges nothing.
+    ///
+    /// The payload is the direction evidence that acknowledgment
+    /// carried, so the five states are distinct and must never be
+    /// collapsed (issue #67):
+    ///
+    /// | State | Representation |
+    /// |---|---|
+    /// | Empty, nothing owed | `None` |
+    /// | Owed, direction unknown | `Some(AlertCause::Unknown)` |
+    /// | Owed, FL observed | `Some(AlertCause::BelowLow)` |
+    /// | Owed, FH observed | `Some(AlertCause::AboveHigh)` |
+    /// | Owed, both observed | `Some(AlertCause::Both)` |
+    ///
+    /// In particular `Some(AlertCause::Unknown)` is a real debt — a
+    /// successful level wait plus a successful zero-flag acknowledgment
+    /// — and is not interchangeable with `None`.
+    interrupt_sample_pending: Option<AlertCause>,
 }
 
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
@@ -1003,7 +1151,7 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
         Self {
             tmp108,
             alert,
-            interrupt_sample_pending: false,
+            interrupt_sample_pending: None,
         }
     }
 
@@ -1206,6 +1354,230 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
         (self.tmp108.destroy(), self.alert)
     }
 
+    /// Deliver a retained interrupt, or observe ALERT, then read temperature.
+    ///
+    /// Available with the `embedded-sensors-hal-async` feature. Unlike
+    /// `TemperatureThresholdWait::wait_for_temperature_threshold`, this
+    /// inherent method returns direction evidence as well as a [`Celsius`]
+    /// sample. It does not configure the chip or start conversions.
+    ///
+    /// With no retained delivery, one configuration read selects mode and
+    /// polarity. In Interrupt mode, nonzero entry flags qualify the alert
+    /// immediately, without GPIO waiting or another acknowledgment.
+    /// Otherwise this method waits for the asserted pin level, then
+    /// acknowledges with one configuration read. Nonzero acknowledgment
+    /// flags supply direction; zero flags still deliver an event with
+    /// [`AlertCause::Unknown`].
+    ///
+    /// In Comparator mode, this method waits for the asserted level and
+    /// reports [`AlertCause::Unknown`]. Entry flags do not establish direction
+    /// for the later level observation. There is no post-wait configuration
+    /// read. An already-asserted comparator level completes the wait
+    /// immediately; repeated calls need not represent distinct crossings.
+    ///
+    /// In Interrupt mode, FL/FH describe threshold excursions since the flags
+    /// were last observed and cleared, subject to reset, not what is true at
+    /// the moment this method returns. Reading configuration consumes those
+    /// flags and releases ALERT (TMP108 datasheet SBOS663A, sections 7.5.3.4
+    /// and 7.5.4). Both flags can be reported together; their order and the
+    /// number of excursions are not known.
+    ///
+    /// The temperature is the latest available conversion, not the
+    /// temperature at the crossing (SBOS663A, section 7.5.2). Known direction
+    /// comes only from FL/FH, never from comparing the sample with limits.
+    ///
+    /// # Retained delivery
+    ///
+    /// After a successful interrupt acknowledgment, the wrapper retains the
+    /// cause before awaiting temperature, including `Unknown` when
+    /// appropriate. Temperature failure or cancellation leaves it pending.
+    /// The next call to either this method or the threshold-wait trait reads
+    /// temperature only, without configuration or GPIO access. Retrying
+    /// preserves the original cause but obtains a new sample.
+    ///
+    /// A retained cause can describe an earlier interrupt even if another
+    /// interrupt has since latched in the opposite direction. The returned
+    /// sample need not support the retained direction: it may be inside the
+    /// limits or beyond the opposite limit. This is expected, not grounds to
+    /// replace the cause or reject the event.
+    ///
+    /// This method and the threshold-wait trait are two views of one
+    /// consumptive stream, not two subscribers. Either may retain an
+    /// obligation; successful delivery through either consumes it. A
+    /// successful trait delivery deliberately discards cause, and a later
+    /// call to this method cannot retrieve that consumed cause. If a trait
+    /// attempt fails or is cancelled during its temperature read, the
+    /// retained cause remains available to this method.
+    ///
+    /// Only a successful temperature read settles a retained obligation.
+    /// This method does not return a partially successful event on a sample
+    /// error. No internal retries or asynchronous drop cleanup are performed.
+    ///
+    /// Retention survives direct sensor access and reconfiguration, including
+    /// switching to Comparator mode. Direct temperature reads do not consume
+    /// it. Decomposing or dropping the wrapper abandons it without driver I/O;
+    /// a new wrapper starts empty. Fresh comparator observations never create
+    /// a retained obligation.
+    ///
+    /// # Cancellation and ownership
+    ///
+    /// This future is **not event-delivery cancel-safe during configuration
+    /// reads**: hardware may acknowledge before I2C reports success. Failure
+    /// or cancellation there can lose evidence before it can be retained.
+    /// HAL-specific bus and GPIO cancellation/recovery guarantees still
+    /// apply. There is no durable queue or exactly-once guarantee per
+    /// physical excursion.
+    ///
+    /// Callers must provide retry bounds or backoff on a failing bus and
+    /// backoff for repeated comparator observations. An immediately failing
+    /// bus can make repeated retained-delivery attempts return errors without
+    /// yielding.
+    ///
+    /// Use a dedicated ALERT pin and serialize device access. Do not change
+    /// mode or polarity, or acknowledge through an independent device
+    /// handle, during a pending acquisition. See [`AlertTmp108`] for
+    /// phase-specific recovery and lifecycle details.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Bus`] preserves an I2C error from configuration or temperature;
+    /// [`Error::Pin`] preserves a GPIO-wait error. This method does not
+    /// produce [`Error::InvalidInput`].
+    ///
+    /// A bus error neither identifies the failing phase nor proves that no
+    /// interrupt occurred or that its flags survived. After successful
+    /// interrupt acknowledgment, a failed sample retains delivery on this
+    /// wrapper; failure during acknowledgment need not do so.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// # use embedded_hal_mock::eh1::{digital, i2c::{Mock, Transaction}};
+    /// use tmp108::{AlertCause, AlertTmp108};
+    /// # let i2c = Mock::new(&[
+    /// #     Transaction::write_read(0x48, vec![0x01], vec![0x36, 0x10]),
+    /// #     Transaction::write_read(0x48, vec![0x00], vec![0x19, 0x00]),
+    /// # ]);
+    /// # let alert = digital::Mock::new(&[]);
+    ///
+    /// let mut sensor = AlertTmp108::new_with_a0_gnd(i2c, alert);
+    /// // Here the chip has an already-latched high interrupt.
+    /// let event = sensor.wait_for_alert().await.unwrap();
+    /// assert_eq!(event.cause, AlertCause::AboveHigh);
+    /// assert_eq!(event.temperature.sixteenths(), 400); // latest sample: 25 C
+    /// # let (mut i2c, mut alert) = sensor.destroy();
+    /// # i2c.done();
+    /// # alert.done();
+    /// # });
+    /// ```
+    pub async fn wait_for_alert(
+        &mut self,
+    ) -> Result<AlertEvent, Error<I2C::Error, <ALERT as embedded_hal::digital::ErrorType>::Error>> {
+        // Inspect the slot *first*, and copy rather than take. `AlertCause`
+        // is `Copy`, so the authoritative value stays on the wrapper
+        // across the `.await` on T below: a dropped future never runs an
+        // error arm, so any "take now, restore on Err" shape would lose
+        // the event exactly at cancellation. `Some(AlertCause::Unknown)`
+        // is a genuine debt and takes the retained branch, identically to
+        // a known direction — collapsing it into `None` would reintroduce
+        // the lost-event loop.
+        let cause = if let Some(retained) = self.interrupt_sample_pending {
+            // A previous call already acknowledged an interrupt on the
+            // chip but never managed to complete delivery. The chip has
+            // no copy left, so the delivery obligation is this driver's
+            // to settle: no C0 (there is nothing to collect and a read
+            // would destroy a *newer* latch), no GPIO wait (the pin was
+            // released by the acknowledgment), no C1. Just T. See issue
+            // #58, gap 2.
+            retained
+        } else {
+            // C0. This single transaction both tells us how the chip is
+            // configured and consumes whatever FL/FH it had latched. The
+            // binding is immutable on purpose: the flags captured here are
+            // evidence of an already-pending interrupt until transferred
+            // into the delivery obligation; nothing below may clobber them.
+            let entry_snapshot = self.read_alert_snapshot().await.map_err(Error::Bus)?;
+            let config = entry_snapshot.config;
+
+            match (config.thermostat_mode, config.alert_polarity) {
+                // Comparator mode does not latch, so FL/FH are not evidence
+                // of anything the caller is waiting for — the pin level is.
+                // Deliberately no fast path and no acknowledgment here.
+                //
+                // The ALERT pin stays asserted while the temperature is
+                // outside (Tlow + HYS)..(Thigh - HYS), so calling this in a
+                // tight loop returns immediately on every iteration.
+                //
+                // Nothing is acknowledged, so nothing can be owed: these
+                // two arms must never arm `interrupt_sample_pending`. The
+                // local `Unknown` below is this call's report, not a debt.
+                (Thermostat::Comparator, Polarity::ActiveLow) => {
+                    self.alert.wait_for_low().await.map_err(Error::Pin)?;
+                    AlertCause::Unknown
+                }
+                (Thermostat::Comparator, Polarity::ActiveHigh) => {
+                    self.alert.wait_for_high().await.map_err(Error::Pin)?;
+                    AlertCause::Unknown
+                }
+
+                // Interrupt mode latches into FL/FH and releases the pin on
+                // a configuration read. C0 above has therefore already
+                // collected — and destroyed — any pending event. If it found
+                // one, that *is* the notification: waiting on the pin now
+                // would wait for a transition that has already been consumed
+                // and that may never recur (issue #59).
+                //
+                // Otherwise we await the asserted level. A level wait, not
+                // an edge wait: an assertion can land between C0 and the
+                // moment the wait is armed, and `Wait`'s edge methods do not
+                // return for an already-active pin.
+                (Thermostat::Interrupt, polarity) => {
+                    let acquired = if entry_snapshot.low || entry_snapshot.high {
+                        ops::interrupt_alert_cause(entry_snapshot.low, entry_snapshot.high)
+                    } else {
+                        match polarity {
+                            Polarity::ActiveLow => self.alert.wait_for_low().await.map_err(Error::Pin)?,
+                            Polarity::ActiveHigh => self.alert.wait_for_high().await.map_err(Error::Pin)?,
+                        }
+
+                        // C1: acknowledge the assertion we just observed.
+                        // Its flags *inform* direction but never *decide*
+                        // whether an event exists — the successful level
+                        // wait is the qualifying evidence, and requiring
+                        // nonzero flags here would reintroduce a lost-event
+                        // loop. The zero-flag case therefore still
+                        // qualifies, and arms `Some(AlertCause::Unknown)`.
+                        let acknowledgment = self.read_alert_snapshot().await.map_err(Error::Bus)?;
+                        ops::interrupt_alert_cause(acknowledgment.low, acknowledgment.high)
+                    };
+
+                    // The event is now acknowledged on the chip and owed to
+                    // the caller. Arm retention *before* awaiting T, so that
+                    // a failure or a drop at any point from here on leaves
+                    // the debt recorded — together with the direction the
+                    // chip can no longer re-report.
+                    self.interrupt_sample_pending = Some(acquired);
+                    acquired
+                }
+            }
+        };
+
+        // T. The latest conversion, read after observing an alert — not
+        // the temperature at the moment the threshold was crossed, and
+        // possibly back inside the configured band. It never determines
+        // or requalifies `cause`.
+        let temperature = self.sensor_mut().temperature().await.map_err(Error::Bus)?;
+
+        // Delivery succeeded, so the debt is settled. This runs in the
+        // same poll that resolved T, with no `.await` in between: there
+        // is no suspension point the caller could cancel at, so the
+        // clear cannot be skipped on the success path. On the error
+        // path the `?` above returns first and the slot keeps its cause.
+        self.interrupt_sample_pending = None;
+        Ok(AlertEvent { cause, temperature })
+    }
+
     /// Read the configuration register once and keep both the settings
     /// and the ALERT status flags it returned.
     ///
@@ -1216,8 +1588,10 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
     /// recoverable from the chip. The waiter transfers notification
     /// evidence into its delivery obligation before awaiting temperature:
     /// nonzero entry flags or a successful level wait plus acknowledgment
-    /// qualify it. FL/FH direction is still discarded (issue #58, gap 1),
-    /// including all flags from the post-wait acknowledgment. Failure or
+    /// qualify it. The flags of either read supply the delivered
+    /// [`AlertCause`] when they are nonzero, but they **never requalify**
+    /// a successful level wait: a zero-flag acknowledgment still delivers
+    /// an event, with [`AlertCause::Unknown`] (issue #67). Failure or
     /// cancellation during this read can lose evidence before that transfer.
     /// Call this exactly as often as the protocol
     /// requires — never speculatively, and never as "cleanup".
@@ -2249,6 +2623,13 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
     /// Deliver a retained interrupt, or acquire a fresh ALERT notification,
     /// then return the latest temperature conversion.
     ///
+    /// This is a scalar projection of
+    /// [`AlertTmp108::wait_for_alert`], which owns the whole acquisition
+    /// and delivery protocol. Both entry points are two views of one
+    /// consumptive stream sharing a single retained obligation: this one
+    /// deliberately discards the observed [`AlertCause`], so a successful
+    /// delivery here cannot be re-read as a cause later.
+    ///
     /// The returned value is **not** a trigger-time sample, the error
     /// type cannot express a partially delivered event, and this future
     /// is not event-delivery cancel-safe during configuration reads.
@@ -2267,88 +2648,7 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
     async fn wait_for_temperature_threshold(
         &mut self,
     ) -> Result<embedded_sensors_hal_async::temperature::DegreesCelsius, Self::Error> {
-        // A previous call already acknowledged an interrupt on the chip
-        // but never managed to complete delivery. The chip has no copy
-        // left, so the delivery obligation is this driver's to settle:
-        // no C0 (there is nothing to collect and a read would destroy a
-        // *newer* latch), no GPIO wait (the pin was released by the
-        // acknowledgment), no C1. Just T. See issue #58, gap 2.
-        if !self.interrupt_sample_pending {
-            // C0. This single transaction both tells us how the chip is
-            // configured and consumes whatever FL/FH it had latched. The
-            // binding is immutable on purpose: the flags captured here are
-            // evidence of an already-pending interrupt until transferred
-            // into the delivery obligation; nothing below may clobber them.
-            let entry_snapshot = self.read_alert_snapshot().await.map_err(Error::Bus)?;
-            let config = entry_snapshot.config;
-
-            match (config.thermostat_mode, config.alert_polarity) {
-                // Comparator mode does not latch, so FL/FH are not evidence
-                // of anything the caller is waiting for — the pin level is.
-                // Deliberately no fast path and no acknowledgment here.
-                //
-                // The ALERT pin stays asserted while the temperature is
-                // outside (Tlow + HYS)..(Thigh - HYS), so calling this in a
-                // tight loop returns immediately on every iteration.
-                //
-                // Nothing is acknowledged, so nothing can be owed: these
-                // two arms must never arm `interrupt_sample_pending`.
-                (Thermostat::Comparator, Polarity::ActiveLow) => {
-                    self.alert.wait_for_low().await.map_err(Error::Pin)?;
-                }
-                (Thermostat::Comparator, Polarity::ActiveHigh) => {
-                    self.alert.wait_for_high().await.map_err(Error::Pin)?;
-                }
-
-                // Interrupt mode latches into FL/FH and releases the pin on
-                // a configuration read. C0 above has therefore already
-                // collected — and destroyed — any pending event. If it found
-                // one, that *is* the notification: waiting on the pin now
-                // would wait for a transition that has already been consumed
-                // and that may never recur (issue #59).
-                //
-                // Otherwise we await the asserted level. A level wait, not
-                // an edge wait: an assertion can land between C0 and the
-                // moment the wait is armed, and `Wait`'s edge methods do not
-                // return for an already-active pin.
-                (Thermostat::Interrupt, polarity) => {
-                    if !(entry_snapshot.low || entry_snapshot.high) {
-                        match polarity {
-                            Polarity::ActiveLow => self.alert.wait_for_low().await.map_err(Error::Pin)?,
-                            Polarity::ActiveHigh => self.alert.wait_for_high().await.map_err(Error::Pin)?,
-                        }
-
-                        // C1: acknowledge the assertion we just observed.
-                        // Its own flags are intentionally discarded — the
-                        // successful level wait is the qualifying evidence,
-                        // and requiring nonzero flags here would reintroduce
-                        // a lost-event loop. That includes the zero-flag
-                        // case: it still qualifies, so it still arms
-                        // retention below.
-                        let _acknowledgment = self.read_alert_snapshot().await.map_err(Error::Bus)?;
-                    }
-
-                    // The event is now acknowledged on the chip and owed to
-                    // the caller. Arm retention *before* awaiting T, so that
-                    // a failure or a drop at any point from here on leaves
-                    // the debt recorded.
-                    self.interrupt_sample_pending = true;
-                }
-            }
-        }
-
-        // T. The latest conversion, read after observing an alert — not
-        // the temperature at the moment the threshold was crossed, and
-        // possibly back inside the configured band.
-        let temperature = self.sensor_mut().temperature().await.map_err(Error::Bus)?;
-
-        // Delivery succeeded, so the debt is settled. This runs in the
-        // same poll that resolved T, with no `.await` in between: there
-        // is no suspension point the caller could cancel at, so the
-        // clear cannot be skipped on the success path. On the error
-        // path the `?` above returns first and the flag stays set.
-        self.interrupt_sample_pending = false;
-        Ok(temperature.to_degrees())
+        self.wait_for_alert().await.map(|event| event.temperature.to_degrees())
     }
 }
 
@@ -2547,6 +2847,80 @@ mod tests {
                 for (byte0, low, high) in cases {
                     let snapshot = decode_alert_snapshot(Configuration::from([byte0, 0x10]));
                     assert_eq!((snapshot.low, snapshot.high), (low, high), "byte0 {byte0:#04x}");
+                }
+            }
+        }
+
+        /// Issue #67: interpreting the FL/FH pair of an
+        /// already-qualified notification.
+        ///
+        /// `(false, false)` mapping to `Unknown` is *interpretation
+        /// after qualification*, never raw evidence that an alert
+        /// occurred: the caller reaches this function only because
+        /// nonzero entry flags or a successful level wait plus a
+        /// successful acknowledgment already qualified the event.
+        #[cfg(feature = "embedded-sensors-hal-async")]
+        mod alert_cause {
+            use crate::AlertCause;
+            use crate::inner::Configuration;
+            use crate::ops::{decode_alert_snapshot, interrupt_alert_cause};
+
+            /// All four inputs, exhaustively.
+            #[test]
+            fn the_mapping_is_exhaustive_and_total() {
+                assert_eq!(interrupt_alert_cause(false, false), AlertCause::Unknown);
+                assert_eq!(interrupt_alert_cause(true, false), AlertCause::BelowLow);
+                assert_eq!(interrupt_alert_cause(false, true), AlertCause::AboveHigh);
+                assert_eq!(interrupt_alert_cause(true, true), AlertCause::Both);
+            }
+
+            /// FL is bit 3 and FH is bit 4 of the first configuration
+            /// byte (SBOS663A, Table 8), and **no other bit** in the
+            /// register can influence the cause.
+            ///
+            /// Walking all 65,536 patterns includes every `M = 0b11`
+            /// encoding, which the generated `Mode` decoder rejects
+            /// (issue #62). Nothing on this path may call `c.m()`.
+            #[test]
+            fn only_bits_3_and_4_of_byte_0_decide_the_cause() {
+                for word in 0..=u16::MAX {
+                    let bytes = word.to_le_bytes();
+                    let snapshot = decode_alert_snapshot(Configuration::from(bytes));
+                    let cause = interrupt_alert_cause(snapshot.low, snapshot.high);
+
+                    let want = match (bytes[0] & 0x08 != 0, bytes[0] & 0x10 != 0) {
+                        (false, false) => AlertCause::Unknown,
+                        (true, false) => AlertCause::BelowLow,
+                        (false, true) => AlertCause::AboveHigh,
+                        (true, true) => AlertCause::Both,
+                    };
+
+                    assert_eq!(cause, want, "cause wrong for {bytes:02x?}");
+                }
+            }
+
+            /// The same cause for every setting of every other bit,
+            /// holding FL/FH fixed. `M = 0b11` is included explicitly.
+            #[test]
+            fn other_configuration_bits_are_irrelevant() {
+                for flags in 0..4_u8 {
+                    let fl = flags & 1 != 0;
+                    let fh = flags & 2 != 0;
+                    let want = interrupt_alert_cause(fl, fh);
+                    let flag_bits = u8::from(fl) << 3 | u8::from(fh) << 4;
+
+                    for other in 0..=u16::MAX {
+                        let other = other.to_le_bytes();
+                        // Everything except bits 3 and 4 of byte 0 —
+                        // M = 0b11 among them.
+                        let bytes = [(other[0] & !0x18) | flag_bits, other[1]];
+                        let snapshot = decode_alert_snapshot(Configuration::from(bytes));
+                        assert_eq!(
+                            interrupt_alert_cause(snapshot.low, snapshot.high),
+                            want,
+                            "cause moved for {bytes:02x?}"
+                        );
+                    }
                 }
             }
         }
@@ -3876,6 +4250,14 @@ mod tests {
                 Err(I2cError),
                 /// The transaction future never resolves.
                 Pending,
+                /// The transaction is recorded immediately — including its
+                /// response bytes — but its future stays `Pending` until
+                /// the test opens the gate, after which it resolves
+                /// successfully *without* running a second transaction.
+                ///
+                /// Design section 8.3 D: `Pending` alone cannot express a
+                /// delayed completion, because it never resolves.
+                Gated,
             }
 
             /// One scripted I2C transaction.
@@ -3904,6 +4286,12 @@ mod tests {
 
                 fn pending(mut self) -> Self {
                     self.outcome = Outcome::Pending;
+                    self
+                }
+
+                /// See [`Outcome::Gated`].
+                fn gated(mut self) -> Self {
+                    self.outcome = Outcome::Gated;
                     self
                 }
             }
@@ -3964,6 +4352,8 @@ mod tests {
                 strict_pin: bool,
                 /// Error returned by the next *level* wait.
                 pin_error: Option<PinError>,
+                /// Whether [`Outcome::Gated`] transactions may now resolve.
+                gate_open: bool,
             }
 
             impl World {
@@ -4074,15 +4464,34 @@ mod tests {
 
                     step.outcome
                 }
+
+                /// Resolve a scripted outcome. The transaction itself has
+                /// already been recorded by [`FakeI2c::step`], so a
+                /// [`Outcome::Gated`] completion adds no further log entry.
+                async fn finish(&self, outcome: Outcome) -> Result<(), I2cError> {
+                    match outcome {
+                        Outcome::Ok => Ok(()),
+                        Outcome::Err(e) => Err(e),
+                        Outcome::Pending => core::future::pending().await,
+                        Outcome::Gated => {
+                            let shared = self.shared.clone();
+                            core::future::poll_fn(move |_cx| {
+                                if shared.lock().unwrap().gate_open {
+                                    Poll::Ready(Ok(()))
+                                } else {
+                                    Poll::Pending
+                                }
+                            })
+                            .await
+                        }
+                    }
+                }
             }
 
             impl embedded_hal_async::i2c::I2c for FakeI2c {
                 async fn write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), Self::Error> {
-                    match self.step(addr, bytes, None) {
-                        Outcome::Ok => Ok(()),
-                        Outcome::Err(e) => Err(e),
-                        Outcome::Pending => core::future::pending().await,
-                    }
+                    let outcome = self.step(addr, bytes, None);
+                    self.finish(outcome).await
                 }
 
                 async fn read(&mut self, _addr: u8, _buf: &mut [u8]) -> Result<(), Self::Error> {
@@ -4090,11 +4499,8 @@ mod tests {
                 }
 
                 async fn write_read(&mut self, addr: u8, bytes: &[u8], buf: &mut [u8]) -> Result<(), Self::Error> {
-                    match self.step(addr, bytes, Some(buf)) {
-                        Outcome::Ok => Ok(()),
-                        Outcome::Err(e) => Err(e),
-                        Outcome::Pending => core::future::pending().await,
-                    }
+                    let outcome = self.step(addr, bytes, Some(buf));
+                    self.finish(outcome).await
                 }
 
                 async fn transaction(
@@ -4230,6 +4636,7 @@ mod tests {
                     sticky_low: !setup.level_high,
                     strict_pin: setup.strict_pin,
                     pin_error: setup.pin_error,
+                    gate_open: false,
                 }));
                 let i2c = FakeI2c { shared: shared.clone() };
                 let pin = FakePin { shared: shared.clone() };
@@ -5885,6 +6292,1196 @@ mod tests {
 
                 shared.lock().unwrap().strict_pin = true;
                 expect_retained_delivery(&shared, &mut tmp, T25, 25.0);
+            }
+
+            // ===============================================================
+            // Issue #67 — observable alert cause.
+            //
+            // Design section 8.2, "Fast cause matrix", "Slow cause matrix"
+            // and "Zero-C1 qualification".
+            // ===============================================================
+
+            type AlertPoll = Poll<Result<AlertEvent, Error<I2cError, PinError>>>;
+
+            fn event(p: AlertPoll) -> AlertEvent {
+                match p {
+                    Poll::Ready(Ok(e)) => e,
+                    Poll::Ready(Err(e)) => panic!("expected an alert event, got {e:?}"),
+                    Poll::Pending => panic!(
+                        "waiter parked instead of completing — it is waiting for a notification \
+                         this fixture will never deliver"
+                    ),
+                }
+            }
+
+            /// 25 °C as the driver's own representation, so the assertion
+            /// is exact rather than approximate.
+            fn celsius(sixteenths: i16) -> Celsius {
+                Celsius::from_sixteenths(sixteenths).expect("in range by construction")
+            }
+
+            /// The asserted-level wait a given polarity byte selects.
+            fn asserted_wait(byte1: u8) -> PinOp {
+                if byte1 == ACTIVE_HIGH {
+                    PinOp::WaitHigh
+                } else {
+                    PinOp::WaitLow
+                }
+            }
+
+            // ---------------------------------------------------------------
+            // Fast cause matrix: nonzero entry flags, C0 and T only.
+            // ---------------------------------------------------------------
+
+            fn fast_cause_case(byte1: u8, fl: bool, fh: bool, want: AlertCause) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let release: fn(&mut World) = if asserted_high {
+                    ack_release_low
+                } else {
+                    ack_release_high
+                };
+
+                let (shared, mut tmp) = build(Setup {
+                    level_high: asserted_high,
+                    fl,
+                    fh,
+                    // Any GPIO touch is a bug on the fast path (issue #59).
+                    strict_pin: true,
+                    // T25 is deliberately *inside* any plausible band: an
+                    // in-band sample must not alter the reported cause.
+                    steps: vec![cfg(INTERRUPT, byte1).effect(release), temp(T25)],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_alert());
+                    poll_once(fut.as_mut())
+                };
+                let ev = event(result);
+
+                assert_eq!(ev.cause, want, "C0 flags ({fl}, {fh}) must map to {want:?}");
+                assert_eq!(ev.temperature, celsius(400));
+                assert!(
+                    pin_calls(&shared).is_empty(),
+                    "a pending entry flag must suppress every GPIO operation, saw {:?}",
+                    pin_calls(&shared)
+                );
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x01], vec![0x00]],
+                    "the fast path performs exactly C0 and T (no C1)"
+                );
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            #[test]
+            fn fast_path_fl_active_low_reports_below_low() {
+                fast_cause_case(ACTIVE_LOW, true, false, AlertCause::BelowLow);
+            }
+
+            #[test]
+            fn fast_path_fh_active_low_reports_above_high() {
+                fast_cause_case(ACTIVE_LOW, false, true, AlertCause::AboveHigh);
+            }
+
+            #[test]
+            fn fast_path_both_flags_active_low_reports_both() {
+                fast_cause_case(ACTIVE_LOW, true, true, AlertCause::Both);
+            }
+
+            #[test]
+            fn fast_path_fl_active_high_reports_below_low() {
+                fast_cause_case(ACTIVE_HIGH, true, false, AlertCause::BelowLow);
+            }
+
+            #[test]
+            fn fast_path_fh_active_high_reports_above_high() {
+                fast_cause_case(ACTIVE_HIGH, false, true, AlertCause::AboveHigh);
+            }
+
+            #[test]
+            fn fast_path_both_flags_active_high_reports_both() {
+                fast_cause_case(ACTIVE_HIGH, true, true, AlertCause::Both);
+            }
+
+            // ---------------------------------------------------------------
+            // Slow cause matrix: clear C0, one level wait, then C1.
+            // ---------------------------------------------------------------
+
+            /// Clear entry snapshot, one asserted-level wait, one C1
+            /// carrying `(fl, fh)`, then T. All four C1 flag pairs are
+            /// legal, including zero: C1's flags inform the cause but
+            /// never decide whether an event exists.
+            fn slow_cause_case(byte1: u8, fl: bool, fh: bool, want: AlertCause) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let release: fn(&mut World) = if asserted_high {
+                    ack_release_low
+                } else {
+                    ack_release_high
+                };
+
+                let (shared, mut tmp) = build(Setup {
+                    // ALERT inactive and nothing latched: the waiter must
+                    // take the level-wait path.
+                    level_high: !asserted_high,
+                    steps: vec![cfg(INTERRUPT, byte1), cfg(INTERRUPT, byte1).effect(release), temp(T25)],
+                    ..Default::default()
+                });
+
+                let mut fut = pin!(tmp.wait_for_alert());
+
+                assert!(poll_once(fut.as_mut()).is_pending(), "must park until ALERT asserts");
+                assert_eq!(
+                    log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![INTERRUPT, byte1]),
+                        Op::PinCall(asserted_wait(byte1)),
+                    ],
+                    "exactly one level wait, armed after C0 and before any C1"
+                );
+
+                // The alert asserts, latching whatever C1 will report.
+                {
+                    let mut w = shared.lock().unwrap();
+                    w.fl = fl;
+                    w.fh = fh;
+                    w.set_level(asserted_high);
+                }
+
+                let ev = event(poll_once(fut.as_mut()));
+
+                assert_eq!(ev.cause, want, "C1 flags ({fl}, {fh}) must map to {want:?}");
+                assert_eq!(ev.temperature, celsius(400));
+                assert_eq!(
+                    pin_calls(&shared),
+                    vec![asserted_wait(byte1)],
+                    "exactly one level wait, and never a second one"
+                );
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x01], vec![0x01], vec![0x00]],
+                    "the slow path performs C0, C1 and T"
+                );
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            #[test]
+            fn slow_path_zero_c1_active_low_reports_unknown() {
+                slow_cause_case(ACTIVE_LOW, false, false, AlertCause::Unknown);
+            }
+
+            #[test]
+            fn slow_path_fl_c1_active_low_reports_below_low() {
+                slow_cause_case(ACTIVE_LOW, true, false, AlertCause::BelowLow);
+            }
+
+            #[test]
+            fn slow_path_fh_c1_active_low_reports_above_high() {
+                slow_cause_case(ACTIVE_LOW, false, true, AlertCause::AboveHigh);
+            }
+
+            #[test]
+            fn slow_path_both_c1_active_low_reports_both() {
+                slow_cause_case(ACTIVE_LOW, true, true, AlertCause::Both);
+            }
+
+            #[test]
+            fn slow_path_zero_c1_active_high_reports_unknown() {
+                slow_cause_case(ACTIVE_HIGH, false, false, AlertCause::Unknown);
+            }
+
+            #[test]
+            fn slow_path_fl_c1_active_high_reports_below_low() {
+                slow_cause_case(ACTIVE_HIGH, true, false, AlertCause::BelowLow);
+            }
+
+            #[test]
+            fn slow_path_fh_c1_active_high_reports_above_high() {
+                slow_cause_case(ACTIVE_HIGH, false, true, AlertCause::AboveHigh);
+            }
+
+            #[test]
+            fn slow_path_both_c1_active_high_reports_both() {
+                slow_cause_case(ACTIVE_HIGH, true, true, AlertCause::Both);
+            }
+
+            // ---------------------------------------------------------------
+            // Zero-C1 qualification, stated on its own.
+            // ---------------------------------------------------------------
+
+            /// A successful level wait followed by a **successful** C1 is
+            /// the qualification gate. C1 returning FL = FH = 0 does not
+            /// invalidate it: the waiter must return `Ready` with
+            /// `AlertCause::Unknown`, not park for another assertion and
+            /// not sample `InputPin`. Requiring nonzero C1 flags would
+            /// reintroduce the lost-event loop of issue #59.
+            #[test]
+            fn a_zero_flag_c1_still_qualifies_and_never_re_waits() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: true,
+                    steps: vec![
+                        cfg(INTERRUPT, ACTIVE_LOW),
+                        // C1 reads the modeled chip, whose flags are still
+                        // clear — nothing latched them.
+                        cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high),
+                        temp(T25),
+                    ],
+                    ..Default::default()
+                });
+
+                let mut fut = pin!(tmp.wait_for_alert());
+                assert!(poll_once(fut.as_mut()).is_pending(), "must park until ALERT asserts");
+
+                // Only the level moves; FL and FH stay clear.
+                shared.lock().unwrap().set_level(false);
+
+                let ev = event(poll_once(fut.as_mut()));
+                assert_eq!(ev.cause, AlertCause::Unknown);
+                assert_eq!(ev.temperature, celsius(400));
+                assert_eq!(
+                    pin_calls(&shared),
+                    vec![PinOp::WaitLow],
+                    "one level wait only — no second wait, and no InputPin sampling"
+                );
+                assert_eq!(i2c_writes(&shared), vec![vec![0x01], vec![0x01], vec![0x00]]);
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            // ===============================================================
+            // Issue #67 — design sections 8.3 and 8.4.
+            //
+            // Every expectation below is written out as a *literal* trace
+            // derived from the protocol in design section 3, not as "API A
+            // agrees with API B": both entry points now run one shared
+            // implementation, so a shared regression would satisfy any
+            // purely comparative assertion.
+            // ===============================================================
+
+            /// Open the gate of a [`Outcome::Gated`] transaction.
+            fn release_gate(shared: &Shared) {
+                shared.lock().unwrap().gate_open = true;
+            }
+
+            /// [`expect_bus`], for the inherent method's result type.
+            fn expect_alert_bus(shared: &Shared, p: AlertPoll, want: I2cError) {
+                match p {
+                    Poll::Ready(Err(Error::Bus(e))) => assert_eq!(e, want),
+                    Poll::Pending => panic!(
+                        "waiter parked instead of returning Err(Bus({want:?})); pin operations so \
+                         far: {:?}",
+                        pin_calls(shared)
+                    ),
+                    other @ Poll::Ready(_) => panic!("expected Err(Bus({want:?})), got {other:?}"),
+                }
+            }
+
+            /// The C0/C1 response byte 0 the modeled chip produces for a
+            /// given latched flag pair.
+            fn cfg_byte0(fl: bool, fh: bool) -> u8 {
+                INTERRUPT | u8::from(fl) << 3 | u8::from(fh) << 4
+            }
+
+            /// Which entry point a test drives. Both are views of one
+            /// consumptive stream (design section 3.6), so every arming and
+            /// retry helper below is parameterised over this.
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            enum Api {
+                /// `AlertTmp108::wait_for_alert`.
+                Inherent,
+                /// `TemperatureThresholdWait::wait_for_temperature_threshold`.
+                Trait,
+            }
+
+            /// Arm exactly one retained obligation through the interrupt
+            /// **fast path**, via `api`, by failing T.
+            ///
+            /// Leaves `strict_pin` armed and the log empty.
+            fn arm_fast_via(byte1: u8, fl: bool, fh: bool, api: Api) -> (Shared, AlertTmp108<FakeI2c, FakePin>) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let release: fn(&mut World) = if asserted_high {
+                    ack_release_low
+                } else {
+                    ack_release_high
+                };
+
+                let (shared, mut tmp) = build(Setup {
+                    level_high: asserted_high,
+                    fl,
+                    fh,
+                    strict_pin: true,
+                    steps: vec![cfg(INTERRUPT, byte1).effect(release), temp(T80).err(I2cError::Other)],
+                    ..Default::default()
+                });
+
+                match api {
+                    Api::Trait => {
+                        let result = {
+                            let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                            poll_once(fut.as_mut())
+                        };
+                        expect_bus(&shared, result, I2cError::Other);
+                    }
+                    Api::Inherent => {
+                        let result = {
+                            let mut fut = pin!(tmp.wait_for_alert());
+                            poll_once(fut.as_mut())
+                        };
+                        expect_alert_bus(&shared, result, I2cError::Other);
+                    }
+                }
+
+                assert_eq!(
+                    take_log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![cfg_byte0(fl, fh), byte1]),
+                        Op::WriteRead(vec![0x00], T80.to_vec()),
+                    ],
+                    "arming the fast path is exactly C0 and a failing T"
+                );
+                assert_eq!(steps_left(&shared), 0);
+                (shared, tmp)
+            }
+
+            /// Arm one retained obligation through the interrupt **slow
+            /// path** with a successful but **zero-flag** C1, via `api`.
+            ///
+            /// The resulting slot must be `Some(AlertCause::Unknown)` —
+            /// a genuine debt, not `None`.
+            fn arm_slow_unknown_via(byte1: u8, api: Api, cancel: bool) -> (Shared, AlertTmp108<FakeI2c, FakePin>) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let want = asserted_wait(byte1);
+                let release: fn(&mut World) = if asserted_high {
+                    ack_release_low
+                } else {
+                    ack_release_high
+                };
+
+                let last = if cancel {
+                    temp(T80).pending()
+                } else {
+                    temp(T80).err(I2cError::Other)
+                };
+
+                let (shared, mut tmp) = build(Setup {
+                    level_high: !asserted_high,
+                    steps: vec![cfg(INTERRUPT, byte1), cfg(INTERRUPT, byte1).effect(release), last],
+                    ..Default::default()
+                });
+
+                {
+                    // One scope for both APIs would need one future type,
+                    // so the arming is written out per API instead.
+                    match api {
+                        Api::Trait => {
+                            let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                            assert!(poll_once(fut.as_mut()).is_pending(), "must park until ALERT asserts");
+                            assert_eq!(pin_calls(&shared), vec![want]);
+                            // Only the level moves: FL and FH stay clear,
+                            // so C1 will return zero flags.
+                            shared.lock().unwrap().set_level(asserted_high);
+                            let result = poll_once(fut.as_mut());
+                            if cancel {
+                                assert!(result.is_pending(), "the gated T must park so it can be cancelled");
+                            } else {
+                                expect_bus(&shared, result, I2cError::Other);
+                            }
+                        }
+                        Api::Inherent => {
+                            let mut fut = pin!(tmp.wait_for_alert());
+                            assert!(poll_once(fut.as_mut()).is_pending(), "must park until ALERT asserts");
+                            assert_eq!(pin_calls(&shared), vec![want]);
+                            shared.lock().unwrap().set_level(asserted_high);
+                            let result = poll_once(fut.as_mut());
+                            if cancel {
+                                assert!(result.is_pending(), "the gated T must park so it can be cancelled");
+                            } else {
+                                expect_alert_bus(&shared, result, I2cError::Other);
+                            }
+                        }
+                    }
+                }
+
+                assert_eq!(
+                    take_log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![INTERRUPT, byte1]),
+                        Op::PinCall(want),
+                        Op::PinDone(want),
+                        // C1 with FL = FH = 0: still a qualifying
+                        // acknowledgment (design section 3.4 step 4).
+                        Op::WriteRead(vec![0x01], vec![INTERRUPT, byte1]),
+                        Op::WriteRead(vec![0x00], T80.to_vec()),
+                    ],
+                    "the slow path is C0, one level wait, a zero-flag C1, then T"
+                );
+                assert_eq!(steps_left(&shared), 0);
+                shared.lock().unwrap().strict_pin = true;
+                (shared, tmp)
+            }
+
+            /// Deliver a retained obligation through the inherent method
+            /// and require the literal one-transaction trace.
+            fn expect_retained_event(
+                shared: &Shared,
+                tmp: &mut AlertTmp108<FakeI2c, FakePin>,
+                bytes: [u8; 2],
+                want_cause: AlertCause,
+                want_sixteenths: i16,
+            ) {
+                push_steps(shared, vec![temp(bytes)]);
+                take_log(shared);
+                let ev = event({
+                    let mut fut = pin!(tmp.wait_for_alert());
+                    poll_once(fut.as_mut())
+                });
+
+                assert_eq!(ev.cause, want_cause, "a retained delivery reports the *original* cause");
+                assert_eq!(
+                    ev.temperature,
+                    celsius(want_sixteenths),
+                    "with a fresh, retry-time sample"
+                );
+                assert_eq!(
+                    take_log(shared),
+                    vec![Op::WriteRead(vec![0x00], bytes.to_vec())],
+                    "a retained delivery is exactly one transaction — T — and no GPIO at all"
+                );
+                assert_eq!(steps_left(shared), 0);
+            }
+
+            /// As above, through the trait: the scalar projection consumes
+            /// the very same obligation and discards its direction.
+            fn expect_retained_scalar(
+                shared: &Shared,
+                tmp: &mut AlertTmp108<FakeI2c, FakePin>,
+                bytes: [u8; 2],
+                want: f32,
+            ) {
+                push_steps(shared, vec![temp(bytes)]);
+                take_log(shared);
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+
+                assert_approx_eq!(degrees(result), want, 1e-4);
+                assert_eq!(
+                    take_log(shared),
+                    vec![Op::WriteRead(vec![0x00], bytes.to_vec())],
+                    "a retained scalar delivery is exactly one transaction — T — and no GPIO"
+                );
+                assert_eq!(steps_left(shared), 0);
+            }
+
+            /// Fail one retained retry through `api`, leaving the debt in
+            /// place, and require the literal T-only trace.
+            fn expect_retained_failure(shared: &Shared, tmp: &mut AlertTmp108<FakeI2c, FakePin>, api: Api) {
+                push_steps(shared, vec![temp(T80).err(I2cError::Other)]);
+                take_log(shared);
+                match api {
+                    Api::Trait => {
+                        let result = {
+                            let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                            poll_once(fut.as_mut())
+                        };
+                        expect_bus(shared, result, I2cError::Other);
+                    }
+                    Api::Inherent => {
+                        let result = {
+                            let mut fut = pin!(tmp.wait_for_alert());
+                            poll_once(fut.as_mut())
+                        };
+                        expect_alert_bus(shared, result, I2cError::Other);
+                    }
+                }
+                assert_eq!(
+                    take_log(shared),
+                    vec![Op::WriteRead(vec![0x00], T80.to_vec())],
+                    "a failed retained retry is still T alone — no C0, no C1, no GPIO"
+                );
+                assert_eq!(steps_left(shared), 0);
+            }
+
+            /// Cancel one retained retry through `api` by dropping the
+            /// parked future, and require the literal T-only trace.
+            fn expect_retained_cancellation(shared: &Shared, tmp: &mut AlertTmp108<FakeI2c, FakePin>, api: Api) {
+                push_steps(shared, vec![temp(T80).pending()]);
+                take_log(shared);
+                match api {
+                    Api::Trait => {
+                        let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                        assert!(poll_once(fut.as_mut()).is_pending());
+                    }
+                    Api::Inherent => {
+                        let mut fut = pin!(tmp.wait_for_alert());
+                        assert!(poll_once(fut.as_mut()).is_pending());
+                    }
+                }
+                assert_eq!(
+                    take_log(shared),
+                    vec![Op::WriteRead(vec![0x00], T80.to_vec())],
+                    "a cancelled retained retry is T alone, with no cleanup acknowledgment"
+                );
+                assert_eq!(steps_left(shared), 0);
+            }
+
+            /// Require that the next call is a **fresh acquisition**: a new
+            /// C0, and — since the modeled chip has nothing latched and the
+            /// pin is released — a level wait it parks on.
+            ///
+            /// This is the negative half of "consumed exactly once": a
+            /// replayed cause would produce a lone `[0x00]` instead.
+            fn expect_fresh_acquisition(shared: &Shared, tmp: &mut AlertTmp108<FakeI2c, FakePin>, byte1: u8, api: Api) {
+                push_steps(shared, vec![cfg(INTERRUPT, byte1)]);
+                {
+                    let mut w = shared.lock().unwrap();
+                    w.strict_pin = false;
+                    w.fl = false;
+                    w.fh = false;
+                    w.set_level(byte1 != ACTIVE_HIGH);
+                }
+                take_log(shared);
+
+                match api {
+                    Api::Trait => {
+                        let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                        assert!(
+                            poll_once(fut.as_mut()).is_pending(),
+                            "a settled obligation must not be replayed"
+                        );
+                    }
+                    Api::Inherent => {
+                        let mut fut = pin!(tmp.wait_for_alert());
+                        assert!(
+                            poll_once(fut.as_mut()).is_pending(),
+                            "a settled obligation must not be replayed"
+                        );
+                    }
+                }
+
+                assert_eq!(
+                    take_log(shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![INTERRUPT, byte1]),
+                        Op::PinCall(asserted_wait(byte1)),
+                    ],
+                    "a fresh acquisition is a new C0 followed by a level wait"
+                );
+                assert_eq!(steps_left(shared), 0);
+            }
+
+            // ---------------------------------------------------------------
+            // Family A — cross-entry-point ownership symmetry (8.3 A).
+            //
+            // One consumptive stream, two views. Each test asserts the
+            // literal transaction log on both sides of the handoff.
+            // ---------------------------------------------------------------
+
+            /// Trait acquires FH and fails T; the inherent method retries
+            /// and must recover the *direction the trait captured* — which
+            /// the chip can no longer report, having been acknowledged.
+            #[test]
+            fn a_failed_trait_attempt_hands_its_cause_to_the_inherent_method() {
+                let (shared, mut tmp) = arm_fast_via(ACTIVE_LOW, false, true, Api::Trait);
+                expect_retained_event(&shared, &mut tmp, T25, AlertCause::AboveHigh, 400);
+                expect_fresh_acquisition(&shared, &mut tmp, ACTIVE_LOW, Api::Inherent);
+            }
+
+            /// As above, but the trait attempt is *cancelled* rather than
+            /// failed: no error arm runs, so a "take on entry, restore on
+            /// Err" shape would drop the cause here.
+            #[test]
+            fn a_cancelled_trait_attempt_hands_its_cause_to_the_inherent_method() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: false,
+                    fh: true,
+                    strict_pin: true,
+                    steps: vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high), temp(T80).pending()],
+                    ..Default::default()
+                });
+
+                {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    assert!(poll_once(fut.as_mut()).is_pending());
+                }
+                assert_eq!(
+                    take_log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![cfg_byte0(false, true), ACTIVE_LOW]),
+                        Op::WriteRead(vec![0x00], T80.to_vec()),
+                    ],
+                    "C0 and the cancelled T — and no cleanup read"
+                );
+
+                expect_retained_event(&shared, &mut tmp, T25, AlertCause::AboveHigh, 400);
+                expect_fresh_acquisition(&shared, &mut tmp, ACTIVE_LOW, Api::Inherent);
+            }
+
+            /// The mirror: the inherent method acquires FL and fails T, the
+            /// trait settles the debt with T alone, and the *direction is
+            /// then gone* — a later inherent call acquires afresh rather
+            /// than re-reporting `BelowLow`.
+            #[test]
+            fn a_failed_inherent_attempt_is_settled_by_the_trait_and_consumed() {
+                let (shared, mut tmp) = arm_fast_via(ACTIVE_LOW, true, false, Api::Inherent);
+                expect_retained_scalar(&shared, &mut tmp, T25, 25.0);
+                expect_fresh_acquisition(&shared, &mut tmp, ACTIVE_LOW, Api::Inherent);
+            }
+
+            /// As above with cancellation on the inherent side.
+            #[test]
+            fn a_cancelled_inherent_attempt_is_settled_by_the_trait_and_consumed() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: true,
+                    fl: true,
+                    strict_pin: true,
+                    steps: vec![cfg(INTERRUPT, ACTIVE_HIGH).effect(ack_release_low), temp(T80).pending()],
+                    ..Default::default()
+                });
+
+                {
+                    let mut fut = pin!(tmp.wait_for_alert());
+                    assert!(poll_once(fut.as_mut()).is_pending());
+                }
+                assert_eq!(
+                    take_log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![cfg_byte0(true, false), ACTIVE_HIGH]),
+                        Op::WriteRead(vec![0x00], T80.to_vec()),
+                    ],
+                );
+
+                expect_retained_scalar(&shared, &mut tmp, T25, 25.0);
+                expect_fresh_acquisition(&shared, &mut tmp, ACTIVE_HIGH, Api::Inherent);
+            }
+
+            /// Alternating failures and cancellations across both entry
+            /// points before settlement. The obligation is one shared
+            /// slot, so none of these attempts may duplicate, refresh or
+            /// discard it, and exactly one of them settles it.
+            #[test]
+            fn alternating_cross_api_attempts_preserve_one_obligation_until_settlement() {
+                let (shared, mut tmp) = arm_fast_via(ACTIVE_LOW, true, true, Api::Trait);
+
+                expect_retained_failure(&shared, &mut tmp, Api::Inherent);
+                expect_retained_cancellation(&shared, &mut tmp, Api::Trait);
+                expect_retained_failure(&shared, &mut tmp, Api::Trait);
+                expect_retained_cancellation(&shared, &mut tmp, Api::Inherent);
+
+                // Still `Both` — neither API degraded it to `Unknown`, and
+                // no direction was refreshed from the (now clear) chip.
+                expect_retained_event(&shared, &mut tmp, T25, AlertCause::Both, 400);
+                expect_fresh_acquisition(&shared, &mut tmp, ACTIVE_LOW, Api::Trait);
+            }
+
+            /// An `Unknown`-origin obligation crosses the same handoff.
+            /// Direction is unavailable, but the *debt* is not: the retry
+            /// must still be T-only and must still report `Unknown`.
+            #[test]
+            fn an_unknown_origin_obligation_hands_over_to_the_inherent_method() {
+                let (shared, mut tmp) = arm_slow_unknown_via(ACTIVE_LOW, Api::Trait, false);
+                expect_retained_event(&shared, &mut tmp, T25, AlertCause::Unknown, 400);
+                expect_fresh_acquisition(&shared, &mut tmp, ACTIVE_LOW, Api::Inherent);
+            }
+
+            /// And the other way round: an `Unknown` acquired by the
+            /// inherent method is settled by the trait's scalar result.
+            #[test]
+            fn an_unknown_origin_obligation_is_settled_by_the_trait() {
+                let (shared, mut tmp) = arm_slow_unknown_via(ACTIVE_HIGH, Api::Inherent, false);
+                expect_retained_scalar(&shared, &mut tmp, T25, 25.0);
+                expect_fresh_acquisition(&shared, &mut tmp, ACTIVE_HIGH, Api::Trait);
+            }
+
+            // ---------------------------------------------------------------
+            // Family B — `Some(Unknown)` is not `None` (8.3 B).
+            //
+            // The single most dangerous slip in this change is collapsing
+            // "pending, direction unknown" into "empty". Both states have
+            // the same *cause* information and completely different
+            // *protocol* consequences: T alone versus C0 + level wait.
+            // ---------------------------------------------------------------
+
+            fn unknown_retention_case(byte1: u8, cancel: bool) {
+                let (shared, mut tmp) = arm_slow_unknown_via(byte1, Api::Inherent, cancel);
+
+                // If `Some(Unknown)` had collapsed to `None`, this call
+                // would issue a C0 and then park on a level wait against a
+                // released pin — the fixture's `strict_pin` turns that into
+                // a named panic rather than a hang.
+                expect_retained_event(&shared, &mut tmp, T25, AlertCause::Unknown, 400);
+                expect_fresh_acquisition(&shared, &mut tmp, byte1, Api::Inherent);
+            }
+
+            #[test]
+            fn a_zero_flag_c1_obligation_survives_a_failed_t_active_low() {
+                unknown_retention_case(ACTIVE_LOW, false);
+            }
+
+            #[test]
+            fn a_zero_flag_c1_obligation_survives_a_failed_t_active_high() {
+                unknown_retention_case(ACTIVE_HIGH, false);
+            }
+
+            #[test]
+            fn a_zero_flag_c1_obligation_survives_a_cancelled_t_active_low() {
+                unknown_retention_case(ACTIVE_LOW, true);
+            }
+
+            #[test]
+            fn a_zero_flag_c1_obligation_survives_a_cancelled_t_active_high() {
+                unknown_retention_case(ACTIVE_HIGH, true);
+            }
+
+            /// The same `Some(Unknown)` debt, settled through the trait.
+            #[test]
+            fn a_zero_flag_c1_obligation_settles_through_the_trait_with_t_only() {
+                let (shared, mut tmp) = arm_slow_unknown_via(ACTIVE_LOW, Api::Inherent, true);
+                expect_retained_scalar(&shared, &mut tmp, T25, 25.0);
+                expect_fresh_acquisition(&shared, &mut tmp, ACTIVE_LOW, Api::Trait);
+            }
+
+            // ---------------------------------------------------------------
+            // Family C — event A's cause survives an opposite-direction B
+            // (8.3 C, design section 3.7).
+            // ---------------------------------------------------------------
+
+            /// A is acknowledged with FH and its T fails. B then latches FL
+            /// in the chip. A's retry must report `AboveHigh` — with a
+            /// sample that deliberately contradicts it — must leave B's
+            /// flag standing, and only the following *fresh* acquisition
+            /// may collect B.
+            fn opposite_latch_case(a_low: bool, a_high: bool, want_a: AlertCause, want_b: AlertCause) {
+                let (shared, mut tmp) = arm_fast_via(ACTIVE_LOW, a_low, a_high, Api::Inherent);
+
+                // B latches in the opposite direction and re-asserts ALERT.
+                {
+                    let mut w = shared.lock().unwrap();
+                    w.fl = a_high;
+                    w.fh = a_low;
+                    w.set_level(false);
+                }
+
+                // T80 is above any plausible high limit, T25 inside the
+                // band: whichever A's direction is, the sample argues for
+                // the other one or for neither. It must change nothing.
+                let contradicting = if want_a == AlertCause::AboveHigh { T25 } else { T80 };
+                let sixteenths = if want_a == AlertCause::AboveHigh { 400 } else { 1280 };
+                expect_retained_event(&shared, &mut tmp, contradicting, want_a, sixteenths);
+
+                {
+                    let w = shared.lock().unwrap();
+                    assert_eq!(
+                        (w.fl, w.fh),
+                        (a_high, a_low),
+                        "a retained delivery performs no configuration read, so B's flag must still \
+                         be latched in the chip"
+                    );
+                }
+
+                // Only now may B be collected — by a fresh C0, on the fast
+                // path, because B's flag is set and the pin is asserted.
+                push_steps(
+                    &shared,
+                    vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high), temp(T25)],
+                );
+                take_log(&shared);
+                let ev = event({
+                    let mut fut = pin!(tmp.wait_for_alert());
+                    poll_once(fut.as_mut())
+                });
+                assert_eq!(ev.cause, want_b, "the following fresh acquisition collects B, not A");
+                assert_eq!(
+                    take_log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![cfg_byte0(a_high, a_low), ACTIVE_LOW]),
+                        Op::WriteRead(vec![0x00], T25.to_vec()),
+                    ],
+                    "B is collected by C0 and T — the fast path, with no GPIO"
+                );
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            #[test]
+            fn a_retained_above_high_is_not_rewritten_by_a_newer_low_side_latch() {
+                opposite_latch_case(false, true, AlertCause::AboveHigh, AlertCause::BelowLow);
+            }
+
+            #[test]
+            fn a_retained_below_low_is_not_rewritten_by_a_newer_high_side_latch() {
+                opposite_latch_case(true, false, AlertCause::BelowLow, AlertCause::AboveHigh);
+            }
+
+            /// The same separation across an API handoff: A is acquired by
+            /// the trait, B latches, and the inherent retry must still
+            /// report A's `AboveHigh`.
+            #[test]
+            fn a_mixed_method_retry_reports_a_across_a_newer_opposite_latch() {
+                let (shared, mut tmp) = arm_fast_via(ACTIVE_HIGH, false, true, Api::Trait);
+
+                {
+                    let mut w = shared.lock().unwrap();
+                    w.fl = true;
+                    w.set_level(true);
+                }
+
+                expect_retained_event(&shared, &mut tmp, T25, AlertCause::AboveHigh, 400);
+                assert!(shared.lock().unwrap().fl, "B's FL must survive A's T-only delivery");
+
+                push_steps(
+                    &shared,
+                    vec![cfg(INTERRUPT, ACTIVE_HIGH).effect(ack_release_low), temp(T80)],
+                );
+                take_log(&shared);
+                let ev = event({
+                    let mut fut = pin!(tmp.wait_for_alert());
+                    poll_once(fut.as_mut())
+                });
+                assert_eq!(ev.cause, AlertCause::BelowLow);
+                assert_eq!(
+                    take_log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![cfg_byte0(true, false), ACTIVE_HIGH]),
+                        Op::WriteRead(vec![0x00], T80.to_vec()),
+                    ],
+                );
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            // ---------------------------------------------------------------
+            // Family D — settlement happens in the poll that resolves T
+            // (8.3 D, design section 3.4 step 7).
+            //
+            // `Outcome::Pending` parks forever, so it can only prove that
+            // an *unresolved* T keeps the debt. `Outcome::Gated` records
+            // its transaction, parks, and then resolves — which is what
+            // makes the completion poll itself observable.
+            // ---------------------------------------------------------------
+
+            /// Initial (post-C0) delivery through the inherent method.
+            #[test]
+            fn an_initial_delivery_settles_in_the_poll_that_resolves_temperature() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: false,
+                    fh: true,
+                    strict_pin: true,
+                    steps: vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high), temp(T25).gated()],
+                    ..Default::default()
+                });
+
+                let expected = vec![
+                    Op::WriteRead(vec![0x01], vec![cfg_byte0(false, true), ACTIVE_LOW]),
+                    Op::WriteRead(vec![0x00], T25.to_vec()),
+                ];
+
+                {
+                    let mut fut = pin!(tmp.wait_for_alert());
+                    assert!(poll_once(fut.as_mut()).is_pending(), "T has not resolved yet");
+                    assert_eq!(log(&shared), expected, "C0 and T, issued once");
+
+                    release_gate(&shared);
+                    let ev = event(poll_once(fut.as_mut()));
+
+                    assert_eq!(ev.cause, AlertCause::AboveHigh);
+                    assert_eq!(ev.temperature, celsius(400));
+                    assert_eq!(
+                        log(&shared),
+                        expected,
+                        "the completion poll performs no further I/O: no second T, no GPIO, no \
+                         configuration read"
+                    );
+                }
+                assert_eq!(steps_left(&shared), 0);
+                take_log(&shared);
+
+                // The debt was cleared *in that poll*, not merely at some
+                // later point: the next call acquires afresh.
+                expect_fresh_acquisition(&shared, &mut tmp, ACTIVE_LOW, Api::Inherent);
+            }
+
+            /// Retained delivery through the inherent method.
+            #[test]
+            fn a_retained_delivery_settles_in_the_poll_that_resolves_temperature() {
+                let (shared, mut tmp) = arm_fast_via(ACTIVE_LOW, true, false, Api::Inherent);
+                push_steps(&shared, vec![temp(T25).gated()]);
+                take_log(&shared);
+
+                let expected = vec![Op::WriteRead(vec![0x00], T25.to_vec())];
+
+                {
+                    let mut fut = pin!(tmp.wait_for_alert());
+                    assert!(poll_once(fut.as_mut()).is_pending());
+                    assert_eq!(log(&shared), expected, "a retained delivery issues T and nothing else");
+
+                    release_gate(&shared);
+                    let ev = event(poll_once(fut.as_mut()));
+
+                    assert_eq!(
+                        ev.cause,
+                        AlertCause::BelowLow,
+                        "the original cause, not a refreshed one"
+                    );
+                    assert_eq!(ev.temperature, celsius(400));
+                    assert_eq!(log(&shared), expected, "the completion poll adds no I/O");
+                }
+                assert_eq!(steps_left(&shared), 0);
+                take_log(&shared);
+
+                expect_fresh_acquisition(&shared, &mut tmp, ACTIVE_LOW, Api::Inherent);
+            }
+
+            /// Initial delivery through the trait projection.
+            #[test]
+            fn an_initial_scalar_delivery_settles_in_the_poll_that_resolves_temperature() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: true,
+                    fl: true,
+                    strict_pin: true,
+                    steps: vec![cfg(INTERRUPT, ACTIVE_HIGH).effect(ack_release_low), temp(T25).gated()],
+                    ..Default::default()
+                });
+
+                let expected = vec![
+                    Op::WriteRead(vec![0x01], vec![cfg_byte0(true, false), ACTIVE_HIGH]),
+                    Op::WriteRead(vec![0x00], T25.to_vec()),
+                ];
+
+                {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    assert!(poll_once(fut.as_mut()).is_pending());
+                    assert_eq!(log(&shared), expected);
+
+                    release_gate(&shared);
+                    let result = poll_once(fut.as_mut());
+                    assert_approx_eq!(degrees(result), 25.0, 1e-4);
+                    assert_eq!(
+                        log(&shared),
+                        expected,
+                        "the trait adds no await and no I/O after obtaining the event"
+                    );
+                }
+                assert_eq!(steps_left(&shared), 0);
+                take_log(&shared);
+
+                expect_fresh_acquisition(&shared, &mut tmp, ACTIVE_HIGH, Api::Trait);
+            }
+
+            /// Retained delivery through the trait projection.
+            #[test]
+            fn a_retained_scalar_delivery_settles_in_the_poll_that_resolves_temperature() {
+                let (shared, mut tmp) = arm_fast_via(ACTIVE_HIGH, false, true, Api::Trait);
+                push_steps(&shared, vec![temp(T80).gated()]);
+                take_log(&shared);
+
+                let expected = vec![Op::WriteRead(vec![0x00], T80.to_vec())];
+
+                {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    assert!(poll_once(fut.as_mut()).is_pending());
+                    assert_eq!(log(&shared), expected);
+
+                    release_gate(&shared);
+                    let result = poll_once(fut.as_mut());
+                    assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                    assert_eq!(log(&shared), expected);
+                }
+                assert_eq!(steps_left(&shared), 0);
+                take_log(&shared);
+
+                // And the consumed cause is not replayed to the inherent
+                // method afterwards.
+                expect_fresh_acquisition(&shared, &mut tmp, ACTIVE_HIGH, Api::Inherent);
+            }
+
+            // ---------------------------------------------------------------
+            // Family E — fresh comparator cancellation versus an old
+            // interrupt debt (8.3 E).
+            //
+            // Both halves are required, and they fail *different* wrong
+            // implementations.
+            // ---------------------------------------------------------------
+
+            /// A fresh comparator acquisition never arms the slot, even
+            /// though it has a local cause and even though C0 returned
+            /// nonzero flags. Cancelling its T therefore leaves nothing
+            /// behind: the retry must observe the chip and the pin again.
+            ///
+            /// A generic "a cause exists, therefore retain" branch would
+            /// turn this retry into a bare T.
+            #[test]
+            fn a_cancelled_fresh_comparator_delivery_retains_nothing() {
+                let (shared, mut tmp) = build(Setup {
+                    // Already asserted, so the level wait completes at once.
+                    level_high: false,
+                    // Nonzero entry flags: stale evidence of an earlier
+                    // comparison, never a reason to retain.
+                    fl: true,
+                    fh: true,
+                    steps: vec![cfg(COMPARATOR, ACTIVE_LOW), temp(T25).pending()],
+                    ..Default::default()
+                });
+
+                {
+                    let mut fut = pin!(tmp.wait_for_alert());
+                    assert!(poll_once(fut.as_mut()).is_pending());
+                }
+                assert_eq!(
+                    take_log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![COMPARATOR | 0x18, ACTIVE_LOW]),
+                        Op::PinCall(PinOp::WaitLow),
+                        Op::PinDone(PinOp::WaitLow),
+                        Op::WriteRead(vec![0x00], T25.to_vec()),
+                    ],
+                    "fresh comparator: C0, one level wait, T"
+                );
+                assert_eq!(steps_left(&shared), 0);
+
+                // The retry must be a full fresh acquisition again.
+                push_steps(&shared, vec![cfg(COMPARATOR, ACTIVE_LOW), temp(T80)]);
+                let ev = event({
+                    let mut fut = pin!(tmp.wait_for_alert());
+                    poll_once(fut.as_mut())
+                });
+                assert_eq!(ev.cause, AlertCause::Unknown, "fresh comparator is always Unknown");
+                assert_eq!(ev.temperature, celsius(1280));
+                assert_eq!(
+                    take_log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![COMPARATOR | 0x18, ACTIVE_LOW]),
+                        Op::PinCall(PinOp::WaitLow),
+                        Op::PinDone(PinOp::WaitLow),
+                        Op::WriteRead(vec![0x00], T80.to_vec()),
+                    ],
+                    "the retry repeats C0 and the level wait — it is not a retained T"
+                );
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            /// The converse: an interrupt debt outranks a later switch to
+            /// comparator mode, and a *cancelled* retry in that state must
+            /// keep it. An unconditional "we are in comparator mode, so
+            /// clear the slot" would lose the event here.
+            #[test]
+            fn a_cancelled_retained_retry_in_comparator_mode_keeps_the_interrupt_debt() {
+                let (shared, mut tmp) = arm_fast_via(ACTIVE_LOW, false, true, Api::Inherent);
+
+                // Reconfigure the part to comparator mode through the inner
+                // sensor. This is real I/O on the modeled chip, not a
+                // rewritten fixture.
+                push_steps(
+                    &shared,
+                    vec![cfg(INTERRUPT, ACTIVE_LOW), write(vec![0x01, COMPARATOR, ACTIVE_LOW])],
+                );
+                let configured = {
+                    let mut fut = pin!(tmp.sensor_mut().configure(Config {
+                        thermostat_mode: Thermostat::Comparator,
+                        alert_polarity: Polarity::ActiveLow,
+                        ..Default::default()
+                    }));
+                    poll_once(fut.as_mut())
+                };
+                assert!(matches!(configured, Poll::Ready(Ok(()))));
+                assert_eq!(steps_left(&shared), 0);
+                take_log(&shared);
+
+                // Cancelled retry, then a failed one, then settlement —
+                // all T-only, all still `AboveHigh`.
+                expect_retained_cancellation(&shared, &mut tmp, Api::Inherent);
+                expect_retained_failure(&shared, &mut tmp, Api::Trait);
+                expect_retained_event(&shared, &mut tmp, T25, AlertCause::AboveHigh, 400);
+
+                // Once settled, the chip's *current* comparator mode governs.
+                push_steps(&shared, vec![cfg(COMPARATOR, ACTIVE_LOW), temp(T80)]);
+                shared.lock().unwrap().strict_pin = false;
+                shared.lock().unwrap().set_level(false);
+                take_log(&shared);
+                let ev = event({
+                    let mut fut = pin!(tmp.wait_for_alert());
+                    poll_once(fut.as_mut())
+                });
+                assert_eq!(ev.cause, AlertCause::Unknown);
+                assert_eq!(
+                    take_log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![COMPARATOR, ACTIVE_LOW]),
+                        Op::PinCall(PinOp::WaitLow),
+                        Op::PinDone(PinOp::WaitLow),
+                        Op::WriteRead(vec![0x00], T80.to_vec()),
+                    ],
+                );
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            // ---------------------------------------------------------------
+            // Family F — lifecycle abandonment, invariant I-25 (8.4).
+            //
+            // The retained state is armed by real acquisition, never by
+            // assigning the private field. Decomposition must be silent:
+            // no acknowledgment, no cleanup read, no GPIO.
+            // ---------------------------------------------------------------
+
+            /// `into_inner` abandons the obligation without I/O, and
+            /// `into_alert` re-wraps into an **empty** slot.
+            #[test]
+            fn into_inner_abandons_a_retained_event_without_driver_io() {
+                let (shared, tmp) = arm_fast_via(ACTIVE_LOW, false, true, Api::Inherent);
+
+                let (sensor, alert) = tmp.into_inner();
+                assert!(
+                    log(&shared).is_empty(),
+                    "decomposition must perform no I/O, saw {:?}",
+                    log(&shared)
+                );
+                assert_eq!(steps_left(&shared), 0);
+
+                let mut tmp = sensor.into_alert(alert);
+                assert!(
+                    log(&shared).is_empty(),
+                    "construction must perform no I/O, saw {:?}",
+                    log(&shared)
+                );
+
+                // The obligation did not travel with the parts.
+                expect_fresh_acquisition(&shared, &mut tmp, ACTIVE_LOW, Api::Inherent);
+            }
+
+            /// `destroy` recovers the bus and the pin with no I/O, and a
+            /// wrapper rebuilt from them starts empty.
+            #[test]
+            fn destroy_abandons_a_retained_event_without_driver_io() {
+                let (shared, tmp) = arm_slow_unknown_via(ACTIVE_HIGH, Api::Trait, false);
+
+                let (i2c, alert) = tmp.destroy();
+                assert!(
+                    log(&shared).is_empty(),
+                    "destroy must perform no I/O, saw {:?}",
+                    log(&shared)
+                );
+                assert_eq!(steps_left(&shared), 0);
+
+                let mut tmp = AlertTmp108::new_with_a0_gnd(i2c, alert);
+                assert!(log(&shared).is_empty(), "construction must perform no I/O");
+
+                expect_fresh_acquisition(&shared, &mut tmp, ACTIVE_HIGH, Api::Trait);
+            }
+
+            /// Dropping the wrapper is equally silent. The fake world is
+            /// held by an external `Arc`, so it outlives the driver and can
+            /// still be inspected — including for a cleanup acknowledgment
+            /// that must not exist.
+            #[test]
+            fn dropping_the_wrapper_abandons_a_retained_event_without_driver_io() {
+                let (shared, tmp) = arm_fast_via(ACTIVE_HIGH, true, true, Api::Inherent);
+
+                drop(tmp);
+
+                assert!(
+                    log(&shared).is_empty(),
+                    "dropping the wrapper must perform no cleanup acknowledgment, saw {:?}",
+                    log(&shared)
+                );
+                assert_eq!(steps_left(&shared), 0, "and must consume no scripted transaction");
             }
         }
     }
