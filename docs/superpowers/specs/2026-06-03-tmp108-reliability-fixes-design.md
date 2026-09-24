@@ -116,6 +116,17 @@ window is a board-design concern, not a driver invariant.
 
 **Status:** rejected as a "fix"; documented as a contract.
 
+> **SUPERSEDED (2026-09-24).** The premise below — that
+> `embedded_hal_async::digital::Wait` retains pending edges between
+> calls — is **false**. `embedded-hal-async-1.0.0/src/digital.rs`
+> lines 35-45 state that an edge wait does *not* return immediately
+> for an already-active pin. The replacement contract (entry
+> configuration snapshot, conditional level wait, conditional
+> acknowledgment) is specified in
+> `docs/superpowers/specs/2026-09-24-tmp108-issue-59-alert-wait-ordering-design.md`.
+> The text below is retained unaltered as a historical record of the
+> decision that was made at the time.
+
 The reliability review proposed sampling `InputPin::is_low`/`is_high`
 on entry. User clarification: **the `Wait` trait already handles
 pending edges via the MCU's GPIO controller** — that's the contract
