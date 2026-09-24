@@ -578,6 +578,95 @@ pub(crate) mod ops {
         r.set_cr(cfg.conversion_rate);
         r.set_hys(cfg.hysteresis);
     }
+
+    /// Bit mask of the raw two-bit `M` field within byte 0 of the
+    /// configuration register.
+    const M_FIELD_MASK: u8 = 0b11;
+
+    /// Raw `M` encoding for shutdown.
+    const M_RAW_SHUTDOWN: u8 = 0b00;
+
+    /// Raw `M` encoding for a one-shot trigger / conversion in flight.
+    const M_RAW_ONE_SHOT: u8 = 0b01;
+
+    /// Number of completion polls
+    /// [`acquire_one_shot`][crate::Tmp108::acquire_one_shot] performs
+    /// after triggering the conversion.
+    ///
+    /// Eight polls, each preceded by a requested
+    /// [`ONE_SHOT_POLL_INTERVAL_MS`] delay, gives the part room to
+    /// clear `M` past its ~30 ms typical conversion time — a figure
+    /// the datasheet specifies at +25 °C and V+ = 1.8 V (SBOS663A
+    /// §6.5 gives 21 / 27 / 33 ms min/typ/max under those
+    /// conditions) and does not guarantee outside them.
+    ///
+    /// Eight requested 5 ms delays are **not** a 40 ms wall-clock
+    /// deadline. I²C transaction time, scheduler latency and the fact
+    /// that [`DelayNs`][embedded_hal::delay::DelayNs] implementations
+    /// may overshoot all add to the elapsed time. The budget is
+    /// expressed in polls, not in milliseconds.
+    pub(crate) const ONE_SHOT_POLLS: u8 = 8;
+
+    /// Delay requested *before* each completion poll, in milliseconds.
+    ///
+    /// The delay leads the read, so no sample of `M` is taken until at
+    /// least one interval has been requested after the trigger.
+    /// Reading immediately after the trigger would sample the register
+    /// before the chip has had any chance to act on it.
+    pub(crate) const ONE_SHOT_POLL_INTERVAL_MS: u32 = 5;
+
+    /// Extract the raw two-bit `M` field from a configuration snapshot.
+    ///
+    /// Deliberately raw rather than `c.m()`: [`crate::Mode`] has no
+    /// inhabitant for `0b11`, so decoding first would erase the
+    /// difference between `0b10` and `0b11` before any decision is
+    /// made about it.
+    pub(crate) fn raw_mode(c: Configuration) -> u8 {
+        let raw: [u8; 2] = c.into();
+        raw[0] & M_FIELD_MASK
+    }
+
+    /// What one completion poll of the `M` field means.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum PollOutcome {
+        /// `M == 0b00`: the chip cleared the trigger by itself, so the
+        /// conversion has landed and the temperature register is fresh.
+        Complete,
+        /// `M == 0b01`: the trigger is still standing; keep polling.
+        Converting,
+        /// `M == 0b10` or `0b11`: the part is in a continuous mode,
+        /// which a one-shot sequence never asks for. Something else
+        /// wrote the configuration register. Carries the decoded mode,
+        /// which cannot distinguish the two raw encodings.
+        Unexpected(crate::Mode),
+    }
+
+    /// Classify one completion poll taken after a one-shot trigger.
+    pub(crate) fn classify_poll(c: Configuration) -> PollOutcome {
+        match raw_mode(c) {
+            M_RAW_SHUTDOWN => PollOutcome::Complete,
+            M_RAW_ONE_SHOT => PollOutcome::Converting,
+            other => PollOutcome::Unexpected(crate::Mode::from(other)),
+        }
+    }
+
+    /// Check the post-settle re-read that must precede a one-shot
+    /// trigger.
+    ///
+    /// `Ok(())` iff the part reports `M == 0b00`. Otherwise the
+    /// decoded mode that was found instead, for the caller to report.
+    ///
+    /// # Errors
+    ///
+    /// The decoded [`crate::Mode`] when `M` is anything but `0b00`.
+    pub(crate) fn check_prepared(c: Configuration) -> Result<(), crate::Mode> {
+        let raw = raw_mode(c);
+        if raw == M_RAW_SHUTDOWN {
+            Ok(())
+        } else {
+            Err(crate::Mode::from(raw))
+        }
+    }
 }
 
 /// Tmp108 device driver.
@@ -1717,9 +1806,18 @@ impl<I2C: I2c> Tmp108<I2C> {
     ///
     /// The consequence for callers hand-rolling a one-shot: do **not**
     /// call `configure` between triggering the conversion and reading
-    /// its result. `configure` clears the in-flight trigger, so the
-    /// conversion you are waiting on will never be reported as
-    /// complete. Configure first, then trigger.
+    /// its result. Configure first, then trigger.
+    ///
+    /// The hazard is not a conversion that never completes — it is a
+    /// completion that appears to have already happened. A hand-rolled
+    /// poll detects completion by testing for `M == 0b00`, which is
+    /// exactly what `configure` writes. Software cannot distinguish
+    /// its own clearing of the command field from the chip's
+    /// completion transition, so the next poll reports "done"
+    /// immediately and the temperature register is read while the
+    /// conversion is in fact still running — deferred shutdown
+    /// (SBOS663A §7.4.1) finishes it afterwards. The value returned is
+    /// stale.
     ///
     /// # Errors
     ///
@@ -1773,7 +1871,38 @@ impl<I2C: I2c> Tmp108<I2C> {
         Ok(Celsius::from_register(raw.into()))
     }
 
-    /// Configure device for one-shot conversion
+    /// Trigger a one-shot conversion.
+    ///
+    /// Writes `M = 0b01` and returns as soon as that write is
+    /// acknowledged. That is *all* it does: it is a bare trigger, not
+    /// an acquisition.
+    ///
+    /// # This is not a complete one-shot
+    ///
+    /// A correct single-sample acquisition has two requirements this
+    /// method neither checks nor satisfies:
+    ///
+    /// - **The part must already be in shutdown.** Triggering from
+    ///   [`Mode::Continuous`] is meaningless — the part is already
+    ///   converting on its own cadence — and the datasheet defers
+    ///   shutdown until the conversion in progress finishes
+    ///   (SBOS663A 7.4.1), so entering shutdown needs a settling
+    ///   delay before the trigger.
+    /// - **Completion must be observed before the temperature
+    ///   register is read.** The chip clears `M` back to `0b00` when
+    ///   the conversion lands; until then the temperature register
+    ///   still holds the *previous* result. Reading it after a fixed
+    ///   delay, without polling `M`, silently returns stale data
+    ///   whenever the delay was short.
+    ///
+    /// Use [`acquire_one_shot`][Self::acquire_one_shot] to get the
+    /// whole sequence — prepare, settle, trigger, poll, read — done
+    /// for you. Reach for this method only when you are driving the
+    /// sequence yourself.
+    ///
+    /// Note also that [`configure`][Self::configure] stands down an
+    /// in-flight trigger, so it must not be called between this
+    /// method and the completion poll.
     ///
     /// # Errors
     ///
@@ -1784,8 +1913,10 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// ```
     /// # use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
     /// use tmp108::Tmp108;
+    /// // A one-shot is triggered from shutdown, so the chip reports
+    /// // M = 0b00 (0x1020) going in and is left at M = 0b01 (0x1021).
     /// let i2c = Mock::new(&[
-    ///     Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
+    ///     Transaction::write_read(0x48, vec![0x01], vec![0x20, 0x10]),
     ///     Transaction::write(0x48, vec![0x01, 0x21, 0x10]),
     /// ]);
     /// let mut tmp = Tmp108::new_with_a0_gnd(i2c);
@@ -1795,6 +1926,170 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// ```
     pub fn one_shot(&mut self) -> Result<(), I2C::Error> {
         self.inner.configuration().modify(|r| r.set_m(Mode::OneShot))
+    }
+
+    /// Acquire exactly one temperature sample by supervising a
+    /// complete one-shot conversion.
+    ///
+    /// Writes shutdown, waits `shutdown_settle_ms`, verifies that the
+    /// configuration register reads back [`Mode::Shutdown`], triggers
+    /// the conversion, polls `M` until the chip clears the trigger,
+    /// and only then reads the temperature register.
+    ///
+    /// The readback is a *shutdown-mode readback*, not proof that the
+    /// part has arrived at quiescence: per SBOS663A §7.4.1 the device
+    /// *"shuts down when current conversion is completed"*, so the
+    /// register can report shutdown while a conversion is still
+    /// finishing. Triggering is specified to apply when the device is
+    /// in shutdown mode (§7.4.2).
+    ///
+    /// Given a settling delay long enough for your board, supply and
+    /// temperature range, and given that this driver has exclusive
+    /// access to the part, the reading is fresh — the temperature
+    /// register is read only after the chip itself cleared the
+    /// trigger. Neither condition is enforced by the driver, and
+    /// neither is an unconditional guarantee; with a too-short delay
+    /// or a concurrent writer the result can still be stale. That is
+    /// nonetheless a stronger footing than a fixed-delay
+    /// [`one_shot`][Self::one_shot] plus
+    /// [`temperature`][Self::temperature], which never observes
+    /// completion at all.
+    ///
+    /// # This operation is interrupt-destructive
+    ///
+    /// The sequence performs roughly ten configuration-register
+    /// reads. In [`Thermostat::Interrupt`] mode **every configuration
+    /// read acknowledges FL/FH and releases the ALERT pin** (TMP108
+    /// datasheet SBOS663A 7.5.3.4). Any latched interrupt evidence
+    /// that had not yet been collected is consumed and lost, and the
+    /// loss is not reported anywhere in the return value.
+    ///
+    /// This is a sample-only helper. If you are relying on latched
+    /// interrupt evidence, collect it first — or do not use this
+    /// method.
+    ///
+    /// # `shutdown_settle_ms` is yours to choose
+    ///
+    /// The driver cannot pick this for you, and deliberately does not
+    /// try. Per datasheet SBOS663A 7.4.1 the device *"shuts down when
+    /// current conversion is completed"* — shutdown is **deferred**.
+    /// So a successful `M = 0b00` write is not proof of quiescence,
+    /// and the re-read that follows only reads back what software
+    /// wrote. The delay is the only thing standing between the write
+    /// and a trigger issued while the part is still busy.
+    ///
+    /// A reasonable **starting point** is `40`, comfortably past the
+    /// part's ~30 ms typical conversion time. Attach the datasheet's
+    /// conditions to that number: SBOS663A §6.5 gives 21 / 27 / 33 ms
+    /// min/typ/max, specified at +25 °C and V+ = 1.8 V, and not
+    /// guaranteed outside them. Validate the value against your own
+    /// board, supply and temperature range. It is a starting point,
+    /// not a bound — the driver enforces nothing about it.
+    ///
+    /// # Shutdown is observed only on success
+    ///
+    /// On successful completion the chip has been observed in
+    /// [`Mode::Shutdown`]: the poll that reported completion is what
+    /// the success path is predicated on.
+    ///
+    /// On **any** error path, no such claim is made. There is no mode
+    /// restoration and no error-path cleanup write: the driver does
+    /// not record the mode it found, makes no attempt to put the chip
+    /// back that way, and does not issue a shutdown write on the way
+    /// out. [`OneShotError::UnexpectedMode`] returns as soon as a
+    /// continuous mode is observed, [`OneShotError::Timeout`] returns
+    /// with the trigger still standing, and an
+    /// [`OneShotError::Bus`] failure can occur after the trigger write
+    /// has already succeeded. In all of those the part may still be
+    /// converting, may be in [`Mode::Continuous`], or may be in a
+    /// state the driver cannot characterise at all.
+    ///
+    /// The same uncertainty applies if the sequence simply stops
+    /// running: should the caller drop the future mid-sequence — or,
+    /// for the blocking shell, unwind through it — no cleanup runs,
+    /// and the chip is left wherever the last completed write put it.
+    ///
+    /// If you were running in [`Mode::Continuous`], you must
+    /// re-establish it yourself afterwards, on the success path and
+    /// on the error paths alike.
+    ///
+    /// # Errors
+    ///
+    /// - [`OneShotError::Bus`] — an I²C transaction failed. Can occur
+    ///   at any step.
+    /// - [`OneShotError::PreparationNotShutdown`] — the re-read after
+    ///   the settling delay did not report shutdown. The conversion is
+    ///   not triggered, the temperature register is not read, and the
+    ///   sequence does not retry.
+    /// - [`OneShotError::UnexpectedMode`] — a completion poll found
+    ///   the part in a continuous mode. The temperature register is
+    ///   not read.
+    /// - [`OneShotError::Timeout`] — all eight completion polls, each
+    ///   preceded by a requested 5 ms delay, still found the trigger
+    ///   standing. The temperature register is not read. The eight
+    ///   requested delays are a poll budget, not a 40 ms wall-clock
+    ///   deadline: bus time, scheduler latency and delay overshoot all
+    ///   add to the elapsed time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use embedded_hal_mock::eh1::delay::NoopDelay;
+    /// # use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
+    /// use tmp108::Tmp108;
+    /// let i2c = Mock::new(&[
+    ///     // Found in continuous mode; driven into shutdown.
+    ///     Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
+    ///     Transaction::write(0x48, vec![0x01, 0x20, 0x10]),
+    ///     // After the settling delay, confirm M == 0b00.
+    ///     Transaction::write_read(0x48, vec![0x01], vec![0x20, 0x10]),
+    ///     // Trigger the conversion.
+    ///     Transaction::write_read(0x48, vec![0x01], vec![0x20, 0x10]),
+    ///     Transaction::write(0x48, vec![0x01, 0x21, 0x10]),
+    ///     // Poll: still converting, then done.
+    ///     Transaction::write_read(0x48, vec![0x01], vec![0x21, 0x10]),
+    ///     Transaction::write_read(0x48, vec![0x01], vec![0x20, 0x10]),
+    ///     // Only now is the temperature register read.
+    ///     Transaction::write_read(0x48, vec![0x00], vec![0x32, 0x00]),
+    /// ]);
+    /// let mut tmp = Tmp108::new_with_a0_gnd(i2c);
+    /// let mut delay = NoopDelay::new();
+    /// let temp = tmp.acquire_one_shot(&mut delay, 40).unwrap();
+    /// assert_eq!(temp.to_degrees(), 50.0);
+    /// # let mut i2c = tmp.destroy();
+    /// # i2c.done();
+    /// ```
+    pub fn acquire_one_shot<DELAY: DelayNs>(
+        &mut self,
+        delay: &mut DELAY,
+        shutdown_settle_ms: u32,
+    ) -> Result<Celsius, OneShotError<I2C::Error>> {
+        self.inner
+            .configuration()
+            .modify(|r| r.set_m(Mode::Shutdown))
+            .map_err(OneShotError::Bus)?;
+
+        delay.delay_ms(shutdown_settle_ms);
+
+        let prepared = self.inner.configuration().read().map_err(OneShotError::Bus)?;
+        ops::check_prepared(prepared).map_err(OneShotError::PreparationNotShutdown)?;
+
+        self.inner
+            .configuration()
+            .modify(|r| r.set_m(Mode::OneShot))
+            .map_err(OneShotError::Bus)?;
+
+        for _ in 0..ops::ONE_SHOT_POLLS {
+            delay.delay_ms(ops::ONE_SHOT_POLL_INTERVAL_MS);
+            let sample = self.inner.configuration().read().map_err(OneShotError::Bus)?;
+            match ops::classify_poll(sample) {
+                ops::PollOutcome::Complete => return self.temperature().map_err(OneShotError::Bus),
+                ops::PollOutcome::Converting => {}
+                ops::PollOutcome::Unexpected(mode) => return Err(OneShotError::UnexpectedMode(mode)),
+            }
+        }
+
+        Err(OneShotError::Timeout)
     }
 
     /// Place device in shutdown mode
@@ -2055,9 +2350,18 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     ///
     /// The consequence for callers hand-rolling a one-shot: do **not**
     /// call `configure` between triggering the conversion and reading
-    /// its result. `configure` clears the in-flight trigger, so the
-    /// conversion you are waiting on will never be reported as
-    /// complete. Configure first, then trigger.
+    /// its result. Configure first, then trigger.
+    ///
+    /// The hazard is not a conversion that never completes — it is a
+    /// completion that appears to have already happened. A hand-rolled
+    /// poll detects completion by testing for `M == 0b00`, which is
+    /// exactly what `configure` writes. Software cannot distinguish
+    /// its own clearing of the command field from the chip's
+    /// completion transition, so the next poll reports "done"
+    /// immediately and the temperature register is read while the
+    /// conversion is in fact still running — deferred shutdown
+    /// (SBOS663A §7.4.1) finishes it afterwards. The value returned is
+    /// stale.
     ///
     /// # Errors
     ///
@@ -2118,7 +2422,38 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
         Ok(Celsius::from_register(raw.into()))
     }
 
-    /// Configure device for one-shot conversion
+    /// Trigger a one-shot conversion.
+    ///
+    /// Writes `M = 0b01` and returns as soon as that write is
+    /// acknowledged. That is *all* it does: it is a bare trigger, not
+    /// an acquisition.
+    ///
+    /// # This is not a complete one-shot
+    ///
+    /// A correct single-sample acquisition has two requirements this
+    /// method neither checks nor satisfies:
+    ///
+    /// - **The part must already be in shutdown.** Triggering from
+    ///   [`Mode::Continuous`] is meaningless — the part is already
+    ///   converting on its own cadence — and the datasheet defers
+    ///   shutdown until the conversion in progress finishes
+    ///   (SBOS663A 7.4.1), so entering shutdown needs a settling
+    ///   delay before the trigger.
+    /// - **Completion must be observed before the temperature
+    ///   register is read.** The chip clears `M` back to `0b00` when
+    ///   the conversion lands; until then the temperature register
+    ///   still holds the *previous* result. Reading it after a fixed
+    ///   delay, without polling `M`, silently returns stale data
+    ///   whenever the delay was short.
+    ///
+    /// Use [`acquire_one_shot`][Self::acquire_one_shot] to get the
+    /// whole sequence — prepare, settle, trigger, poll, read — done
+    /// for you. Reach for this method only when you are driving the
+    /// sequence yourself.
+    ///
+    /// Note also that [`configure`][Self::configure] stands down an
+    /// in-flight trigger, so it must not be called between this
+    /// method and the completion poll.
     ///
     /// # Errors
     ///
@@ -2130,8 +2465,10 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// # use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
     /// use tmp108::AsyncTmp108;
+    /// // A one-shot is triggered from shutdown, so the chip reports
+    /// // M = 0b00 (0x1020) going in and is left at M = 0b01 (0x1021).
     /// let i2c = Mock::new(&[
-    ///     Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
+    ///     Transaction::write_read(0x48, vec![0x01], vec![0x20, 0x10]),
     ///     Transaction::write(0x48, vec![0x01, 0x21, 0x10]),
     /// ]);
     /// let mut tmp = AsyncTmp108::new_with_a0_gnd(i2c);
@@ -2145,6 +2482,186 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
             .configuration()
             .modify_async(|r| r.set_m(Mode::OneShot))
             .await
+    }
+
+    /// Acquire exactly one temperature sample by supervising a
+    /// complete one-shot conversion.
+    ///
+    /// Writes shutdown, waits `shutdown_settle_ms`, verifies that the
+    /// configuration register reads back [`Mode::Shutdown`], triggers
+    /// the conversion, polls `M` until the chip clears the trigger,
+    /// and only then reads the temperature register.
+    ///
+    /// The readback is a *shutdown-mode readback*, not proof that the
+    /// part has arrived at quiescence: per SBOS663A §7.4.1 the device
+    /// *"shuts down when current conversion is completed"*, so the
+    /// register can report shutdown while a conversion is still
+    /// finishing. Triggering is specified to apply when the device is
+    /// in shutdown mode (§7.4.2).
+    ///
+    /// Given a settling delay long enough for your board, supply and
+    /// temperature range, and given that this driver has exclusive
+    /// access to the part, the reading is fresh — the temperature
+    /// register is read only after the chip itself cleared the
+    /// trigger. Neither condition is enforced by the driver, and
+    /// neither is an unconditional guarantee; with a too-short delay
+    /// or a concurrent writer the result can still be stale. That is
+    /// nonetheless a stronger footing than a fixed-delay
+    /// [`one_shot`][Self::one_shot] plus
+    /// [`temperature`][Self::temperature], which never observes
+    /// completion at all.
+    ///
+    /// # This operation is interrupt-destructive
+    ///
+    /// The sequence performs roughly ten configuration-register
+    /// reads. In [`Thermostat::Interrupt`] mode **every configuration
+    /// read acknowledges FL/FH and releases the ALERT pin** (TMP108
+    /// datasheet SBOS663A 7.5.3.4). Any latched interrupt evidence
+    /// that had not yet been collected is consumed and lost, and the
+    /// loss is not reported anywhere in the return value.
+    ///
+    /// This is a sample-only helper. If you are relying on latched
+    /// interrupt evidence, collect it first — or do not use this
+    /// method.
+    ///
+    /// # `shutdown_settle_ms` is yours to choose
+    ///
+    /// The driver cannot pick this for you, and deliberately does not
+    /// try. Per datasheet SBOS663A 7.4.1 the device *"shuts down when
+    /// current conversion is completed"* — shutdown is **deferred**.
+    /// So a successful `M = 0b00` write is not proof of quiescence,
+    /// and the re-read that follows only reads back what software
+    /// wrote. The delay is the only thing standing between the write
+    /// and a trigger issued while the part is still busy.
+    ///
+    /// A reasonable **starting point** is `40`, comfortably past the
+    /// part's ~30 ms typical conversion time. Attach the datasheet's
+    /// conditions to that number: SBOS663A §6.5 gives 21 / 27 / 33 ms
+    /// min/typ/max, specified at +25 °C and V+ = 1.8 V, and not
+    /// guaranteed outside them. Validate the value against your own
+    /// board, supply and temperature range. It is a starting point,
+    /// not a bound — the driver enforces nothing about it.
+    ///
+    /// # Shutdown is observed only on success
+    ///
+    /// On successful completion the chip has been observed in
+    /// [`Mode::Shutdown`]: the poll that reported completion is what
+    /// the success path is predicated on.
+    ///
+    /// On **any** error path, no such claim is made. There is no mode
+    /// restoration and no error-path cleanup write: the driver does
+    /// not record the mode it found, makes no attempt to put the chip
+    /// back that way, and does not issue a shutdown write on the way
+    /// out. [`OneShotError::UnexpectedMode`] returns as soon as a
+    /// continuous mode is observed, [`OneShotError::Timeout`] returns
+    /// with the trigger still standing, and an
+    /// [`OneShotError::Bus`] failure can occur after the trigger write
+    /// has already succeeded. In all of those the part may still be
+    /// converting, may be in [`Mode::Continuous`], or may be in a
+    /// state the driver cannot characterise at all.
+    ///
+    /// **This future is not cancellation-safe in the chip's terms.**
+    /// Dropping it mid-sequence — a `select!` branch losing, a timeout
+    /// firing, a task being aborted — runs no cleanup, so the same
+    /// uncertainty applies: the chip is left wherever the last
+    /// completed write put it, quite possibly with a one-shot
+    /// conversion in flight.
+    ///
+    /// If you were running in [`Mode::Continuous`], you must
+    /// re-establish it yourself afterwards, on the success path and
+    /// on the error and cancellation paths alike.
+    ///
+    /// # Errors
+    ///
+    /// - [`OneShotError::Bus`] — an I²C transaction failed. Can occur
+    ///   at any step.
+    /// - [`OneShotError::PreparationNotShutdown`] — the re-read after
+    ///   the settling delay did not report shutdown. The conversion is
+    ///   not triggered, the temperature register is not read, and the
+    ///   sequence does not retry.
+    /// - [`OneShotError::UnexpectedMode`] — a completion poll found
+    ///   the part in a continuous mode. The temperature register is
+    ///   not read.
+    /// - [`OneShotError::Timeout`] — all eight completion polls, each
+    ///   preceded by a requested 5 ms delay, still found the trigger
+    ///   standing. The temperature register is not read. The eight
+    ///   requested delays are a poll budget, not a 40 ms wall-clock
+    ///   deadline: bus time, scheduler latency and delay overshoot all
+    ///   add to the elapsed time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// # use embedded_hal_mock::eh1::delay::NoopDelay;
+    /// # use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
+    /// use tmp108::AsyncTmp108;
+    /// let i2c = Mock::new(&[
+    ///     // Found in continuous mode; driven into shutdown.
+    ///     Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
+    ///     Transaction::write(0x48, vec![0x01, 0x20, 0x10]),
+    ///     // After the settling delay, confirm M == 0b00.
+    ///     Transaction::write_read(0x48, vec![0x01], vec![0x20, 0x10]),
+    ///     // Trigger the conversion.
+    ///     Transaction::write_read(0x48, vec![0x01], vec![0x20, 0x10]),
+    ///     Transaction::write(0x48, vec![0x01, 0x21, 0x10]),
+    ///     // Poll: still converting, then done.
+    ///     Transaction::write_read(0x48, vec![0x01], vec![0x21, 0x10]),
+    ///     Transaction::write_read(0x48, vec![0x01], vec![0x20, 0x10]),
+    ///     // Only now is the temperature register read.
+    ///     Transaction::write_read(0x48, vec![0x00], vec![0x32, 0x00]),
+    /// ]);
+    /// let mut tmp = AsyncTmp108::new_with_a0_gnd(i2c);
+    /// let mut delay = NoopDelay::new();
+    /// let temp = tmp.acquire_one_shot(&mut delay, 40).await.unwrap();
+    /// assert_eq!(temp.to_degrees(), 50.0);
+    /// # let mut i2c = tmp.destroy();
+    /// # i2c.done();
+    /// # });
+    /// ```
+    pub async fn acquire_one_shot<DELAY: AsyncDelayNs>(
+        &mut self,
+        delay: &mut DELAY,
+        shutdown_settle_ms: u32,
+    ) -> Result<Celsius, OneShotError<I2C::Error>> {
+        self.inner
+            .configuration()
+            .modify_async(|r| r.set_m(Mode::Shutdown))
+            .await
+            .map_err(OneShotError::Bus)?;
+
+        delay.delay_ms(shutdown_settle_ms).await;
+
+        let prepared = self
+            .inner
+            .configuration()
+            .read_async()
+            .await
+            .map_err(OneShotError::Bus)?;
+        ops::check_prepared(prepared).map_err(OneShotError::PreparationNotShutdown)?;
+
+        self.inner
+            .configuration()
+            .modify_async(|r| r.set_m(Mode::OneShot))
+            .await
+            .map_err(OneShotError::Bus)?;
+
+        for _ in 0..ops::ONE_SHOT_POLLS {
+            delay.delay_ms(ops::ONE_SHOT_POLL_INTERVAL_MS).await;
+            let sample = self
+                .inner
+                .configuration()
+                .read_async()
+                .await
+                .map_err(OneShotError::Bus)?;
+            match ops::classify_poll(sample) {
+                ops::PollOutcome::Complete => return self.temperature().await.map_err(OneShotError::Bus),
+                ops::PollOutcome::Converting => {}
+                ops::PollOutcome::Unexpected(mode) => return Err(OneShotError::UnexpectedMode(mode)),
+            }
+        }
+
+        Err(OneShotError::Timeout)
     }
 
     /// Place device in shutdown mode
@@ -2566,6 +3083,58 @@ impl<E: embedded_hal::i2c::Error + PartialEq, P: embedded_hal::digital::Error + 
 }
 
 impl<E: embedded_hal::i2c::Error + Eq, P: embedded_hal::digital::Error + Eq> Eq for Error<E, P> {}
+
+/// Why a supervised one-shot acquisition did not produce a reading.
+///
+/// Returned by [`Tmp108::acquire_one_shot`] and
+/// [`AsyncTmp108::acquire_one_shot`]. Distinct from [`Error`] because
+/// the failure modes are entirely different: nothing here is an
+/// invalid *input*, and there is no ALERT pin in the sequence, so
+/// neither of `Error`'s non-bus variants can occur and `Error`'s `P`
+/// parameter would be dead weight.
+///
+/// Like [`Error`], this type derives [`Debug`] and carries no
+/// [`core::fmt::Display`] or [`core::error::Error`] implementation:
+/// the crate is `#![no_std]` and leaves rendering of driver errors to
+/// the application.
+///
+/// `E` is the underlying I²C error type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OneShotError<E> {
+    /// An I²C transaction failed. Can arise at any step of the
+    /// sequence.
+    Bus(E),
+    /// The configuration re-read after the settling delay did not
+    /// report [`Mode::Shutdown`]. No one-shot trigger was issued and
+    /// the temperature register was not read; the sequence does not
+    /// retry.
+    ///
+    /// Check `shutdown_settle_ms` first: shutdown is deferred until
+    /// the current conversion completes (SBOS663A §7.4.1), so a delay
+    /// that is too short for your board will reach the re-read before
+    /// the part has left its previous mode. Concurrent configuration
+    /// writes through another device handle or bus master are another
+    /// possible cause. Note also that the converse does not hold — a
+    /// shutdown-mode readback alone does not prove that the current
+    /// conversion has finished.
+    ///
+    /// Reports the decoded operating mode, not the raw two-bit M
+    /// field: both `0b10` and `0b11` are reported as
+    /// [`Mode::Continuous`].
+    PreparationNotShutdown(Mode),
+    /// A completion poll found the part in a continuous mode, which a
+    /// one-shot sequence never asks for. Something else wrote the
+    /// configuration register while the conversion was in flight.
+    ///
+    /// Reports the decoded operating mode, not the raw two-bit M
+    /// field: both `0b10` and `0b11` are reported as
+    /// [`Mode::Continuous`].
+    UnexpectedMode(Mode),
+    /// Every completion poll still found the trigger standing. The
+    /// conversion did not land within the driver's polling budget, so
+    /// the temperature register was not read.
+    Timeout,
+}
 
 #[cfg(all(feature = "embedded-sensors-hal", not(feature = "async")))]
 impl<E: embedded_hal::i2c::Error, P: embedded_hal::digital::Error> embedded_sensors_hal::sensor::Error for Error<E, P> {
@@ -3539,6 +4108,282 @@ mod tests {
             assert_ne!(bus_err, pin_err);
             assert_ne!(bus_err, invalid_a);
         }
+
+        /// The pure decision functions behind `acquire_one_shot`.
+        ///
+        /// The domain is the raw two-bit `M` field, so these walk it
+        /// exhaustively rather than sampling. Everything else in the
+        /// configuration register must be irrelevant to the decision,
+        /// which is checked by running each case against several
+        /// unrelated high-byte / upper-low-byte patterns.
+        mod one_shot_decisions {
+            use crate::inner::Configuration;
+            use crate::ops::{self, PollOutcome};
+
+            /// Configuration words that differ in every bit *except*
+            /// `M`, so a decision function that accidentally depended
+            /// on one of them would disagree across this set.
+            const NOISE: &[[u8; 2]] = &[[0x20, 0x10], [0x00, 0x00], [0xfc, 0xff], [0x64, 0xb0], [0x38, 0x90]];
+
+            fn with_m(noise: [u8; 2], m: u8) -> Configuration {
+                Configuration::from([(noise[0] & !0b11) | m, noise[1]])
+            }
+
+            #[test]
+            fn raw_mode_extracts_the_two_bit_field_and_nothing_else() {
+                for noise in NOISE {
+                    for m in 0..4u8 {
+                        assert_eq!(
+                            ops::raw_mode(with_m(*noise, m)),
+                            m,
+                            "raw_mode lost or gained bits for M = {m:#04b} with noise {noise:02x?}"
+                        );
+                    }
+                }
+            }
+
+            #[test]
+            fn only_raw_zero_is_a_completed_conversion() {
+                for noise in NOISE {
+                    assert_eq!(ops::classify_poll(with_m(*noise, 0b00)), PollOutcome::Complete);
+                }
+            }
+
+            #[test]
+            fn a_standing_trigger_keeps_polling() {
+                for noise in NOISE {
+                    assert_eq!(ops::classify_poll(with_m(*noise, 0b01)), PollOutcome::Converting);
+                }
+            }
+
+            /// Both continuous encodings abort. They are reported
+            /// through `Mode`, which cannot tell them apart: `0b11`
+            /// decodes to `Mode::Continuous` as well (#62).
+            #[test]
+            fn both_continuous_encodings_abort() {
+                for noise in NOISE {
+                    for m in [0b10u8, 0b11u8] {
+                        assert_eq!(
+                            ops::classify_poll(with_m(*noise, m)),
+                            PollOutcome::Unexpected(crate::Mode::Continuous),
+                            "M = {m:#04b} must abort a one-shot poll"
+                        );
+                    }
+                }
+            }
+
+            #[test]
+            fn preparation_accepts_only_shutdown() {
+                for noise in NOISE {
+                    assert_eq!(ops::check_prepared(with_m(*noise, 0b00)), Ok(()));
+                    assert_eq!(ops::check_prepared(with_m(*noise, 0b01)), Err(crate::Mode::OneShot));
+                    assert_eq!(ops::check_prepared(with_m(*noise, 0b10)), Err(crate::Mode::Continuous));
+                    assert_eq!(ops::check_prepared(with_m(*noise, 0b11)), Err(crate::Mode::Continuous));
+                }
+            }
+
+            /// The polling budget is 8 × 5 ms = 40 ms. Both numbers
+            /// are asserted so that changing either is a deliberate
+            /// act with a test to update, not a silent retune.
+            #[test]
+            fn polling_budget_is_eight_polls_of_five_milliseconds() {
+                assert_eq!(ops::ONE_SHOT_POLLS, 8);
+                assert_eq!(ops::ONE_SHOT_POLL_INTERVAL_MS, 5);
+            }
+        }
+    }
+
+    /// One shared event log for I²C *and* delays.
+    ///
+    /// `embedded_hal_mock`'s I²C mock and its `CheckedDelay` are
+    /// independent: each verifies its own sequence in isolation, so
+    /// neither can see that a register read happened *before* the
+    /// delay that was supposed to precede it. Swapping the two halves
+    /// of a poll iteration therefore slips past both.
+    ///
+    /// These fakes write into a single log, which makes the
+    /// interleaving the one thing under test. Used only where
+    /// ordering across the two peripherals is the property — the
+    /// value-level assertions stay on the richer `embedded_hal_mock`
+    /// types.
+    mod timeline {
+        use std::sync::{Arc, Mutex};
+
+        /// Something the driver did, in the order it did it.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Event {
+            /// A delay of this many milliseconds was requested.
+            Delay(u32),
+            /// The register at this address was written.
+            Write(u8),
+            /// The register at this address was read.
+            Read(u8),
+        }
+
+        /// The shared log both fakes append to.
+        pub type Log = Arc<Mutex<Vec<Event>>>;
+
+        pub fn log() -> Log {
+            Arc::new(Mutex::new(Vec::new()))
+        }
+
+        pub fn events(log: &Log) -> Vec<Event> {
+            log.lock().unwrap().clone()
+        }
+
+        fn record(log: &Log, event: Event) {
+            log.lock().unwrap().push(event);
+        }
+
+        /// A scripted I²C bus that answers reads from `replies` in
+        /// order and records every access.
+        pub struct Bus {
+            log: Log,
+            replies: std::collections::VecDeque<[u8; 2]>,
+        }
+
+        impl Bus {
+            pub fn new(log: &Log, replies: &[[u8; 2]]) -> Self {
+                Self {
+                    log: log.clone(),
+                    replies: replies.iter().copied().collect(),
+                }
+            }
+
+            /// Shared body of the blocking and async `transaction`
+            /// implementations: the fake has no I/O to await, so the
+            /// two differ only in their signature.
+            fn run(&mut self, operations: &mut [embedded_hal::i2c::Operation<'_>]) {
+                use embedded_hal::i2c::Operation;
+
+                let mut register = 0u8;
+                for op in operations {
+                    match op {
+                        Operation::Write(bytes) => {
+                            register = bytes[0];
+                            // One byte is a register pointer; more is
+                            // a pointer plus payload, i.e. a write.
+                            if bytes.len() > 1 {
+                                record(&self.log, Event::Write(register));
+                            }
+                        }
+                        Operation::Read(buffer) => {
+                            record(&self.log, Event::Read(register));
+                            let reply = self.replies.pop_front().expect("unscripted read");
+                            buffer.copy_from_slice(&reply);
+                        }
+                    }
+                }
+            }
+        }
+
+        impl embedded_hal::i2c::ErrorType for Bus {
+            type Error = embedded_hal::i2c::ErrorKind;
+        }
+
+        impl embedded_hal::i2c::I2c for Bus {
+            fn transaction(
+                &mut self,
+                _address: u8,
+                operations: &mut [embedded_hal::i2c::Operation<'_>],
+            ) -> Result<(), Self::Error> {
+                self.run(operations);
+                Ok(())
+            }
+        }
+
+        // The fake has no I/O to await, so these return a ready
+        // future rather than being `async fn`s that never suspend.
+        #[cfg(feature = "async")]
+        impl embedded_hal_async::i2c::I2c for Bus {
+            fn transaction(
+                &mut self,
+                _address: u8,
+                operations: &mut [embedded_hal::i2c::Operation<'_>],
+            ) -> impl core::future::Future<Output = Result<(), Self::Error>> {
+                self.run(operations);
+                core::future::ready(Ok(()))
+            }
+        }
+
+        /// A delay that takes no time and records what was asked for.
+        pub struct Clock {
+            log: Log,
+        }
+
+        impl Clock {
+            pub fn new(log: &Log) -> Self {
+                Self { log: log.clone() }
+            }
+        }
+
+        impl embedded_hal::delay::DelayNs for Clock {
+            fn delay_ns(&mut self, ns: u32) {
+                record(&self.log, Event::Delay(ns / 1_000_000));
+            }
+
+            // Overridden so a millisecond request lands in the log as
+            // one event rather than as the default implementation's
+            // loop of microsecond waits.
+            fn delay_ms(&mut self, ms: u32) {
+                record(&self.log, Event::Delay(ms));
+            }
+        }
+
+        #[cfg(feature = "async")]
+        impl embedded_hal_async::delay::DelayNs for Clock {
+            fn delay_ns(&mut self, ns: u32) -> impl core::future::Future<Output = ()> {
+                record(&self.log, Event::Delay(ns / 1_000_000));
+                core::future::ready(())
+            }
+
+            fn delay_ms(&mut self, ms: u32) -> impl core::future::Future<Output = ()> {
+                record(&self.log, Event::Delay(ms));
+                core::future::ready(())
+            }
+        }
+
+        /// The interleaving `acquire_one_shot` must produce when the
+        /// first poll finds the conversion still in flight and the
+        /// second finds it complete.
+        ///
+        /// Written out in full rather than built by a helper: this is
+        /// the protocol, and it should be readable as such.
+        pub fn expected_one_shot_timeline(settle_ms: u32) -> Vec<Event> {
+            vec![
+                // Preparation: read-modify-write M = 0b00.
+                Event::Read(0x01),
+                Event::Write(0x01),
+                // The caller's settling delay, before anything is
+                // concluded about the part being quiescent.
+                Event::Delay(settle_ms),
+                // The re-read that gates the trigger.
+                Event::Read(0x01),
+                // Trigger: read-modify-write M = 0b01.
+                Event::Read(0x01),
+                Event::Write(0x01),
+                // Each poll delays *first*, then reads. A read here
+                // before its delay would be sampling M at 0 ms.
+                Event::Delay(5),
+                Event::Read(0x01),
+                Event::Delay(5),
+                Event::Read(0x01),
+                // And only now the temperature register.
+                Event::Read(0x00),
+            ]
+        }
+
+        /// Read replies matching [`expected_one_shot_timeline`]:
+        /// continuous, shutdown, shutdown, converting, complete,
+        /// +50.0 °C.
+        pub const ONE_SHOT_REPLIES: &[[u8; 2]] = &[
+            [0x22, 0x10],
+            [0x20, 0x10],
+            [0x20, 0x10],
+            [0x21, 0x10],
+            [0x20, 0x10],
+            [0x32, 0x00],
+        ];
     }
 
     #[cfg(not(feature = "async"))]
@@ -3854,6 +4699,236 @@ mod tests {
 
             let mut mock = tmp108.destroy();
             mock.done();
+        }
+
+        /// Wire-level behaviour of the supervised one-shot sequence.
+        ///
+        /// Every case pairs a scripted I²C mock with a scripted
+        /// delay mock, so both the transactions *and* the delays that
+        /// separate them are asserted. `done()` on each mock at the
+        /// end of a case is what proves the sequence issued nothing
+        /// further — that is how "no trigger was written" and "the
+        /// temperature register was never read" are checked.
+        mod acquire_one_shot {
+            use embedded_hal_mock::eh1::delay::{CheckedDelay, Transaction as Delay};
+            use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
+
+            use super::*;
+
+            /// Caller-supplied settling delay used by every case.
+            const SETTLE_MS: u32 = 40;
+
+            /// Read-modify-write that drives the part from continuous
+            /// (0x1022) into shutdown (0x1020).
+            fn prepare() -> Vec<Transaction> {
+                vec![
+                    Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
+                    Transaction::write(0x48, vec![0x01, 0x20, 0x10]),
+                ]
+            }
+
+            /// A configuration read reporting raw `M` = `m`, with
+            /// every other bit at its reset value.
+            fn reports(m: u8) -> Transaction {
+                Transaction::write_read(0x48, vec![0x01], vec![0x20 | m, 0x10])
+            }
+
+            /// Read-modify-write that writes the one-shot trigger.
+            fn trigger() -> Vec<Transaction> {
+                vec![reports(0b00), Transaction::write(0x48, vec![0x01, 0x21, 0x10])]
+            }
+
+            /// The one temperature read, 0x3200 -> +50.0 °C.
+            fn temperature() -> Transaction {
+                Transaction::write_read(0x48, vec![0x00], vec![0x32, 0x00])
+            }
+
+            /// The settling delay, then `polls` poll intervals.
+            fn delays(polls: usize) -> Vec<Delay> {
+                let mut expected = vec![Delay::delay_ms(SETTLE_MS)];
+                expected.extend((0..polls).map(|_| Delay::delay_ms(5)));
+                expected
+            }
+
+            fn run(
+                i2c: &[Transaction],
+                delay: &[Delay],
+            ) -> Result<Celsius, OneShotError<embedded_hal::i2c::ErrorKind>> {
+                let mut tmp = Tmp108::new_with_a0_gnd(Mock::new(i2c));
+                let mut clock = CheckedDelay::new(delay);
+                let result = tmp.acquire_one_shot(&mut clock, SETTLE_MS);
+                clock.done();
+                let mut mock = tmp.destroy();
+                mock.done();
+                result
+            }
+
+            #[test]
+            fn prepares_settles_triggers_polls_then_reads() {
+                let mut i2c = prepare();
+                i2c.push(reports(0b00));
+                i2c.extend(trigger());
+                i2c.push(reports(0b01));
+                i2c.push(reports(0b01));
+                i2c.push(reports(0b01));
+                i2c.push(reports(0b00));
+                i2c.push(temperature());
+
+                let temp = run(&i2c, &delays(4)).unwrap();
+                assert_approx_eq!(temp.to_degrees(), 50.0);
+            }
+
+            /// The two mocks above are independent, so neither can
+            /// see a poll that read before it delayed. This one puts
+            /// both peripherals on a single timeline and asserts the
+            /// whole interleaving, which is the only place the
+            /// delay-then-read discipline is actually pinned.
+            #[test]
+            fn every_step_happens_in_the_documented_order() {
+                use super::super::timeline;
+
+                let log = timeline::log();
+                let bus = timeline::Bus::new(&log, timeline::ONE_SHOT_REPLIES);
+                let mut sensor = Tmp108::new_with_a0_gnd(bus);
+                let mut clock = timeline::Clock::new(&log);
+
+                let temp = sensor.acquire_one_shot(&mut clock, SETTLE_MS).unwrap();
+
+                assert_approx_eq!(temp.to_degrees(), 50.0);
+                assert_eq!(timeline::events(&log), timeline::expected_one_shot_timeline(SETTLE_MS));
+            }
+
+            /// The re-read after the settle is the gate. If the part
+            /// is not in shutdown the sequence stops dead: the mocks
+            /// below script no trigger and no temperature read, and
+            /// `done()` would fail if either were issued.
+            #[test]
+            fn refuses_to_trigger_when_the_part_is_not_shutdown() {
+                for (m, expected) in [
+                    (0b01u8, Mode::OneShot),
+                    (0b10, Mode::Continuous),
+                    (0b11, Mode::Continuous),
+                ] {
+                    let mut i2c = prepare();
+                    i2c.push(reports(m));
+
+                    assert_eq!(
+                        run(&i2c, &delays(0)),
+                        Err(OneShotError::PreparationNotShutdown(expected)),
+                        "raw M = {m:#04b} after the settle must abort before the trigger"
+                    );
+                }
+            }
+
+            /// Both raw continuous encodings abort mid-poll, and
+            /// neither reads the temperature register.
+            #[test]
+            fn aborts_when_a_poll_finds_a_continuous_mode() {
+                for m in [0b10u8, 0b11u8] {
+                    let mut i2c = prepare();
+                    i2c.push(reports(0b00));
+                    i2c.extend(trigger());
+                    i2c.push(reports(0b01));
+                    i2c.push(reports(m));
+
+                    assert_eq!(
+                        run(&i2c, &delays(2)),
+                        Err(OneShotError::UnexpectedMode(Mode::Continuous)),
+                        "raw M = {m:#04b} during polling must abort"
+                    );
+                }
+            }
+
+            /// Eight polls, no completion, no temperature read.
+            #[test]
+            fn times_out_after_exactly_eight_polls() {
+                let mut i2c = prepare();
+                i2c.push(reports(0b00));
+                i2c.extend(trigger());
+                for _ in 0..8 {
+                    i2c.push(reports(0b01));
+                }
+
+                assert_eq!(run(&i2c, &delays(8)), Err(OneShotError::Timeout));
+            }
+
+            /// The off-by-one boundary: completion observed on the
+            /// eighth and last poll still succeeds.
+            #[test]
+            fn accepts_completion_on_the_final_poll() {
+                let mut i2c = prepare();
+                i2c.push(reports(0b00));
+                i2c.extend(trigger());
+                for _ in 0..7 {
+                    i2c.push(reports(0b01));
+                }
+                i2c.push(reports(0b00));
+                i2c.push(temperature());
+
+                let temp = run(&i2c, &delays(8)).unwrap();
+                assert_approx_eq!(temp.to_degrees(), 50.0);
+            }
+
+            /// Every I²C transaction in the sequence is a distinct
+            /// failure site; all of them surface as `Bus`.
+            #[test]
+            fn maps_a_bus_error_at_every_step() {
+                let err = embedded_hal::i2c::ErrorKind::Other;
+
+                // (description, i2c script, delays expected before the failure)
+                let mut cases: Vec<(&str, Vec<Transaction>, Vec<Delay>)> = Vec::new();
+
+                cases.push((
+                    "preparation read",
+                    vec![Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]).with_error(err)],
+                    Vec::new(),
+                ));
+
+                cases.push((
+                    "preparation write",
+                    vec![
+                        Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
+                        Transaction::write(0x48, vec![0x01, 0x20, 0x10]).with_error(err),
+                    ],
+                    Vec::new(),
+                ));
+
+                let mut post_settle = prepare();
+                post_settle.push(reports(0b00).with_error(err));
+                cases.push(("post-settle re-read", post_settle, delays(0)));
+
+                let mut trigger_read = prepare();
+                trigger_read.push(reports(0b00));
+                trigger_read.push(reports(0b00).with_error(err));
+                cases.push(("trigger read", trigger_read, delays(0)));
+
+                let mut trigger_write = prepare();
+                trigger_write.push(reports(0b00));
+                trigger_write.push(reports(0b00));
+                trigger_write.push(Transaction::write(0x48, vec![0x01, 0x21, 0x10]).with_error(err));
+                cases.push(("trigger write", trigger_write, delays(0)));
+
+                let mut poll_read = prepare();
+                poll_read.push(reports(0b00));
+                poll_read.extend(trigger());
+                poll_read.push(reports(0b01).with_error(err));
+                cases.push(("completion poll", poll_read, delays(1)));
+
+                let mut temp_read = prepare();
+                temp_read.push(reports(0b00));
+                temp_read.extend(trigger());
+                temp_read.push(reports(0b00));
+                temp_read.push(temperature().with_error(err));
+                cases.push(("temperature read", temp_read, delays(1)));
+
+                for (what, i2c, delay) in cases {
+                    assert_eq!(
+                        run(&i2c, &delay),
+                        Err(OneShotError::Bus(err)),
+                        "a bus error at the {what} must surface as OneShotError::Bus"
+                    );
+                }
+            }
         }
     }
 
@@ -7744,6 +8819,241 @@ mod tests {
                     log(&shared)
                 );
                 assert_eq!(steps_left(&shared), 0, "and must consume no scripted transaction");
+            }
+        }
+
+        /// Wire-level behaviour of the supervised one-shot sequence.
+        ///
+        /// Mirror of `tests::blocking::acquire_one_shot`. The two
+        /// modules are gated on opposite settings of the `async`
+        /// feature and never run in the same build, so both copies
+        /// have to exist for both shells to be covered.
+        ///
+        /// Every case pairs a scripted I²C mock with a scripted
+        /// delay mock, so both the transactions *and* the delays that
+        /// separate them are asserted. `done()` on each mock at the
+        /// end of a case is what proves the sequence issued nothing
+        /// further — that is how "no trigger was written" and "the
+        /// temperature register was never read" are checked.
+        mod acquire_one_shot {
+            use embedded_hal_mock::eh1::delay::{CheckedDelay, Transaction as Delay};
+            use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
+
+            use super::*;
+
+            /// Caller-supplied settling delay used by every case.
+            const SETTLE_MS: u32 = 40;
+
+            /// Read-modify-write that drives the part from continuous
+            /// (0x1022) into shutdown (0x1020).
+            fn prepare() -> Vec<Transaction> {
+                vec![
+                    Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
+                    Transaction::write(0x48, vec![0x01, 0x20, 0x10]),
+                ]
+            }
+
+            /// A configuration read reporting raw `M` = `m`, with
+            /// every other bit at its reset value.
+            fn reports(m: u8) -> Transaction {
+                Transaction::write_read(0x48, vec![0x01], vec![0x20 | m, 0x10])
+            }
+
+            /// Read-modify-write that writes the one-shot trigger.
+            fn trigger() -> Vec<Transaction> {
+                vec![reports(0b00), Transaction::write(0x48, vec![0x01, 0x21, 0x10])]
+            }
+
+            /// The one temperature read, 0x3200 -> +50.0 °C.
+            fn temperature() -> Transaction {
+                Transaction::write_read(0x48, vec![0x00], vec![0x32, 0x00])
+            }
+
+            /// The settling delay, then `polls` poll intervals.
+            fn delays(polls: usize) -> Vec<Delay> {
+                let mut expected = vec![Delay::delay_ms(SETTLE_MS)];
+                expected.extend((0..polls).map(|_| Delay::delay_ms(5)));
+                expected
+            }
+
+            async fn run(
+                i2c: &[Transaction],
+                delay: &[Delay],
+            ) -> Result<Celsius, OneShotError<embedded_hal::i2c::ErrorKind>> {
+                let mut tmp = AsyncTmp108::new_with_a0_gnd(Mock::new(i2c));
+                let mut clock = CheckedDelay::new(delay);
+                let result = tmp.acquire_one_shot(&mut clock, SETTLE_MS).await;
+                clock.done();
+                let mut mock = tmp.destroy();
+                mock.done();
+                result
+            }
+
+            #[tokio::test]
+            async fn prepares_settles_triggers_polls_then_reads() {
+                let mut i2c = prepare();
+                i2c.push(reports(0b00));
+                i2c.extend(trigger());
+                i2c.push(reports(0b01));
+                i2c.push(reports(0b01));
+                i2c.push(reports(0b01));
+                i2c.push(reports(0b00));
+                i2c.push(temperature());
+
+                let temp = run(&i2c, &delays(4)).await.unwrap();
+                assert_approx_eq!(temp.to_degrees(), 50.0);
+            }
+
+            /// The two mocks above are independent, so neither can
+            /// see a poll that read before it delayed. This one puts
+            /// both peripherals on a single timeline and asserts the
+            /// whole interleaving, which is the only place the
+            /// delay-then-read discipline is actually pinned.
+            #[tokio::test]
+            async fn every_step_happens_in_the_documented_order() {
+                use super::super::timeline;
+
+                let log = timeline::log();
+                let bus = timeline::Bus::new(&log, timeline::ONE_SHOT_REPLIES);
+                let mut sensor = AsyncTmp108::new_with_a0_gnd(bus);
+                let mut clock = timeline::Clock::new(&log);
+
+                let temp = sensor.acquire_one_shot(&mut clock, SETTLE_MS).await.unwrap();
+
+                assert_approx_eq!(temp.to_degrees(), 50.0);
+                assert_eq!(timeline::events(&log), timeline::expected_one_shot_timeline(SETTLE_MS));
+            }
+
+            /// The re-read after the settle is the gate. If the part
+            /// is not in shutdown the sequence stops dead: the mocks
+            /// below script no trigger and no temperature read, and
+            /// `done()` would fail if either were issued.
+            #[tokio::test]
+            async fn refuses_to_trigger_when_the_part_is_not_shutdown() {
+                for (m, expected) in [
+                    (0b01u8, Mode::OneShot),
+                    (0b10, Mode::Continuous),
+                    (0b11, Mode::Continuous),
+                ] {
+                    let mut i2c = prepare();
+                    i2c.push(reports(m));
+
+                    assert_eq!(
+                        run(&i2c, &delays(0)).await,
+                        Err(OneShotError::PreparationNotShutdown(expected)),
+                        "raw M = {m:#04b} after the settle must abort before the trigger"
+                    );
+                }
+            }
+
+            /// Both raw continuous encodings abort mid-poll, and
+            /// neither reads the temperature register.
+            #[tokio::test]
+            async fn aborts_when_a_poll_finds_a_continuous_mode() {
+                for m in [0b10u8, 0b11u8] {
+                    let mut i2c = prepare();
+                    i2c.push(reports(0b00));
+                    i2c.extend(trigger());
+                    i2c.push(reports(0b01));
+                    i2c.push(reports(m));
+
+                    assert_eq!(
+                        run(&i2c, &delays(2)).await,
+                        Err(OneShotError::UnexpectedMode(Mode::Continuous)),
+                        "raw M = {m:#04b} during polling must abort"
+                    );
+                }
+            }
+
+            /// Eight polls, no completion, no temperature read.
+            #[tokio::test]
+            async fn times_out_after_exactly_eight_polls() {
+                let mut i2c = prepare();
+                i2c.push(reports(0b00));
+                i2c.extend(trigger());
+                for _ in 0..8 {
+                    i2c.push(reports(0b01));
+                }
+
+                assert_eq!(run(&i2c, &delays(8)).await, Err(OneShotError::Timeout));
+            }
+
+            /// The off-by-one boundary: completion observed on the
+            /// eighth and last poll still succeeds.
+            #[tokio::test]
+            async fn accepts_completion_on_the_final_poll() {
+                let mut i2c = prepare();
+                i2c.push(reports(0b00));
+                i2c.extend(trigger());
+                for _ in 0..7 {
+                    i2c.push(reports(0b01));
+                }
+                i2c.push(reports(0b00));
+                i2c.push(temperature());
+
+                let temp = run(&i2c, &delays(8)).await.unwrap();
+                assert_approx_eq!(temp.to_degrees(), 50.0);
+            }
+
+            /// Every I²C transaction in the sequence is a distinct
+            /// failure site; all of them surface as `Bus`.
+            #[tokio::test]
+            async fn maps_a_bus_error_at_every_step() {
+                let err = embedded_hal::i2c::ErrorKind::Other;
+
+                // (description, i2c script, delays expected before the failure)
+                let mut cases: Vec<(&str, Vec<Transaction>, Vec<Delay>)> = Vec::new();
+
+                cases.push((
+                    "preparation read",
+                    vec![Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]).with_error(err)],
+                    Vec::new(),
+                ));
+
+                cases.push((
+                    "preparation write",
+                    vec![
+                        Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
+                        Transaction::write(0x48, vec![0x01, 0x20, 0x10]).with_error(err),
+                    ],
+                    Vec::new(),
+                ));
+
+                let mut post_settle = prepare();
+                post_settle.push(reports(0b00).with_error(err));
+                cases.push(("post-settle re-read", post_settle, delays(0)));
+
+                let mut trigger_read = prepare();
+                trigger_read.push(reports(0b00));
+                trigger_read.push(reports(0b00).with_error(err));
+                cases.push(("trigger read", trigger_read, delays(0)));
+
+                let mut trigger_write = prepare();
+                trigger_write.push(reports(0b00));
+                trigger_write.push(reports(0b00));
+                trigger_write.push(Transaction::write(0x48, vec![0x01, 0x21, 0x10]).with_error(err));
+                cases.push(("trigger write", trigger_write, delays(0)));
+
+                let mut poll_read = prepare();
+                poll_read.push(reports(0b00));
+                poll_read.extend(trigger());
+                poll_read.push(reports(0b01).with_error(err));
+                cases.push(("completion poll", poll_read, delays(1)));
+
+                let mut temp_read = prepare();
+                temp_read.push(reports(0b00));
+                temp_read.extend(trigger());
+                temp_read.push(reports(0b00));
+                temp_read.push(temperature().with_error(err));
+                cases.push(("temperature read", temp_read, delays(1)));
+
+                for (what, i2c, delay) in cases {
+                    assert_eq!(
+                        run(&i2c, &delay).await,
+                        Err(OneShotError::Bus(err)),
+                        "a bus error at the {what} must surface as OneShotError::Bus"
+                    );
+                }
             }
         }
     }

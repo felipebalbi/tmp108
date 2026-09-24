@@ -162,3 +162,87 @@ fn pin_wait_for_alert() {
         sensor.wait_for_alert().await
     }
 }
+
+/// `OneShotError` is ungated public surface: it must be nameable from
+/// outside the crate, all four variants constructible, and the match
+/// below must compile *without* a wildcard arm. That exhaustiveness is
+/// the point — it pins the deliberate absence of `#[non_exhaustive]`,
+/// which nothing inside the crate can pin for us.
+// Pinning the `Clone` impl is the point of the assertion, so the
+// redundant clone on a `Copy` type is deliberate.
+#[allow(clippy::clone_on_copy)]
+#[test]
+fn one_shot_error_is_reachable_and_exhaustive() {
+    use tmp108::{Mode, OneShotError};
+
+    // A concrete `E` a downstream caller could plausibly instantiate.
+    type Err = OneShotError<embedded_hal::i2c::ErrorKind>;
+
+    fn describe(error: Err) -> &'static str {
+        match error {
+            OneShotError::Bus(_) => "bus",
+            OneShotError::PreparationNotShutdown(_) => "not shutdown",
+            OneShotError::UnexpectedMode(_) => "unexpected mode",
+            OneShotError::Timeout => "timeout",
+        }
+    }
+
+    fn eq_bound<T: Eq>(_: T) {}
+
+    assert_eq!(describe(OneShotError::Bus(embedded_hal::i2c::ErrorKind::Bus)), "bus");
+    assert_eq!(
+        describe(OneShotError::PreparationNotShutdown(Mode::Continuous)),
+        "not shutdown"
+    );
+    assert_eq!(
+        describe(OneShotError::UnexpectedMode(Mode::Continuous)),
+        "unexpected mode"
+    );
+    assert_eq!(describe(OneShotError::Timeout), "timeout");
+
+    // Clone, Copy, Debug, PartialEq, Eq — the committed derive set.
+    // Note: no `Hash`, unlike `AlertCause`.
+    let copied: Err = OneShotError::Timeout;
+    let cloned = copied.clone();
+    assert_eq!(copied, cloned);
+    assert_ne!(copied, OneShotError::UnexpectedMode(Mode::Continuous));
+    assert_eq!(format!("{copied:?}"), "Timeout");
+    eq_bound(copied);
+}
+
+/// `Tmp108::acquire_one_shot` is public surface: the generic delay
+/// parameter, the `shutdown_settle_ms` scalar, and the
+/// `Result<Celsius, OneShotError<I2C::Error>>` return type are all
+/// pinned here from outside the crate.
+#[allow(dead_code)]
+fn pin_blocking_acquire_one_shot() {
+    fn _type_check<I2C, DELAY>(
+        tmp: &mut tmp108::Tmp108<I2C>,
+        delay: &mut DELAY,
+        settle_ms: u32,
+    ) -> Result<Celsius, tmp108::OneShotError<I2C::Error>>
+    where
+        I2C: embedded_hal::i2c::I2c,
+        DELAY: embedded_hal::delay::DelayNs,
+    {
+        tmp.acquire_one_shot(delay, settle_ms)
+    }
+}
+
+/// The async `acquire_one_shot` carries the same signature over the
+/// async I2C and delay traits.
+#[cfg(feature = "async")]
+#[allow(dead_code)]
+fn pin_async_acquire_one_shot() {
+    async fn _type_check<I2C, DELAY>(
+        tmp: &mut tmp108::AsyncTmp108<I2C>,
+        delay: &mut DELAY,
+        settle_ms: u32,
+    ) -> Result<Celsius, tmp108::OneShotError<I2C::Error>>
+    where
+        I2C: embedded_hal_async::i2c::I2c,
+        DELAY: embedded_hal_async::delay::DelayNs,
+    {
+        tmp.acquire_one_shot(delay, settle_ms).await
+    }
+}
