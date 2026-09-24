@@ -61,6 +61,64 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Supervised single-sample acquisition through
+  `acquire_one_shot(&mut self, delay, shutdown_settle_ms: u32)` on both
+  `Tmp108` and `AsyncTmp108` (#60). The result is
+  `Result<Celsius, OneShotError<I2C::Error>>`; the new `OneShotError<E>`
+  distinguishes `Bus(E)`, `PreparationNotShutdown(Mode)`,
+  `UnexpectedMode(Mode)` and `Timeout`. This public API change is
+  **purely additive**: existing signatures and `Error<E, P>` are unchanged.
+
+  The helper requests shutdown, waits the caller-supplied settling delay,
+  requires a configuration re-read to report `M = 0b00`, then triggers a
+  one-shot. Each of up to eight completion polls delays 5 ms before reading:
+  `0b01` keeps polling, `0b00` completes, and `0b10` or `0b11` aborts with
+  `UnexpectedMode(Mode::Continuous)`. Temperature is read exactly once,
+  only after observed completion. Success deliberately leaves the part in
+  shutdown; the previous mode is not restored. There is no error-path
+  cleanup write, so an error is not a guarantee of shutdown.
+
+  **The settling delay is the caller's responsibility.** TMP108 datasheet
+  [SBOS663A](https://www.ti.com/lit/gpn/tmp108) §7.4.1 says the device
+  "shuts down when current conversion is completed". Shutdown is deferred:
+  a successful write, or a re-read of the `M = 0b00` software just wrote,
+  does not prove quiescence. The Electrical Characteristics table's
+  21 / 27 / 33 ms conversion-time figures apply at +25 °C and V+ = +1.8 V.
+  A 40 ms settling delay is a **starting point, not a guarantee**; validate
+  it against the board, supply and temperature range. The driver does not
+  validate this argument or infer a safe bound.
+
+  **Interrupt-destructive:** the full sequence performs up to 11
+  configuration reads. In interrupt thermostat mode each acknowledges
+  FL/FH and releases ALERT (SBOS663A §7.5.3.4). Uncollected interrupt
+  evidence is consumed, and the result does not report that loss. Collect
+  pending evidence first, or do not use this sample-only helper where
+  evidence must survive acquisition. A non-destructive variant remains
+  future work (#65).
+
+  **Migration:** replace a bare trigger plus a fixed delay with the
+  supervised helper when a fresh sample is required. These alternative
+  blocking call sites assume an existing `Tmp108` named `sensor` and an
+  `embedded_hal::delay::DelayNs` named `delay`; the after-call uses a
+  board-validated `shutdown_settle_ms`. The before-call is the incomplete
+  pattern being replaced, not a recommended acquisition sequence:
+
+  ```rust,ignore
+  // Before: neither prepares shutdown nor observes completion.
+  use embedded_hal::delay::DelayNs;
+  sensor.one_shot().unwrap();
+  delay.delay_ms(40);
+  let temperature = sensor.temperature().unwrap();
+
+  // After: prepares, settles, triggers, polls, then reads.
+  let temperature = sensor
+      .acquire_one_shot(&mut delay, shutdown_settle_ms)
+      .unwrap();
+  ```
+
+  Async callers use an `embedded_hal_async::delay::DelayNs` and await
+  `sensor.acquire_one_shot(&mut delay, shutdown_settle_ms)`. Production
+  callers handle `OneShotError` rather than the illustrative `unwrap()`.
 - Observable alert cause through `AlertTmp108::wait_for_alert` (#67),
   supplying the status-bearing API left open by #58 below. The crate root
   now exposes `AlertCause::{BelowLow, AboveHigh, Both, Unknown}` without
@@ -142,6 +200,34 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `configure()` no longer retriggers an in-flight one-shot when changing
+  unrelated settings (#61). Before, its read-modify-write echoed sampled
+  `M = 0b01` back to the chip, reissuing a conversion command. Now
+  `ops::apply_config` normalises only that encoding to `0b00` (shutdown).
+  Raw `0b00`, `0b10` and `0b11` are preserved bit-for-bit; `0b11` is not
+  canonicalised to `0b10`. The datasheet's One-Shot Mode description makes
+  `M` a trigger/completion field, not an ordinary setting to preserve.
+
+  **Upgrade behavior:** a caller hand-rolling a one-shot **must not call
+  `configure()` between triggering the conversion and checking for
+  completion**. It now stands the trigger down, so a later `M = 0b00`
+  cannot establish that the chip completed the requested conversion.
+  Configure first, then acquire; the hysteresis setter that delegates to
+  `configure()` has the same restriction. This is a non-breaking bug fix:
+  preserving the in-flight busy indication across reconfiguration was
+  never a documented or supported contract. Neither `configure()`'s
+  signature nor `Error<E, P>` changed. `continuous()` does not route
+  through `configure()` and its mode transitions are unaffected.
+- Correct `one_shot()` documentation and doctest priming on both driver
+  types (#60). The method remains a **bare trigger**, returning after the
+  `M = 0b01` write; its signature and semantics are unchanged. Callers
+  supervising acquisition themselves must first establish shutdown and
+  allow deferred shutdown to settle (SBOS663A §7.4.1), then observe
+  completion before reading temperature. The doctests now start from
+  shutdown (`0x1020`, wire bytes `[0x20, 0x10]`), not the continuous-mode
+  power-on word (`0x1022`, `[0x22, 0x10]`), and still expect the same
+  trigger write (`0x1021`, `[0x21, 0x10]`). Use `acquire_one_shot` for the
+  complete sequence, subject to its settling and interrupt-loss caveats.
 - `AlertTmp108::wait_for_temperature_threshold` no longer loses an
   already-pending interrupt-mode alert (#59). Reading the configuration
   register clears both the watchdog flags and the ALERT pin (TMP108
