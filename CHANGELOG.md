@@ -6,6 +6,87 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Observable alert cause through `AlertTmp108::wait_for_alert` (#67),
+  supplying the status-bearing API left open by #58 below. The crate root
+  now exposes `AlertCause::{BelowLow, AboveHigh, Both, Unknown}` without
+  a feature gate, and `AlertEvent { cause: AlertCause, temperature: Celsius }`
+  with `embedded-sensors-hal-async`. The additive inherent method requires
+  that same feature; its signature is:
+
+  ```rust
+  pub async fn wait_for_alert(
+      &mut self,
+  ) -> Result<
+      AlertEvent,
+      Error<I2C::Error, <ALERT as embedded_hal::digital::ErrorType>::Error>,
+  >;
+  ```
+
+  The part records which limit it crossed in FL/FH; the driver previously
+  decoded those flags for control flow but discarded the direction. TMP108
+  datasheet SBOS663A §7.5.3.4 specifies that FH is set when temperature
+  exceeds THIGH and FL when it falls below TLOW. FH is bit 4 and FL is bit 3
+  of the first configuration byte (Table 8). FL alone reports `BelowLow`,
+  FH alone `AboveHigh`, and both together `Both`. Interrupt acquisition
+  uses the flags from the entry read if either is set; otherwise it uses
+  the post-wait acknowledging read. No extra status read is added.
+
+  `Unknown` means an alert was observed but direction is unavailable,
+  not that no alert occurred:
+  - Fresh Comparator acquisition always reports `Unknown`. It performs
+    no acknowledging read, and the entry read's flags predate the level
+    observation; attributing them to that observation would be a guess.
+  - Interrupt acquisition reports `Unknown` when the post-wait
+    acknowledging read returns both flags clear. This still counts as a
+    delivered alert; requiring nonzero flags would reintroduce the
+    lost-event loop fixed in #59.
+
+  In Interrupt mode, flags describe what happened since they were last
+  observed and cleared, subject to reset, not what is true now. The
+  temperature is the latest conversion (SBOS663A §7.5.2), **not a
+  trigger-time sample**. Comparing it against the limits to infer direction
+  is the invalid inference documented in #58. `Both` supplies neither the
+  number nor the order of excursions.
+
+  A retained cause may be older than its sample. If an interrupt is
+  acknowledged and the temperature read then fails or is cancelled, the
+  wrapper still owes delivery. A retry reports the original cause with a
+  newly read sample, without configuration reads or GPIO waiting. Another
+  excursion may have latched in the opposite direction meanwhile, so the
+  sample need not support the reported direction. This is expected, not a
+  defect. Fresh Comparator acquisition never retains a delivery obligation.
+
+  `wait_for_temperature_threshold` now delegates to `wait_for_alert` and
+  converts `event.temperature` with `.to_degrees()`. The delegation leaves
+  its signature, behavior, transaction sequence and error mapping unchanged;
+  the #58/#59 fixes below still apply. The methods share one delivery
+  obligation: either may acquire it and either may settle it. A successful
+  scalar delivery discards the cause; a later `wait_for_alert` cannot
+  retrieve it. These are two views of one consumptive stream, not two
+  subscribers.
+
+  **Upgrade behavior:** relative to 0.6.0, this API addition is purely
+  additive: no existing signature changes and no caller needs to change.
+  Adding public API requires a **minor** version bump, which
+  `cargo semver-checks` will report. **Migration:** callers wanting direction
+  can replace the scalar wait with the inherent method. These alternative
+  call sites assume an existing `AlertTmp108` named `sensor` in an async
+  function with compatible error propagation and `embedded-sensors-hal-async`
+  enabled:
+
+  ```rust
+  // Before: temperature only
+  use embedded_sensors_hal_async::temperature::TemperatureThresholdWait;
+  let temperature: f32 = sensor.wait_for_temperature_threshold().await?;
+
+  // After: cause and latest temperature
+  let event = sensor.wait_for_alert().await?;
+  let cause: tmp108::AlertCause = event.cause;
+  let temperature: tmp108::Celsius = event.temperature;
+  ```
+
 ### Fixed
 
 - `AlertTmp108::wait_for_temperature_threshold` no longer loses an
