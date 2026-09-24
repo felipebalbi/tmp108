@@ -89,7 +89,7 @@ let temperature = tmp
     .wait_for_temperature_threshold()
     .await
     .map_err(|_| anyhow!("wait_for_temperature_threshold failed"))?;
-println!("ALERT! Temperature at trigger: {temperature:.2} C");
+println!("ALERT serviced! Latest temperature: {temperature:.2} C");
 ```
 
 See `examples/` for complete, runnable versions of each snippet (and more).
@@ -116,6 +116,22 @@ available simultaneously when both relevant features are enabled.
   In interrupt mode the pin clears as soon as the configuration register is
   read (the driver does this for you inside `wait_for_temperature_threshold`).
   See `examples/alert_comparator.rs` for a demonstration.
+- **Pending interrupts are observed before waiting.** The threshold waiter
+  retains FL/FH from its entry configuration read. In interrupt mode, either
+  flag makes it proceed directly to the temperature read, without GPIO
+  waiting or a second acknowledgment. With neither flag set, it waits for
+  the asserted pin level, not an edge, then acknowledges the alert.
+- **An alert reading is not a trigger-time sample.** The threshold waiter
+  returns the latest conversion read after observing an alert. It may be
+  back inside the configured band and cannot identify whether FL, FH, or
+  both caused the event. Those flags are not exposed by the current API.
+- **The threshold waiter is not event-delivery cancel-safe.** A configuration
+  read may acknowledge an interrupt before the call returns. A subsequent
+  temperature-read failure or dropping the future can consume the event
+  without delivering it. `Error::Bus` does not prove that no alert occurred;
+  retrying starts a fresh observation, not a replay. See the
+  [`AlertTmp108` documentation](https://docs.rs/tmp108/latest/tmp108/struct.AlertTmp108.html)
+  for the full contract.
 - **ALERT polarity is set on-chip.** Wire your pull resistor for the polarity
   you configured. Examples assume active-low + external pull-up.
 - **`AsyncTmp108::continuous` is async-only.** For blocking continuous-mode

@@ -4,6 +4,44 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- `AlertTmp108::wait_for_temperature_threshold` no longer loses an
+  already-pending interrupt-mode alert (#59). Reading the configuration
+  register clears both the watchdog flags and the ALERT pin (TMP108
+  datasheet SBOS663A §7.5.3.4). The waiter now retains FL/FH from that
+  entry read: if either flag was set, it reads the latest temperature
+  without a GPIO wait or a second acknowledgment. Otherwise it waits for
+  the asserted pin level, not an edge, also covering an assertion between
+  the entry read and arming the GPIO wait. Comparator mode is unchanged.
+  **Upgrade behavior:** a waiter that previously hung after a transient
+  excursion may now return promptly, even with temperature back inside
+  the configured band. A polling loop that appeared to work while the
+  excursion persisted was receiving a later, relatched alert, not the
+  original event. Calls no longer need that later event to complete.
+  This is a behavioral bug fix; no public API or caller signature changes
+  are required.
+
+### Documentation
+
+- Correct the threshold waiter's returned-value description and alert
+  examples (partial #58): the value is the most recent conversion, read
+  after observing the alert, **not the temperature at time of trigger**.
+  It may already be inside the configured band and cannot identify
+  whether FL, FH, or both caused the event. The flags are not exposed to
+  callers; #58 remains open for a status-bearing API. The earlier
+  pending-edge guarantee described under 0.6.0 is superseded by the
+  snapshot-and-level behavior above.
+- Document that the threshold waiter is **not event-delivery cancel-safe**.
+  A configuration read may acknowledge an interrupt before the call
+  returns. If the subsequent temperature read fails, or the future is
+  dropped, an event can be consumed without being delivered. `Error::Bus`
+  is not proof that no alert occurred. Retrying starts a fresh observation;
+  it does not replay the original event. Awaiting completion avoids
+  intentional cancellation but does not eliminate bus failures.
+
 ## [0.6.0] - 2026-09-04
 
 The first release since 0.5.0, and a substantial one. It collects three
