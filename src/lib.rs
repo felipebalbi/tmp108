@@ -385,6 +385,42 @@ pub(crate) mod ops {
         }
     }
 
+    /// One configuration-register read, decoded into the settings it
+    /// carries *and* the ALERT status flags it simultaneously consumed.
+    ///
+    /// Reading the configuration register is destructive: per TMP108
+    /// datasheet SBOS663A §7.5.3.4, it clears both FL/FH and the ALERT
+    /// pin. `low` and `high` therefore describe the snapshot that was
+    /// returned, not the chip's state once the transaction completed.
+    /// Whoever holds this value holds the only remaining evidence of a
+    /// latched interrupt.
+    ///
+    /// The two flags are independent; all four combinations occur. The
+    /// type deliberately carries no temperature, timestamp, event
+    /// count, or decoded `Mode`.
+    #[cfg(feature = "embedded-sensors-hal-async")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct AlertSnapshot {
+        pub(crate) config: Config,
+        pub(crate) low: bool,
+        pub(crate) high: bool,
+    }
+
+    /// Decode a configuration-register snapshot into its settings and
+    /// the ALERT status flags it returned.
+    ///
+    /// Pure, total, and allocation-free. Notably it does **not** call
+    /// `c.m()`: the generated `Mode` decoder rejects `M = 0b11`
+    /// (issue #62), and this fix must not inherit that defect.
+    #[cfg(feature = "embedded-sensors-hal-async")]
+    pub(crate) fn decode_alert_snapshot(c: Configuration) -> AlertSnapshot {
+        AlertSnapshot {
+            config: decode_config(c),
+            low: c.fl(),
+            high: c.fh(),
+        }
+    }
+
     /// Apply a typed [`Config`] to a configuration-register snapshot,
     /// preserving untouched bits (M, FL, FH, ID).
     pub(crate) fn apply_config(r: &mut Configuration, cfg: Config) {
@@ -729,12 +765,31 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
 /// # Notes on alert behavior
 ///
 /// The driver's [`wait_for_temperature_threshold`][1] implementation
-/// relies on the `embedded-hal-async` [`Wait`][2] trait contract:
-/// implementations must report transitions that occur between `Wait`
-/// calls (e.g. via a pending-edge / latched-interrupt mechanism in the
-/// MCU's GPIO controller). If the HAL implementation drops pending
-/// edges, the driver will miss them — this is a property of the HAL,
-/// not the driver.
+/// uses the *level* waits [`wait_for_low`][3] / [`wait_for_high`][4],
+/// never the edge waits. This is deliberate. The `embedded-hal-async`
+/// [`Wait`][2] contract states that an edge wait does **not** return
+/// for an already-active pin: `wait_for_falling_edge` on a pin that is
+/// already low "does *not* return immediately, it'll wait for the pin
+/// to go high and then low again". Edges that occurred before the wait
+/// was armed are therefore not guaranteed to be replayed, and a driver
+/// that waits for one after having already acknowledged the chip can
+/// wait forever.
+///
+/// (This supersedes section H1 of
+/// `docs/superpowers/specs/2026-06-03-tmp108-reliability-fixes-design.md`,
+/// which claimed the `Wait` trait retains pending edges between calls.
+/// See
+/// `docs/superpowers/specs/2026-09-24-tmp108-issue-59-alert-wait-ordering-design.md`
+/// section 9.1. The rest of that earlier design stands.)
+///
+/// Reading the configuration register is not a side-effect-free status
+/// query: per TMP108 datasheet SBOS663A §7.5.3.4, it clears both the
+/// FL/FH flags and the ALERT pin. In Interrupt mode the waiter
+/// therefore reads configuration **once** at entry, keeps the FL/FH it
+/// consumed, and completes immediately — performing no GPIO operation
+/// at all — when either flag was set. Only when the entry snapshot is
+/// clear does it await the asserted level and then acknowledge that
+/// subsequent assertion with a second configuration read.
 ///
 /// The chip's `Polarity` (active-low vs active-high) is read from the
 /// configuration register on every call to `wait_for_temperature_threshold`.
@@ -749,7 +804,111 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
 /// (because [`wait_for_low`][3] / [`wait_for_high`][4] return
 /// immediately when the pin is already at the requested level). For
 /// repeated-trigger workflows prefer Interrupt mode, or apply
-/// application-level backoff between iterations.
+/// application-level backoff between iterations. Comparator mode never
+/// consults FL/FH and never performs a post-wait acknowledgment.
+///
+/// # What the returned temperature is
+///
+/// [`wait_for_temperature_threshold`][1] returns the **latest
+/// conversion**, read from the temperature register *after* an alert
+/// was observed. It is not a sample captured at the moment the
+/// threshold was crossed, and the driver does not retain one.
+///
+/// Consequently:
+///
+/// - the value need not equal the temperature that triggered the alert;
+/// - it can be back inside the configured `[TLow + HYS, THigh − HYS]`
+///   band, which is normal when a latched interrupt is delivered after
+///   the excursion ended, and is **not** grounds to treat the
+///   notification as spurious;
+/// - it cannot identify whether FL, FH, or both caused the event. The
+///   chip can set both flags, and it coalesces multiple excursions into
+///   one latched state. Comparing the returned value against the limits
+///   is a heuristic, not a receipt.
+///
+/// Reading the configuration register acknowledges the interrupt before
+/// the temperature transaction is even issued, so the acknowledgment is
+/// never contingent on the temperature read succeeding.
+///
+/// # Errors and cancellation
+///
+/// This operation is **not event-delivery cancel-safe**, and its error
+/// type cannot express a partially completed event delivery. Callers
+/// that need durable, exactly-once threshold notifications require a
+/// separate delivery design — one this driver does not currently
+/// provide, and which cannot be reconstructed by a caller: once an
+/// interrupt's evidence has been irreversibly discarded, no
+/// caller-side retry or queue can restore it. Closing that gap is
+/// deferred to issue #58.
+///
+/// Specifically:
+///
+/// - A configuration read may acknowledge an interrupt — clearing the
+///   chip's FL/FH and releasing ALERT — *before* this call returns.
+///   That acknowledgment is not undone on any failure path.
+/// - [`Error::Bus`] does not identify which transaction failed: the
+///   entry configuration read, the post-wait acknowledgment, or the
+///   temperature read. It also does **not** prove that the interrupt
+///   survived, nor that no interrupt occurred. An error must never be
+///   read as "nothing happened".
+/// - Cancelling this future — by dropping it, or by racing it against a
+///   timeout or a `select!` — can consume an event without returning
+///   either a temperature or an error. No asynchronous cleanup runs on
+///   drop; in particular no cleanup configuration read is performed,
+///   because such a read would itself consume a later event.
+/// - Retrying after a failure or a cancellation starts a **fresh
+///   observation**. It does not replay the original event. If the
+///   excursion has ended and the latch was already consumed, the retry
+///   may wait indefinitely for a different event that never comes.
+/// - Whether the bus and the pin are usable after cancellation depends
+///   entirely on the underlying HAL's cancellation and recovery
+///   guarantees for an in-flight I2C transaction or GPIO wait. The
+///   driver makes no additional promise here.
+/// - The returned sample is current register data, **not** a
+///   trigger-time sample and not a receipt identifying a threshold
+///   direction.
+///
+/// ## Recovery contract, by phase — Interrupt mode
+///
+/// The table below applies to **Interrupt mode only**, because only
+/// Interrupt mode latches FL/FH and only there does a configuration
+/// read consume an event. Recovery differs by *where* the call
+/// stopped, and in two of the four phases the driver cannot tell you
+/// whether an event was consumed:
+///
+/// | Stopped at | Consumed? | What a caller may assume |
+/// |---|---|---|
+/// | Entry configuration read | **Unknown** | The chip may or may not have latched, and may or may not have been acknowledged before the failure. Treat any pending event as possibly lost. |
+/// | GPIO level wait ([`Error::Pin`]) | **Nothing** | No acknowledgment was performed after the entry read. A still-latched event remains visible to the next call's entry snapshot. |
+/// | Post-wait acknowledgment | **Unknown** | ALERT was observed asserted, but whether the acknowledging read reached the chip is not determinable from the error. |
+/// | Temperature read | **Definitely acknowledged** | An interrupt was acknowledged and its evidence is gone. That *latched* event cannot be recovered; only a new latch will be reported. |
+///
+/// ## Recovery contract — Comparator mode
+///
+/// Comparator mode has no latch and no acknowledgment: the entry
+/// configuration read is used solely to learn the configured mode and
+/// polarity, no FL/FH is consulted, and there is deliberately no
+/// post-wait acknowledging read. Consequently **nothing is ever
+/// consumed** on this path, and none of the "evidence is gone" rows
+/// above apply.
+///
+/// A retry after any failure — including a failure of the temperature
+/// read, after the level wait already succeeded — performs a fresh
+/// *level observation*. If the temperature is still outside the
+/// `[TLow + HYS, THigh − HYS]` band, ALERT is still asserted, and the
+/// retry may legitimately complete immediately for the **same
+/// continuously asserted condition**, with no new threshold crossing
+/// having occurred. Callers must therefore not treat a completed
+/// comparator-mode call as evidence of a distinct event, nor treat a
+/// failed one as evidence that a condition was consumed and can no
+/// longer be observed. Conversely, if the temperature has returned
+/// inside the band in the meantime, ALERT is released and the retry
+/// will wait for the next excursion.
+///
+/// Returning from this method — and thus releasing the `&mut self`
+/// borrow — only permits a subsequent Rust call. It establishes nothing
+/// about the hardware: it does not mean the chip has settled, that
+/// ALERT has been released, or that a new conversion has occurred.
 ///
 /// [1]: embedded_sensors_hal_async::temperature::TemperatureThresholdWait::wait_for_temperature_threshold
 /// [2]: embedded_hal_async::digital::Wait
@@ -982,6 +1141,23 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
     /// ```
     pub fn destroy(self) -> (I2C, ALERT) {
         (self.tmp108.destroy(), self.alert)
+    }
+
+    /// Read the configuration register once and keep both the settings
+    /// and the ALERT status flags it returned.
+    ///
+    /// This is a **destructive read and an acknowledgment**, not a
+    /// non-destructive status query. Per TMP108 datasheet SBOS663A
+    /// §7.5.3.4, reading the configuration register clears FL, FH, and
+    /// the ALERT pin. The returned snapshot is therefore the *only*
+    /// remaining record of any interrupt that was latched when this
+    /// transaction ran: if the caller drops it, or overwrites it with a
+    /// later snapshot, that event is lost with no way to recover it
+    /// from the chip. Call this exactly as often as the protocol
+    /// requires — never speculatively, and never as "cleanup".
+    async fn read_alert_snapshot(&mut self) -> Result<ops::AlertSnapshot, I2C::Error> {
+        let c = self.sensor_mut().inner.configuration().read_async().await?;
+        Ok(ops::decode_alert_snapshot(c))
     }
 }
 
@@ -2004,19 +2180,39 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
 impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait + embedded_hal::digital::InputPin>
     embedded_sensors_hal_async::temperature::TemperatureThresholdWait for AlertTmp108<I2C, ALERT>
 {
+    /// Wait for the ALERT pin to report a threshold crossing, then
+    /// return the latest temperature conversion.
+    ///
+    /// The returned value is **not** a trigger-time sample, the error
+    /// type cannot express a partially delivered event, and this future
+    /// is not event-delivery cancel-safe. See [`AlertTmp108`]'s "What
+    /// the returned temperature is" and "Errors and cancellation"
+    /// sections for the full contract before relying on either.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Bus`] if any I2C transaction fails, [`Error::Pin`] if
+    /// the GPIO wait fails. Neither proves whether an interrupt was
+    /// consumed; see the recovery table on [`AlertTmp108`].
     async fn wait_for_temperature_threshold(
         &mut self,
     ) -> Result<embedded_sensors_hal_async::temperature::DegreesCelsius, Self::Error> {
-        let config = self.tmp108.read_configuration().await.map_err(Error::Bus)?;
+        // C0. This single transaction both tells us how the chip is
+        // configured and consumes whatever FL/FH it had latched. The
+        // binding is immutable on purpose: the flags captured here are
+        // the only surviving evidence of an already-pending interrupt,
+        // and nothing below may clobber them.
+        let entry_snapshot = self.read_alert_snapshot().await.map_err(Error::Bus)?;
+        let config = entry_snapshot.config;
 
         match (config.thermostat_mode, config.alert_polarity) {
-            // In comparator mode, the ALERT pin remains active even after triggering.
+            // Comparator mode does not latch, so FL/FH are not evidence
+            // of anything the caller is waiting for — the pin level is.
+            // Deliberately no fast path and no acknowledgment here.
             //
-            // If called in a loop, next iteration would return immediately (after reading config
-            // again) if temperature remains outside threshold.
-            //
-            // ALERT pin only resets when temperature falls within the range of (Tlow + HYS) and
-            // (Thigh - HYS).
+            // The ALERT pin stays asserted while the temperature is
+            // outside (Tlow + HYS)..(Thigh - HYS), so calling this in a
+            // tight loop returns immediately on every iteration.
             (Thermostat::Comparator, Polarity::ActiveLow) => {
                 self.alert.wait_for_low().await.map_err(Error::Pin)?;
             }
@@ -2024,23 +2220,38 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
                 self.alert.wait_for_high().await.map_err(Error::Pin)?;
             }
 
-            // In interrupt mode, the ALERT pin is immediately reset (by reading config register)
-            // after triggering.
+            // Interrupt mode latches into FL/FH and releases the pin on
+            // a configuration read. C0 above has therefore already
+            // collected — and destroyed — any pending event. If it found
+            // one, that *is* the notification: waiting on the pin now
+            // would wait for a transition that has already been consumed
+            // and that may never recur (issue #59).
             //
-            // If called in a loop, next iteration would wait even if temperature remains outside
-            // threshold.
-            (Thermostat::Interrupt, Polarity::ActiveLow) => {
-                self.alert.wait_for_falling_edge().await.map_err(Error::Pin)?;
-                let _ = self.tmp108.read_configuration().await.map_err(Error::Bus)?;
-            }
-            (Thermostat::Interrupt, Polarity::ActiveHigh) => {
-                self.alert.wait_for_rising_edge().await.map_err(Error::Pin)?;
-                let _ = self.tmp108.read_configuration().await.map_err(Error::Bus)?;
+            // Otherwise we await the asserted level. A level wait, not
+            // an edge wait: an assertion can land between C0 and the
+            // moment the wait is armed, and `Wait`'s edge methods do not
+            // return for an already-active pin.
+            (Thermostat::Interrupt, polarity) => {
+                if !(entry_snapshot.low || entry_snapshot.high) {
+                    match polarity {
+                        Polarity::ActiveLow => self.alert.wait_for_low().await.map_err(Error::Pin)?,
+                        Polarity::ActiveHigh => self.alert.wait_for_high().await.map_err(Error::Pin)?,
+                    }
+
+                    // C1: acknowledge the assertion we just observed.
+                    // Its own flags are intentionally discarded — the
+                    // successful level wait is the qualifying evidence,
+                    // and requiring nonzero flags here would reintroduce
+                    // a lost-event loop.
+                    let _acknowledgment = self.read_alert_snapshot().await.map_err(Error::Bus)?;
+                }
             }
         }
 
-        // Return temperature at time of trigger for caller to determine which threshold was crossed.
-        let temperature = self.tmp108.temperature().await.map_err(Error::Bus)?;
+        // T. The latest conversion, read after observing an alert — not
+        // the temperature at the moment the threshold was crossed, and
+        // possibly back inside the configured band.
+        let temperature = self.sensor_mut().temperature().await.map_err(Error::Bus)?;
         Ok(temperature.to_degrees())
     }
 }
@@ -2194,6 +2405,55 @@ mod tests {
 
     mod ops_tests {
         use super::*;
+
+        /// Section 7.9 of the #59 design: the alert-snapshot decoder is
+        /// pure and total over every possible register value.
+        #[cfg(feature = "embedded-sensors-hal-async")]
+        mod alert_snapshot {
+            use crate::inner::Configuration;
+            use crate::ops::{decode_alert_snapshot, decode_config};
+
+            /// Exhaust all 65,536 `[u8; 2]` patterns.
+            ///
+            /// This includes every `M = 0b11` encoding, which the
+            /// generated `Mode` decoder rejects (issue #62). The
+            /// snapshot decoder must not call `m()`, so it has to
+            /// survive them; a future refactor that reintroduces that
+            /// dependency panics here.
+            #[test]
+            fn decoding_is_total_and_matches_the_settings_decoder() {
+                for word in 0..=u16::MAX {
+                    let bytes = word.to_le_bytes();
+                    let c = Configuration::from(bytes);
+                    let snapshot = decode_alert_snapshot(c);
+
+                    assert_eq!(
+                        snapshot.config,
+                        decode_config(c),
+                        "settings projection diverged for {bytes:02x?}"
+                    );
+                    assert_eq!(snapshot.low, bytes[0] & 0x08 != 0, "FL wrong for {bytes:02x?}");
+                    assert_eq!(snapshot.high, bytes[0] & 0x10 != 0, "FH wrong for {bytes:02x?}");
+                }
+            }
+
+            /// All four flag combinations are representable and
+            /// independent.
+            #[test]
+            fn both_flags_are_independent() {
+                let cases = [
+                    (0x22_u8, false, false),
+                    (0x2a_u8, true, false),
+                    (0x32_u8, false, true),
+                    (0x3a_u8, true, true),
+                ];
+
+                for (byte0, low, high) in cases {
+                    let snapshot = decode_alert_snapshot(Configuration::from([byte0, 0x10]));
+                    assert_eq!((snapshot.low, snapshot.high), (low, high), "byte0 {byte0:#04x}");
+                }
+            }
+        }
 
         /// Exhaustive tests for the [`Celsius`] newtype and its
         /// register codec.
@@ -3254,14 +3514,20 @@ mod tests {
                 Transaction::write(0x48, vec![0x01, 0x26, 0x10]),
                 Transaction::write(0x48, vec![0x02, 0x19, 0x00]),
                 Transaction::write(0x48, vec![0x03, 0x50, 0x00]),
+                // C0: no flag is latched yet, so the waiter goes on to
+                // wait on the pin.
                 Transaction::write_read(0x48, vec![0x01], vec![0x26, 0x10]),
+                // C1: acknowledge the assertion the level wait observed.
                 Transaction::write_read(0x48, vec![0x01], vec![0x26, 0x10]),
                 Transaction::write_read(0x48, vec![0x00], vec![0x50, 0x00]),
             ];
             let i2c_mock = Mock::new(&i2c_expectations);
 
-            // Threshold alert GPIO pin mocks and expectations
-            let pin_expectations = vec![digital::Transaction::wait_for_edge(digital::Edge::Falling)];
+            // Threshold alert GPIO pin mocks and expectations. Interrupt
+            // mode waits for the asserted *level*, never an edge: the
+            // entry configuration read has already released the pin, so
+            // an edge that happened before the wait was armed is gone.
+            let pin_expectations = vec![digital::Transaction::wait_for_state(digital::State::Low)];
             let pin_mock = digital::Mock::new(&pin_expectations);
 
             // Create a ALERTTMP108 instance and configure it as active-low interrupt mode
@@ -3282,7 +3548,7 @@ mod tests {
             let result = tmp108.set_temperature_threshold_high(80.0).await;
             assert!(result.is_ok());
 
-            // Ensure alert pin waits for a falling edge
+            // Ensure alert pin waits for the asserted level
             let result = tmp108.wait_for_temperature_threshold().await;
             assert!(result.is_ok());
 
@@ -3390,23 +3656,24 @@ mod tests {
             use embedded_hal_mock::eh1::{MockError, digital};
             use embedded_sensors_hal_async::temperature::TemperatureThresholdWait;
 
-            // Configure for Interrupt + ActiveLow so wait_for_falling_edge
-            // is the gating operation. The pin then errors; the driver
-            // must surface the GPIO error via Error::Pin(_), not swallow
-            // it (the pre-fix behavior collapsed all GPIO failures to
-            // Error::Other).
+            // Configure for Interrupt + ActiveLow so the level wait
+            // (wait_for_low) is the gating operation. The pin then
+            // errors; the driver must surface the GPIO error via
+            // Error::Pin(_), not swallow it (the pre-fix behavior
+            // collapsed all GPIO failures to Error::Other).
             let i2c_expectations = vec![
                 // configure: read + write
                 Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]),
                 Transaction::write(0x48, vec![0x01, 0x26, 0x10]),
-                // wait_for_temperature_threshold reads cfg first
+                // wait_for_temperature_threshold reads cfg first; no flag
+                // is latched, so it goes on to wait on the pin.
                 Transaction::write_read(0x48, vec![0x01], vec![0x26, 0x10]),
             ];
             let i2c_mock = Mock::new(&i2c_expectations);
 
             let pin_err = MockError::Io(std::io::ErrorKind::Other);
             let pin_expectations =
-                vec![digital::Transaction::wait_for_edge(digital::Edge::Falling).with_error(pin_err.clone())];
+                vec![digital::Transaction::wait_for_state(digital::State::Low).with_error(pin_err.clone())];
             let pin_mock = digital::Mock::new(&pin_expectations);
 
             let mut tmp108 = AlertTmp108::new_with_a0_gnd(i2c_mock, pin_mock);
@@ -3427,6 +3694,1633 @@ mod tests {
             let (mut i2c_mock, mut pin_mock) = tmp108.destroy();
             i2c_mock.done();
             pin_mock.done();
+        }
+
+        /// Regression tests for the alert-wait ordering defect (#59).
+        ///
+        /// See
+        /// `docs/superpowers/specs/2026-09-24-tmp108-issue-59-alert-wait-ordering-design.md`
+        /// section 7. Every test here is driven by manual polling, so a
+        /// waiter that parks on a notification that will never arrive
+        /// fails immediately instead of hanging the suite.
+        #[cfg(feature = "embedded-sensors-hal-async")]
+        mod alert_ordering {
+            use core::future::Future;
+            use core::pin::pin;
+            use core::task::{Context, Poll, Waker};
+            use std::sync::{Arc, Mutex};
+
+            use embedded_hal::digital::InputPin;
+            use embedded_sensors_hal_async::temperature::TemperatureThresholdWait;
+
+            use super::*;
+
+            type I2cError = embedded_hal::i2c::ErrorKind;
+            type PinError = embedded_hal::digital::ErrorKind;
+
+            const ADDR: u8 = 0x48;
+
+            /// 25 °C, per design section 2.3.
+            const T25: [u8; 2] = [0x19, 0x00];
+            /// 80 °C, per design section 2.3.
+            const T80: [u8; 2] = [0x50, 0x00];
+
+            /// Configuration byte 0 with FL/FH cleared.
+            const INTERRUPT: u8 = 0x26;
+            const COMPARATOR: u8 = 0x22;
+            /// Configuration byte 1.
+            const ACTIVE_LOW: u8 = 0x10;
+            const ACTIVE_HIGH: u8 = 0x90;
+
+            // ---------------------------------------------------------------
+            // Shared operation log
+            // ---------------------------------------------------------------
+
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            enum PinOp {
+                WaitLow,
+                WaitHigh,
+                WaitFalling,
+                WaitRising,
+                WaitAnyEdge,
+                IsLow,
+                IsHigh,
+            }
+
+            #[derive(Clone, Debug, PartialEq, Eq)]
+            enum Op {
+                /// `write_read(ADDR, written, returned)`.
+                WriteRead(Vec<u8>, Vec<u8>),
+                /// `write(ADDR, written)`.
+                Write(Vec<u8>),
+                /// A pin operation was *started*.
+                PinCall(PinOp),
+                /// A pin operation *completed* (successfully or with an error).
+                PinDone(PinOp),
+            }
+
+            // ---------------------------------------------------------------
+            // Scripted I2C steps
+            // ---------------------------------------------------------------
+
+            #[derive(Clone, Debug)]
+            enum Resp {
+                /// A write: nothing is returned.
+                None,
+                /// A fixed two-byte response (temperature, limits).
+                Fixed([u8; 2]),
+                /// A configuration response whose FL/FH bits are taken from
+                /// the modeled chip state at the moment the transaction runs.
+                Config { base0: u8, byte1: u8 },
+            }
+
+            #[derive(Clone, Copy, Debug)]
+            enum Outcome {
+                Ok,
+                Err(I2cError),
+                /// The transaction future never resolves.
+                Pending,
+            }
+
+            /// One scripted I2C transaction.
+            ///
+            /// `effect` models the *hardware side effect* of the transaction
+            /// and is applied before `outcome` is honoured, so a transaction
+            /// can acknowledge the chip and then fail — the case the
+            /// reliability reviewer requires (R1).
+            struct Step {
+                write: Vec<u8>,
+                resp: Resp,
+                effect: Option<fn(&mut World)>,
+                outcome: Outcome,
+            }
+
+            impl Step {
+                fn effect(mut self, f: fn(&mut World)) -> Self {
+                    self.effect = Some(f);
+                    self
+                }
+
+                fn err(mut self, e: I2cError) -> Self {
+                    self.outcome = Outcome::Err(e);
+                    self
+                }
+
+                fn pending(mut self) -> Self {
+                    self.outcome = Outcome::Pending;
+                    self
+                }
+            }
+
+            /// A configuration read (C0 or C1): `write_read(ADDR, [0x01], _)`.
+            fn cfg(base0: u8, byte1: u8) -> Step {
+                Step {
+                    write: vec![0x01],
+                    resp: Resp::Config { base0, byte1 },
+                    effect: None,
+                    outcome: Outcome::Ok,
+                }
+            }
+
+            /// A temperature read (T): `write_read(ADDR, [0x00], _)`.
+            fn temp(bytes: [u8; 2]) -> Step {
+                Step {
+                    write: vec![0x00],
+                    resp: Resp::Fixed(bytes),
+                    effect: None,
+                    outcome: Outcome::Ok,
+                }
+            }
+
+            /// A register write.
+            fn write(bytes: Vec<u8>) -> Step {
+                Step {
+                    write: bytes,
+                    resp: Resp::None,
+                    effect: None,
+                    outcome: Outcome::Ok,
+                }
+            }
+
+            // ---------------------------------------------------------------
+            // Modeled chip + pin
+            // ---------------------------------------------------------------
+
+            // These are test fixtures, not domain models: the flags are
+            // an explicit script of chip/pin state, and collapsing them
+            // into enums would obscure what each case sets up.
+            #[allow(clippy::struct_excessive_bools)]
+            struct World {
+                log: Vec<Op>,
+                steps: std::collections::VecDeque<Step>,
+                /// FL latched in the chip.
+                fl: bool,
+                /// FH latched in the chip.
+                fh: bool,
+                /// Current ALERT level.
+                level_high: bool,
+                /// An unconsumed observation of the pin having been HIGH.
+                sticky_high: bool,
+                /// An unconsumed observation of the pin having been LOW.
+                sticky_low: bool,
+                /// Panic on any pin call. Makes "must not touch GPIO"
+                /// deterministic instead of a timeout.
+                strict_pin: bool,
+                /// Error returned by the next *level* wait.
+                pin_error: Option<PinError>,
+            }
+
+            impl World {
+                fn set_level(&mut self, high: bool) {
+                    self.level_high = high;
+                    if high {
+                        self.sticky_high = true;
+                        self.sticky_low = false;
+                    } else {
+                        self.sticky_low = true;
+                        self.sticky_high = false;
+                    }
+                }
+
+                /// Drive the pin to `high` and immediately back, leaving the
+                /// observation of `high` unconsumed. Models R4: the level
+                /// wait completed, but the level went inactive again before
+                /// the woken task resumed.
+                fn pulse_level(&mut self, high: bool) {
+                    self.set_level(high);
+                    self.level_high = !high;
+                }
+
+                fn sticky(&self, high: bool) -> bool {
+                    if high { self.sticky_high } else { self.sticky_low }
+                }
+
+                fn clear_sticky(&mut self, high: bool) {
+                    if high {
+                        self.sticky_high = false;
+                    } else {
+                        self.sticky_low = false;
+                    }
+                }
+            }
+
+            type Shared = Arc<Mutex<World>>;
+
+            /// C0's documented hardware side effect in interrupt mode:
+            /// clear FL/FH and release the pin (`ActiveLow` -> HIGH).
+            fn ack_release_high(w: &mut World) {
+                w.fl = false;
+                w.fh = false;
+                w.set_level(true);
+            }
+
+            /// As above for `ActiveHigh`: release the pin to LOW.
+            fn ack_release_low(w: &mut World) {
+                w.fl = false;
+                w.fh = false;
+                w.set_level(false);
+            }
+
+            /// A new alert asserts `ActiveLow` between C0 and GPIO arming.
+            fn assert_low(w: &mut World) {
+                w.set_level(false);
+            }
+
+            /// A new alert asserts `ActiveHigh` between C0 and GPIO arming.
+            fn assert_high(w: &mut World) {
+                w.set_level(true);
+            }
+
+            // ---------------------------------------------------------------
+            // Fakes
+            // ---------------------------------------------------------------
+
+            struct FakeI2c {
+                shared: Shared,
+            }
+
+            impl embedded_hal_async::i2c::ErrorType for FakeI2c {
+                type Error = I2cError;
+            }
+
+            impl FakeI2c {
+                /// Consume one scripted step, record it, apply its hardware
+                /// side effect, and return its outcome.
+                fn step(&mut self, addr: u8, written: &[u8], read: Option<&mut [u8]>) -> Outcome {
+                    let mut w = self.shared.lock().unwrap();
+                    assert_eq!(addr, ADDR, "unexpected I2C address");
+                    let step = w
+                        .steps
+                        .pop_front()
+                        .unwrap_or_else(|| panic!("unexpected I2C transaction, wrote {written:x?}"));
+                    assert_eq!(written, &step.write[..], "unexpected I2C write payload");
+
+                    match (step.resp.clone(), read) {
+                        (Resp::None, None) => w.log.push(Op::Write(written.to_vec())),
+                        (Resp::Fixed(bytes), Some(buf)) => {
+                            assert_eq!(buf.len(), 2, "unexpected read length");
+                            buf.copy_from_slice(&bytes);
+                            w.log.push(Op::WriteRead(written.to_vec(), bytes.to_vec()));
+                        }
+                        (Resp::Config { base0, byte1 }, Some(buf)) => {
+                            assert_eq!(buf.len(), 2, "unexpected read length");
+                            let b0 = base0 | u8::from(w.fl) << 3 | u8::from(w.fh) << 4;
+                            let bytes = [b0, byte1];
+                            buf.copy_from_slice(&bytes);
+                            w.log.push(Op::WriteRead(written.to_vec(), bytes.to_vec()));
+                        }
+                        (resp, _) => panic!("scripted response {resp:?} does not match the transaction shape"),
+                    }
+
+                    if let Some(effect) = step.effect {
+                        effect(&mut w);
+                    }
+
+                    step.outcome
+                }
+            }
+
+            impl embedded_hal_async::i2c::I2c for FakeI2c {
+                async fn write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), Self::Error> {
+                    match self.step(addr, bytes, None) {
+                        Outcome::Ok => Ok(()),
+                        Outcome::Err(e) => Err(e),
+                        Outcome::Pending => core::future::pending().await,
+                    }
+                }
+
+                async fn read(&mut self, _addr: u8, _buf: &mut [u8]) -> Result<(), Self::Error> {
+                    unimplemented!("the driver never issues a bare read")
+                }
+
+                async fn write_read(&mut self, addr: u8, bytes: &[u8], buf: &mut [u8]) -> Result<(), Self::Error> {
+                    match self.step(addr, bytes, Some(buf)) {
+                        Outcome::Ok => Ok(()),
+                        Outcome::Err(e) => Err(e),
+                        Outcome::Pending => core::future::pending().await,
+                    }
+                }
+
+                async fn transaction(
+                    &mut self,
+                    _addr: u8,
+                    _ops: &mut [embedded_hal_async::i2c::Operation<'_>],
+                ) -> Result<(), Self::Error> {
+                    unimplemented!("the driver never issues a compound transaction")
+                }
+            }
+
+            struct FakePin {
+                shared: Shared,
+            }
+
+            impl embedded_hal::digital::ErrorType for FakePin {
+                type Error = PinError;
+            }
+
+            impl FakePin {
+                fn record(&self, op: PinOp) {
+                    let mut w = self.shared.lock().unwrap();
+                    w.log.push(Op::PinCall(op));
+                    assert!(
+                        !w.strict_pin,
+                        "strict pin fake: the waiter performed {op:?}, but this fixture models an \
+                         already-latched event whose excursion has ended — no pin notification will \
+                         ever arrive"
+                    );
+                }
+
+                /// A level wait per `embedded_hal_async::digital::Wait`:
+                /// returns immediately if the level is already active.
+                async fn level_wait(&mut self, op: PinOp, want_high: bool) -> Result<(), PinError> {
+                    self.record(op);
+                    let shared = self.shared.clone();
+                    core::future::poll_fn(move |_cx| {
+                        let mut w = shared.lock().unwrap();
+                        if let Some(e) = w.pin_error.take() {
+                            w.log.push(Op::PinDone(op));
+                            return Poll::Ready(Err(e));
+                        }
+                        if w.level_high == want_high || w.sticky(want_high) {
+                            w.clear_sticky(want_high);
+                            w.log.push(Op::PinDone(op));
+                            Poll::Ready(Ok(()))
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await
+                }
+
+                /// An edge wait. These fixtures deliberately never schedule a
+                /// further transition, so an edge wait parks forever — which
+                /// is exactly the hardware-observed hang.
+                async fn edge_wait(&mut self, op: PinOp) -> Result<(), PinError> {
+                    self.record(op);
+                    core::future::pending().await
+                }
+            }
+
+            impl embedded_hal_async::digital::Wait for FakePin {
+                async fn wait_for_high(&mut self) -> Result<(), Self::Error> {
+                    self.level_wait(PinOp::WaitHigh, true).await
+                }
+
+                async fn wait_for_low(&mut self) -> Result<(), Self::Error> {
+                    self.level_wait(PinOp::WaitLow, false).await
+                }
+
+                async fn wait_for_rising_edge(&mut self) -> Result<(), Self::Error> {
+                    self.edge_wait(PinOp::WaitRising).await
+                }
+
+                async fn wait_for_falling_edge(&mut self) -> Result<(), Self::Error> {
+                    self.edge_wait(PinOp::WaitFalling).await
+                }
+
+                async fn wait_for_any_edge(&mut self) -> Result<(), Self::Error> {
+                    self.edge_wait(PinOp::WaitAnyEdge).await
+                }
+            }
+
+            impl InputPin for FakePin {
+                fn is_high(&mut self) -> Result<bool, Self::Error> {
+                    self.record(PinOp::IsHigh);
+                    Ok(self.shared.lock().unwrap().level_high)
+                }
+
+                fn is_low(&mut self) -> Result<bool, Self::Error> {
+                    self.record(PinOp::IsLow);
+                    Ok(!self.shared.lock().unwrap().level_high)
+                }
+            }
+
+            // ---------------------------------------------------------------
+            // Harness
+            // ---------------------------------------------------------------
+
+            // As for `World`: an explicit per-case script, not a model.
+            #[allow(clippy::struct_excessive_bools)]
+            struct Setup {
+                level_high: bool,
+                fl: bool,
+                fh: bool,
+                strict_pin: bool,
+                pin_error: Option<PinError>,
+                steps: Vec<Step>,
+            }
+
+            impl Default for Setup {
+                fn default() -> Self {
+                    Self {
+                        level_high: true,
+                        fl: false,
+                        fh: false,
+                        strict_pin: false,
+                        pin_error: None,
+                        steps: Vec::new(),
+                    }
+                }
+            }
+
+            fn build(setup: Setup) -> (Shared, AlertTmp108<FakeI2c, FakePin>) {
+                let shared = Arc::new(Mutex::new(World {
+                    log: Vec::new(),
+                    steps: setup.steps.into_iter().collect(),
+                    fl: setup.fl,
+                    fh: setup.fh,
+                    level_high: setup.level_high,
+                    sticky_high: setup.level_high,
+                    sticky_low: !setup.level_high,
+                    strict_pin: setup.strict_pin,
+                    pin_error: setup.pin_error,
+                }));
+                let i2c = FakeI2c { shared: shared.clone() };
+                let pin = FakePin { shared: shared.clone() };
+                (shared, AlertTmp108::new_with_a0_gnd(i2c, pin))
+            }
+
+            fn poll_once<F: Future>(fut: core::pin::Pin<&mut F>) -> Poll<F::Output> {
+                let mut cx = Context::from_waker(Waker::noop());
+                fut.poll(&mut cx)
+            }
+
+            fn log(shared: &Shared) -> Vec<Op> {
+                shared.lock().unwrap().log.clone()
+            }
+
+            fn take_log(shared: &Shared) -> Vec<Op> {
+                core::mem::take(&mut shared.lock().unwrap().log)
+            }
+
+            fn pin_calls(shared: &Shared) -> Vec<PinOp> {
+                log(shared)
+                    .into_iter()
+                    .filter_map(|op| match op {
+                        Op::PinCall(p) => Some(p),
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            /// The written payload of each I2C transaction, in order.
+            fn i2c_writes(shared: &Shared) -> Vec<Vec<u8>> {
+                log(shared)
+                    .into_iter()
+                    .filter_map(|op| match op {
+                        Op::WriteRead(w, _) | Op::Write(w) => Some(w),
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            fn steps_left(shared: &Shared) -> usize {
+                shared.lock().unwrap().steps.len()
+            }
+
+            fn push_steps(shared: &Shared, steps: Vec<Step>) {
+                shared.lock().unwrap().steps.extend(steps);
+            }
+
+            type WaitPoll = Poll<Result<f32, Error<I2cError, PinError>>>;
+
+            /// Assert a bus error, with a diagnostic that names the GPIO
+            /// operations the waiter performed if it parked instead.
+            fn expect_bus(shared: &Shared, p: WaitPoll, want: I2cError) {
+                match p {
+                    Poll::Ready(Err(Error::Bus(e))) => assert_eq!(e, want),
+                    Poll::Pending => panic!(
+                        "waiter parked instead of returning Err(Bus({want:?})); pin operations so \
+                         far: {:?}",
+                        pin_calls(shared)
+                    ),
+                    other @ Poll::Ready(_) => panic!("expected Err(Bus({want:?})), got {other:?}"),
+                }
+            }
+
+            /// As [`expect_bus`], for pin errors.
+            fn expect_pin(shared: &Shared, p: WaitPoll, want: PinError) {
+                match p {
+                    Poll::Ready(Err(Error::Pin(e))) => assert_eq!(e, want),
+                    Poll::Pending => panic!(
+                        "waiter parked instead of returning Err(Pin({want:?})); pin operations so \
+                         far: {:?}",
+                        pin_calls(shared)
+                    ),
+                    other @ Poll::Ready(_) => panic!("expected Err(Pin({want:?})), got {other:?}"),
+                }
+            }
+
+            fn degrees(p: WaitPoll) -> f32 {
+                match p {
+                    Poll::Ready(Ok(t)) => t,
+                    Poll::Ready(Err(e)) => panic!("expected a temperature, got {e:?}"),
+                    Poll::Pending => panic!(
+                        "waiter parked instead of completing — it is waiting for a notification \
+                         this fixture will never deliver"
+                    ),
+                }
+            }
+
+            // ===============================================================
+            // Section 7.2 — transient regression: already latched, excursion
+            // over, and no further assertion will ever occur.
+            // ===============================================================
+
+            /// The crown-jewel regression. Shared body for all six flag /
+            /// polarity permutations.
+            fn transient_case(byte1: u8, fl: bool, fh: bool) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let release: fn(&mut World) = if asserted_high {
+                    ack_release_low
+                } else {
+                    ack_release_high
+                };
+
+                let (shared, mut tmp) = build(Setup {
+                    // The pin is already asserted.
+                    level_high: asserted_high,
+                    fl,
+                    fh,
+                    // Any GPIO touch is a bug: there is nothing left to observe.
+                    strict_pin: true,
+                    steps: vec![cfg(INTERRUPT, byte1).effect(release), temp(T25)],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+
+                assert!(
+                    pin_calls(&shared).is_empty(),
+                    "a pending entry flag must suppress every GPIO operation, saw {:?}",
+                    pin_calls(&shared)
+                );
+                assert_approx_eq!(degrees(result), 25.0, 1e-4);
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x01], vec![0x00]],
+                    "the pending fast path performs exactly C0 and T (no C1)"
+                );
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            #[test]
+            fn transient_latched_fh_active_low_completes_without_gpio() {
+                transient_case(ACTIVE_LOW, false, true);
+            }
+
+            #[test]
+            fn transient_latched_fl_active_low_completes_without_gpio() {
+                transient_case(ACTIVE_LOW, true, false);
+            }
+
+            #[test]
+            fn transient_latched_both_flags_active_low_completes_once() {
+                transient_case(ACTIVE_LOW, true, true);
+            }
+
+            #[test]
+            fn transient_latched_fh_active_high_completes_without_gpio() {
+                transient_case(ACTIVE_HIGH, false, true);
+            }
+
+            #[test]
+            fn transient_latched_fl_active_high_completes_without_gpio() {
+                transient_case(ACTIVE_HIGH, true, false);
+            }
+
+            #[test]
+            fn transient_latched_both_flags_active_high_completes_once() {
+                transient_case(ACTIVE_HIGH, true, true);
+            }
+
+            /// The literal liveness variant from section 7.2: the modeled
+            /// chip really does release the pin and clear the flags when C0
+            /// completes, and nothing ever re-asserts. A waiter that parks on
+            /// the pin parks forever.
+            #[test]
+            fn transient_liveness_no_further_assertion_ever_arrives() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: false,
+                    fh: true,
+                    steps: vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high), temp(T25)],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+
+                assert_eq!(
+                    pin_calls(&shared),
+                    Vec::<PinOp>::new(),
+                    "no GPIO operation may be performed for an event already captured by C0"
+                );
+                assert_approx_eq!(degrees(result), 25.0, 1e-4);
+            }
+
+            // ===============================================================
+            // Section 7.3 — persistent condition, already latched.
+            // ===============================================================
+
+            fn persistent_case(byte1: u8) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let (shared, mut tmp) = build(Setup {
+                    level_high: asserted_high,
+                    fh: true,
+                    strict_pin: true,
+                    steps: vec![cfg(INTERRUPT, byte1), temp(T80)],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+
+                assert!(pin_calls(&shared).is_empty());
+                assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x01], vec![0x00]],
+                    "no C1 on the fast path"
+                );
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            #[test]
+            fn persistent_latched_interrupt_active_low_uses_entry_evidence() {
+                persistent_case(ACTIVE_LOW);
+            }
+
+            #[test]
+            fn persistent_latched_interrupt_active_high_uses_entry_evidence() {
+                persistent_case(ACTIVE_HIGH);
+            }
+
+            // ===============================================================
+            // Section 7.4 — no pending entry flag, later assertion.
+            // ===============================================================
+
+            fn no_pending_then_assertion_case(byte1: u8) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let (want_call, want_done) = if asserted_high {
+                    (PinOp::WaitHigh, PinOp::WaitHigh)
+                } else {
+                    (PinOp::WaitLow, PinOp::WaitLow)
+                };
+
+                let (shared, mut tmp) = build(Setup {
+                    // Pin starts inactive.
+                    level_high: !asserted_high,
+                    steps: vec![cfg(INTERRUPT, byte1), cfg(INTERRUPT, byte1), temp(T80)],
+                    ..Default::default()
+                });
+
+                let mut fut = pin!(tmp.wait_for_temperature_threshold());
+
+                // C0 runs, the level wait is armed, and the waiter parks.
+                assert!(poll_once(fut.as_mut()).is_pending(), "must park until ALERT asserts");
+                assert_eq!(
+                    log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![INTERRUPT, byte1]),
+                        Op::PinCall(want_call),
+                    ],
+                    "exactly one level wait, armed after C0 and before any C1"
+                );
+
+                // The alert asserts.
+                {
+                    let mut w = shared.lock().unwrap();
+                    w.fh = true;
+                    w.set_level(asserted_high);
+                }
+
+                let result = poll_once(fut.as_mut());
+                assert_approx_eq!(degrees(result), 80.0, 1e-4);
+
+                // Cross-interface ordering: C1 cannot precede pin completion.
+                assert_eq!(
+                    log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![INTERRUPT, byte1]),
+                        Op::PinCall(want_call),
+                        Op::PinDone(want_done),
+                        Op::WriteRead(vec![0x01], vec![INTERRUPT | 0x10, byte1]),
+                        Op::WriteRead(vec![0x00], T80.to_vec()),
+                    ]
+                );
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            #[test]
+            fn interrupt_active_low_without_entry_flag_uses_one_level_wait() {
+                no_pending_then_assertion_case(ACTIVE_LOW);
+            }
+
+            #[test]
+            fn interrupt_active_high_without_entry_flag_uses_one_level_wait() {
+                no_pending_then_assertion_case(ACTIVE_HIGH);
+            }
+
+            /// Section 7.4's final paragraph: C1 returning clear flags after a
+            /// successful level wait must not cause a re-qualification loop.
+            #[test]
+            fn interrupt_completes_even_when_c1_reports_clear_flags() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: true,
+                    steps: vec![cfg(INTERRUPT, ACTIVE_LOW), cfg(INTERRUPT, ACTIVE_LOW), temp(T80)],
+                    ..Default::default()
+                });
+
+                let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                assert!(poll_once(fut.as_mut()).is_pending());
+                shared.lock().unwrap().set_level(false);
+
+                let result = poll_once(fut.as_mut());
+                assert_eq!(pin_calls(&shared), vec![PinOp::WaitLow], "exactly one level wait");
+                assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                assert_eq!(i2c_writes(&shared), vec![vec![0x01], vec![0x01], vec![0x00]]);
+            }
+
+            // ===============================================================
+            // Section 7.5 — assertion between C0 and GPIO arming.
+            //
+            // This rejects the "consume the flags, then wait for an edge"
+            // variant, which would otherwise pass section 7.2.
+            // ===============================================================
+
+            fn assertion_before_arming_case(byte1: u8) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let assertion: fn(&mut World) = if asserted_high { assert_high } else { assert_low };
+                let want = if asserted_high { PinOp::WaitHigh } else { PinOp::WaitLow };
+
+                let (shared, mut tmp) = build(Setup {
+                    level_high: !asserted_high,
+                    // C0 sees no flags, but the alert asserts before the
+                    // waiter gets a chance to arm the GPIO. No further
+                    // transition ever occurs.
+                    steps: vec![
+                        cfg(INTERRUPT, byte1).effect(assertion),
+                        cfg(INTERRUPT, byte1),
+                        temp(T80),
+                    ],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+
+                assert_eq!(
+                    pin_calls(&shared),
+                    vec![want],
+                    "an already-active level must be accepted; an edge wait would park forever"
+                );
+                assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                assert_eq!(i2c_writes(&shared), vec![vec![0x01], vec![0x01], vec![0x00]]);
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            #[test]
+            fn interrupt_active_low_accepts_assertion_that_beat_gpio_arming() {
+                assertion_before_arming_case(ACTIVE_LOW);
+            }
+
+            #[test]
+            fn interrupt_active_high_accepts_assertion_that_beat_gpio_arming() {
+                assertion_before_arming_case(ACTIVE_HIGH);
+            }
+
+            // ===============================================================
+            // Sections 7.6 / 7.7 — comparator mode must keep working.
+            // ===============================================================
+
+            fn comparator_case(byte1: u8, start_asserted: bool) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let want = if asserted_high { PinOp::WaitHigh } else { PinOp::WaitLow };
+
+                let (shared, mut tmp) = build(Setup {
+                    level_high: if start_asserted { asserted_high } else { !asserted_high },
+                    steps: vec![cfg(COMPARATOR, byte1), temp(T80)],
+                    ..Default::default()
+                });
+
+                let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                let mut result = poll_once(fut.as_mut());
+                if !start_asserted {
+                    assert!(result.is_pending(), "must park until the level becomes active");
+                    shared.lock().unwrap().set_level(asserted_high);
+                    result = poll_once(fut.as_mut());
+                }
+
+                assert_eq!(
+                    pin_calls(&shared),
+                    vec![want],
+                    "exactly one level wait, no InputPin sampling"
+                );
+                assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x01], vec![0x00]],
+                    "comparator mode performs no post-wait acknowledgment"
+                );
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            #[test]
+            fn comparator_active_low_already_low_completes_immediately() {
+                comparator_case(ACTIVE_LOW, true);
+            }
+
+            #[test]
+            fn comparator_active_low_waits_for_low() {
+                comparator_case(ACTIVE_LOW, false);
+            }
+
+            #[test]
+            fn comparator_active_high_already_high_completes_immediately() {
+                comparator_case(ACTIVE_HIGH, true);
+            }
+
+            #[test]
+            fn comparator_active_high_waits_for_high() {
+                comparator_case(ACTIVE_HIGH, false);
+            }
+
+            /// Two consecutive comparator calls while the level stays active
+            /// must each complete after their own C0 and T. Comparator mode
+            /// does not latch, so nothing is consumed between calls.
+            fn comparator_repeated_calls_case(byte1: u8) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let want = if asserted_high { PinOp::WaitHigh } else { PinOp::WaitLow };
+
+                let (shared, mut tmp) = build(Setup {
+                    level_high: asserted_high,
+                    steps: vec![cfg(COMPARATOR, byte1), temp(T80), cfg(COMPARATOR, byte1), temp(T80)],
+                    ..Default::default()
+                });
+
+                for call in 0..2 {
+                    let result = {
+                        let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                        poll_once(fut.as_mut())
+                    };
+                    assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                    assert_eq!(
+                        take_log(&shared),
+                        vec![
+                            Op::WriteRead(vec![0x01], vec![COMPARATOR, byte1]),
+                            Op::PinCall(want),
+                            Op::PinDone(want),
+                            Op::WriteRead(vec![0x00], T80.to_vec()),
+                        ],
+                        "call {call} must perform exactly C0, one level wait, and T"
+                    );
+                }
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            #[test]
+            fn comparator_repeated_calls_while_level_stays_active() {
+                comparator_repeated_calls_case(ACTIVE_LOW);
+            }
+
+            #[test]
+            fn comparator_active_high_repeated_calls_while_level_stays_active() {
+                comparator_repeated_calls_case(ACTIVE_HIGH);
+            }
+
+            /// Section 7.7's branch-semantics test: comparator flags must not
+            /// substitute for the pin predicate.
+            fn comparator_flags_do_not_fast_path_case(byte1: u8) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let want = if asserted_high { PinOp::WaitHigh } else { PinOp::WaitLow };
+
+                let (shared, mut tmp) = build(Setup {
+                    // Flags set, but the modeled pin is inactive.
+                    level_high: !asserted_high,
+                    fl: true,
+                    fh: true,
+                    steps: vec![cfg(COMPARATOR, byte1), temp(T80)],
+                    ..Default::default()
+                });
+
+                let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                assert!(
+                    poll_once(fut.as_mut()).is_pending(),
+                    "comparator mode must take the level wait, never the interrupt fast path"
+                );
+                assert_eq!(pin_calls(&shared), vec![want]);
+
+                shared.lock().unwrap().set_level(asserted_high);
+                let result = poll_once(fut.as_mut());
+                assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                assert_eq!(i2c_writes(&shared), vec![vec![0x01], vec![0x00]]);
+            }
+
+            #[test]
+            fn comparator_active_low_entry_flags_do_not_take_fast_path() {
+                comparator_flags_do_not_fast_path_case(ACTIVE_LOW);
+            }
+
+            #[test]
+            fn comparator_active_high_entry_flags_do_not_take_fast_path() {
+                comparator_flags_do_not_fast_path_case(ACTIVE_HIGH);
+            }
+
+            // ===============================================================
+            // Section 7.8 — freshness and consecutive calls.
+            // ===============================================================
+
+            #[test]
+            fn waiter_uses_settings_from_its_own_entry_snapshot() {
+                let (shared, mut tmp) = build(Setup {
+                    // Nothing latched yet: the reconfiguration's own
+                    // read-modify-write must see clear flags.
+                    level_high: true,
+                    strict_pin: true,
+                    steps: vec![
+                        // sensor_mut().configure(): read-modify-write.
+                        cfg(COMPARATOR, ACTIVE_LOW),
+                        write(vec![0x01, 0x26, 0x90]),
+                        // C0 of the wait: the freshly programmed settings.
+                        cfg(INTERRUPT, ACTIVE_HIGH),
+                        temp(T25),
+                    ],
+                    ..Default::default()
+                });
+
+                let cfg_new = Config {
+                    thermostat_mode: Thermostat::Interrupt,
+                    alert_polarity: Polarity::ActiveHigh,
+                    ..Default::default()
+                };
+
+                let configured = {
+                    let mut fut = pin!(tmp.sensor_mut().configure(cfg_new));
+                    poll_once(fut.as_mut())
+                };
+                assert!(matches!(configured, Poll::Ready(Ok(()))));
+
+                // Now an ActiveHigh interrupt latches and ALERT asserts HIGH.
+                {
+                    let mut w = shared.lock().unwrap();
+                    w.fh = true;
+                    w.set_level(true);
+                }
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                assert!(pin_calls(&shared).is_empty());
+                assert_approx_eq!(degrees(result), 25.0, 1e-4);
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            /// No trailing acknowledgment on the fast path may consume the
+            /// event intended for the next call.
+            #[test]
+            fn two_consecutive_pending_interrupts_both_complete_without_gpio() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: false,
+                    fh: true,
+                    strict_pin: true,
+                    steps: vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high), temp(T80)],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                assert_eq!(
+                    take_log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![0x36, ACTIVE_LOW]),
+                        Op::WriteRead(vec![0x00], T80.to_vec()),
+                    ]
+                );
+
+                // A new condition latches.
+                {
+                    let mut w = shared.lock().unwrap();
+                    w.fh = true;
+                    w.set_level(false);
+                }
+                push_steps(
+                    &shared,
+                    vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high), temp(T80)],
+                );
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                assert_eq!(
+                    take_log(&shared),
+                    vec![
+                        Op::WriteRead(vec![0x01], vec![0x36, ACTIVE_LOW]),
+                        Op::WriteRead(vec![0x00], T80.to_vec()),
+                    ]
+                );
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            // ===============================================================
+            // Section 7.10 — error injection.
+            // ===============================================================
+
+            #[test]
+            fn c0_bus_error_stops_before_gpio_and_temperature() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: true,
+                    steps: vec![cfg(INTERRUPT, ACTIVE_LOW).err(I2cError::Bus)],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                expect_bus(&shared, result, I2cError::Bus);
+                assert!(pin_calls(&shared).is_empty());
+                assert_eq!(i2c_writes(&shared), vec![vec![0x01]]);
+            }
+
+            fn level_wait_pin_error_case(byte1: u8) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let want = if asserted_high { PinOp::WaitHigh } else { PinOp::WaitLow };
+
+                let (shared, mut tmp) = build(Setup {
+                    level_high: !asserted_high,
+                    pin_error: Some(PinError::Other),
+                    steps: vec![cfg(INTERRUPT, byte1)],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+
+                assert_eq!(pin_calls(&shared), vec![want], "the waiter must use a level wait");
+                expect_pin(&shared, result, PinError::Other);
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x01]],
+                    "a pin error must not trigger a cleanup acknowledgment or a temperature read"
+                );
+            }
+
+            #[test]
+            fn level_wait_pin_error_active_low_is_error_pin() {
+                level_wait_pin_error_case(ACTIVE_LOW);
+            }
+
+            #[test]
+            fn level_wait_pin_error_active_high_is_error_pin() {
+                level_wait_pin_error_case(ACTIVE_HIGH);
+            }
+
+            #[test]
+            fn c1_bus_error_prevents_the_temperature_read() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: false,
+                    steps: vec![
+                        cfg(INTERRUPT, ACTIVE_LOW),
+                        cfg(INTERRUPT, ACTIVE_LOW).err(I2cError::Bus),
+                    ],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+
+                assert_eq!(pin_calls(&shared), vec![PinOp::WaitLow]);
+                expect_bus(&shared, result, I2cError::Bus);
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x01], vec![0x01]],
+                    "no T after a failed C1"
+                );
+            }
+
+            #[test]
+            fn temperature_error_on_the_pending_fast_path_is_bus_error() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: false,
+                    fh: true,
+                    strict_pin: true,
+                    steps: vec![
+                        cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high),
+                        temp(T25).err(I2cError::Other),
+                    ],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                expect_bus(&shared, result, I2cError::Other);
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x01], vec![0x00]],
+                    "a failed T must not retry or read configuration again"
+                );
+
+                // The acknowledged event is gone; a second call must wait.
+                push_steps(&shared, vec![cfg(INTERRUPT, ACTIVE_LOW)]);
+                shared.lock().unwrap().strict_pin = false;
+                let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                assert!(
+                    poll_once(fut.as_mut()).is_pending(),
+                    "no replay is promised: the second call must wait for a new event"
+                );
+            }
+
+            #[test]
+            fn temperature_error_on_the_post_wait_path_is_bus_error() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: false,
+                    steps: vec![
+                        cfg(INTERRUPT, ACTIVE_LOW),
+                        cfg(INTERRUPT, ACTIVE_LOW),
+                        temp(T80).err(I2cError::Other),
+                    ],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                assert_eq!(pin_calls(&shared), vec![PinOp::WaitLow]);
+                expect_bus(&shared, result, I2cError::Other);
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            #[test]
+            fn temperature_error_on_the_comparator_path_is_bus_error() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: false,
+                    steps: vec![cfg(COMPARATOR, ACTIVE_LOW), temp(T80).err(I2cError::Other)],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                assert_eq!(pin_calls(&shared), vec![PinOp::WaitLow]);
+                expect_bus(&shared, result, I2cError::Other);
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            // ===============================================================
+            // R1 — C0's side effect happens before the transaction completes.
+            // ===============================================================
+
+            /// C0 acknowledges the chip and *then* fails. The event is gone;
+            /// no GPIO, T, or cleanup may run, and the retry finds clear
+            /// flags and must wait.
+            #[test]
+            fn c0_failure_after_acknowledgment_loses_the_event_and_waits_on_retry() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: false,
+                    fh: true,
+                    steps: vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high).err(I2cError::Bus)],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                expect_bus(&shared, result, I2cError::Bus);
+                assert!(pin_calls(&shared).is_empty(), "a failed C0 must not touch GPIO");
+                assert_eq!(i2c_writes(&shared), vec![vec![0x01]], "no T and no cleanup read");
+
+                // Retry: flags are clear, the pin is released, so the level
+                // wait must park.
+                push_steps(&shared, vec![cfg(INTERRUPT, ACTIVE_LOW)]);
+                let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                assert!(poll_once(fut.as_mut()).is_pending());
+                assert_eq!(pin_calls(&shared), vec![PinOp::WaitLow]);
+            }
+
+            /// C0 fails *before* acknowledging. The flag survives, so the
+            /// retry captures it on the fast path.
+            #[test]
+            fn c0_failure_before_acknowledgment_preserves_the_flag_for_the_retry() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: false,
+                    fh: true,
+                    steps: vec![cfg(INTERRUPT, ACTIVE_LOW).err(I2cError::Bus)],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                expect_bus(&shared, result, I2cError::Bus);
+                assert!(pin_calls(&shared).is_empty());
+
+                push_steps(
+                    &shared,
+                    vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high), temp(T80)],
+                );
+                shared.lock().unwrap().strict_pin = true;
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            /// C0 acknowledges and then never completes. Dropping the waiter
+            /// must not schedule any cleanup.
+            #[test]
+            fn dropping_a_waiter_stuck_in_c0_performs_no_cleanup() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: false,
+                    fh: true,
+                    steps: vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high).pending()],
+                    ..Default::default()
+                });
+
+                {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    assert!(poll_once(fut.as_mut()).is_pending());
+                }
+
+                assert_eq!(i2c_writes(&shared), vec![vec![0x01]]);
+                assert!(pin_calls(&shared).is_empty());
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            // ===============================================================
+            // R2 — drop the GPIO wait after notification but before the task
+            // resumes.
+            // ===============================================================
+
+            fn dropped_after_notification_case(byte1: u8) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let want = if asserted_high { PinOp::WaitHigh } else { PinOp::WaitLow };
+
+                let (shared, mut tmp) = build(Setup {
+                    level_high: !asserted_high,
+                    steps: vec![cfg(INTERRUPT, byte1)],
+                    ..Default::default()
+                });
+
+                {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    assert!(poll_once(fut.as_mut()).is_pending());
+                    assert_eq!(pin_calls(&shared), vec![want]);
+
+                    // The chip latches and ALERT asserts; the task is woken
+                    // but dropped before it resumes.
+                    let mut w = shared.lock().unwrap();
+                    w.fh = true;
+                    w.set_level(asserted_high);
+                }
+
+                assert_eq!(i2c_writes(&shared), vec![vec![0x01]], "no C1 and no T after the drop");
+
+                // The next call captures the surviving flag on the fast path.
+                push_steps(&shared, vec![cfg(INTERRUPT, byte1), temp(T80)]);
+                shared.lock().unwrap().strict_pin = true;
+                take_log(&shared);
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            #[test]
+            fn dropping_the_gpio_wait_after_notification_active_low_keeps_the_event() {
+                dropped_after_notification_case(ACTIVE_LOW);
+            }
+
+            #[test]
+            fn dropping_the_gpio_wait_after_notification_active_high_keeps_the_event() {
+                dropped_after_notification_case(ACTIVE_HIGH);
+            }
+
+            // ===============================================================
+            // R3 — C1 cancellation / error with both acknowledgment outcomes.
+            // ===============================================================
+
+            /// C1 fails *after* its read has already acknowledged the chip.
+            ///
+            /// The entry snapshot must be empty, otherwise the waiter takes
+            /// the pending fast path and never reaches C1 at all (design
+            /// §2.4 step 3, invariants §2.9.1/§2.9.3). The latch therefore
+            /// appears *during* the level wait, so the acknowledgment C1
+            /// performs is a real one — and the error that follows it
+            /// destroys the only evidence of that event.
+            #[test]
+            fn c1_error_after_acknowledgment_leaves_nothing_to_replay() {
+                let (shared, mut tmp) = build(Setup {
+                    // ALERT inactive and nothing latched: the waiter must
+                    // take the level-wait path.
+                    level_high: true,
+                    steps: vec![
+                        cfg(INTERRUPT, ACTIVE_LOW),
+                        // `.effect` runs before the outcome: this read
+                        // acknowledges the chip and *then* the bus fails.
+                        cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high).err(I2cError::Bus),
+                    ],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    assert!(poll_once(fut.as_mut()).is_pending(), "must park until ALERT asserts");
+                    assert_eq!(pin_calls(&shared), vec![PinOp::WaitLow]);
+
+                    // The event the caller is waiting for now latches.
+                    {
+                        let mut w = shared.lock().unwrap();
+                        w.fh = true;
+                        w.set_level(false);
+                    }
+
+                    // The level wait completes, C1 acknowledges the chip,
+                    // and only then does the bus fail.
+                    poll_once(fut.as_mut())
+                };
+
+                expect_bus(&shared, result, I2cError::Bus);
+                assert!(
+                    !shared.lock().unwrap().fh,
+                    "C1 must really have acknowledged the chip before failing — otherwise this \
+                     test is not exercising post-acknowledgment failure at all"
+                );
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x01], vec![0x01]],
+                    "a failed C1 performs no T and no cleanup read"
+                );
+
+                // The acknowledged event is unrecoverable: the retry finds
+                // clear flags and a released pin, and must wait for a new
+                // event rather than replaying the lost one.
+                push_steps(&shared, vec![cfg(INTERRUPT, ACTIVE_LOW)]);
+                let mut retry = pin!(tmp.wait_for_temperature_threshold());
+                assert!(poll_once(retry.as_mut()).is_pending(), "nothing to replay");
+                assert_eq!(pin_calls(&shared), vec![PinOp::WaitLow, PinOp::WaitLow]);
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            /// C1 fails *without* the chip having acknowledged.
+            ///
+            /// The latch therefore survives in the hardware, and the retry
+            /// must be able to fast-path on the **original** event. The test
+            /// never re-injects the flag after the failure: the FH the retry
+            /// sees is the very one latched during the level wait. That is
+            /// what distinguishes this from
+            /// [`c1_error_after_acknowledgment_leaves_nothing_to_replay`].
+            #[test]
+            fn c1_error_before_acknowledgment_preserves_the_flag_for_the_retry() {
+                let (shared, mut tmp) = build(Setup {
+                    // ALERT inactive and nothing latched: the waiter must
+                    // take the level-wait path.
+                    level_high: true,
+                    steps: vec![
+                        cfg(INTERRUPT, ACTIVE_LOW),
+                        // No `.effect`: the bus fails before this read can
+                        // acknowledge anything.
+                        cfg(INTERRUPT, ACTIVE_LOW).err(I2cError::Bus),
+                    ],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    assert!(poll_once(fut.as_mut()).is_pending(), "must park until ALERT asserts");
+                    assert_eq!(pin_calls(&shared), vec![PinOp::WaitLow]);
+
+                    // The event the caller is waiting for latches now, so it
+                    // is genuinely pending when C1 fails.
+                    {
+                        let mut w = shared.lock().unwrap();
+                        w.fh = true;
+                        w.set_level(false);
+                    }
+
+                    poll_once(fut.as_mut())
+                };
+
+                expect_bus(&shared, result, I2cError::Bus);
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x01], vec![0x01]],
+                    "a failed C1 performs no T and no cleanup read"
+                );
+
+                // The decisive assertion: the chip never acknowledged, so the
+                // latch is still there to be recovered.
+                assert!(
+                    shared.lock().unwrap().fh,
+                    "C1 failed before acknowledging, so FH must still be latched — without this \
+                     the retry below would be replaying an event the test injected rather than \
+                     the original one"
+                );
+
+                // Retry. Note there is no `w.fh = true` here: the flag the
+                // retry captures is the original event. `strict_pin` makes
+                // any GPIO touch a failure, so this can only pass via the
+                // pending fast path.
+                push_steps(
+                    &shared,
+                    vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high), temp(T80)],
+                );
+                shared.lock().unwrap().strict_pin = true;
+                take_log(&shared);
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x01], vec![0x00]],
+                    "the preserved event is delivered by C0 + T alone"
+                );
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            #[test]
+            fn dropping_a_waiter_stuck_in_c1_performs_no_cleanup() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: false,
+                    steps: vec![cfg(INTERRUPT, ACTIVE_LOW), cfg(INTERRUPT, ACTIVE_LOW).pending()],
+                    ..Default::default()
+                });
+
+                {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    assert!(poll_once(fut.as_mut()).is_pending());
+                }
+
+                assert_eq!(pin_calls(&shared), vec![PinOp::WaitLow]);
+                assert_eq!(i2c_writes(&shared), vec![vec![0x01], vec![0x01]], "no T and no cleanup");
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            // ===============================================================
+            // R4 — the observed level returns inactive before resumption.
+            // ===============================================================
+
+            fn level_goes_inactive_before_resumption_case(byte1: u8) {
+                let asserted_high = byte1 == ACTIVE_HIGH;
+                let want = if asserted_high { PinOp::WaitHigh } else { PinOp::WaitLow };
+
+                let (shared, mut tmp) = build(Setup {
+                    level_high: !asserted_high,
+                    steps: vec![cfg(INTERRUPT, byte1), cfg(INTERRUPT, byte1), temp(T80)],
+                    ..Default::default()
+                });
+
+                let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                assert!(poll_once(fut.as_mut()).is_pending());
+                assert_eq!(pin_calls(&shared), vec![want]);
+
+                // The level went active (completing the wait) and back again
+                // before the woken task ran.
+                shared.lock().unwrap().pulse_level(asserted_high);
+
+                let result = poll_once(fut.as_mut());
+                assert_approx_eq!(degrees(result), 80.0, 1e-4);
+                assert_eq!(
+                    pin_calls(&shared),
+                    vec![want],
+                    "the driver must not resample InputPin after a completed level wait"
+                );
+                assert_eq!(i2c_writes(&shared), vec![vec![0x01], vec![0x01], vec![0x00]]);
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            #[test]
+            fn active_low_level_going_inactive_before_resumption_still_completes() {
+                level_goes_inactive_before_resumption_case(ACTIVE_LOW);
+            }
+
+            #[test]
+            fn active_high_level_going_inactive_before_resumption_still_completes() {
+                level_goes_inactive_before_resumption_case(ACTIVE_HIGH);
+            }
+
+            // ===============================================================
+            // R5 — a new event survives a T failure or cancellation.
+            // ===============================================================
+
+            #[test]
+            fn new_event_survives_a_temperature_failure() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: false,
+                    fh: true,
+                    strict_pin: true,
+                    steps: vec![
+                        // C0 captures and clears event A ...
+                        cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high),
+                        // ... and T fails.
+                        temp(T80).err(I2cError::Other),
+                    ],
+                    ..Default::default()
+                });
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                expect_bus(&shared, result, I2cError::Other);
+
+                // Event B latches afterwards.
+                {
+                    let mut w = shared.lock().unwrap();
+                    w.fl = true;
+                    w.set_level(false);
+                }
+                push_steps(
+                    &shared,
+                    vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high), temp(T25)],
+                );
+                take_log(&shared);
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                assert_approx_eq!(degrees(result), 25.0, 1e-4);
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x01], vec![0x00]],
+                    "event B is captured by the next C0 on the fast path"
+                );
+                assert_eq!(steps_left(&shared), 0);
+            }
+
+            #[test]
+            fn new_event_survives_cancellation_during_the_temperature_read() {
+                let (shared, mut tmp) = build(Setup {
+                    level_high: false,
+                    fh: true,
+                    strict_pin: true,
+                    steps: vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high), temp(T80).pending()],
+                    ..Default::default()
+                });
+
+                {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    assert!(poll_once(fut.as_mut()).is_pending());
+
+                    // Event B latches while T is in flight.
+                    let mut w = shared.lock().unwrap();
+                    w.fh = true;
+                    w.set_level(false);
+                }
+
+                assert_eq!(
+                    i2c_writes(&shared),
+                    vec![vec![0x01], vec![0x00]],
+                    "dropping the waiter must not perform a cleanup configuration read"
+                );
+
+                push_steps(
+                    &shared,
+                    vec![cfg(INTERRUPT, ACTIVE_LOW).effect(ack_release_high), temp(T25)],
+                );
+                take_log(&shared);
+
+                let result = {
+                    let mut fut = pin!(tmp.wait_for_temperature_threshold());
+                    poll_once(fut.as_mut())
+                };
+                assert_approx_eq!(degrees(result), 25.0, 1e-4);
+                assert_eq!(steps_left(&shared), 0);
+            }
         }
     }
 }
