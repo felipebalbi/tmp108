@@ -1161,6 +1161,14 @@ The other destructive configuration entry points and their documentation remain 
 
 ### 9.9 #62 boundary
 
+> **SUPERSEDED (2026-09-24).** The fallible-`Mode`-decoder rationale in
+> §§3.4, 7.9 and this section, including the DDSL/generated-code boundary
+> below, is historical and superseded by #62: `M = 0b11` now decodes as
+> `Mode::Continuous`. Snapshot decoding remains mode-independent because
+> its result does not contain functional mode; the design's conclusions
+> still stand, only that justification changed. The text below is retained
+> unaltered as a historical record. See `CHANGELOG.md` under `[Unreleased]`.
+
 The generated `Mode` decoder rejects M=`0b11`, even though the task identifies that encoding as valid continuous mode.
 
 The selected implementation avoids that path:

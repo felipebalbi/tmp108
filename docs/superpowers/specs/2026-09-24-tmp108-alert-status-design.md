@@ -940,6 +940,14 @@ Add new tests alongside them.
 
 ### 8.1 Pure layer: `tests::ops_tests`
 
+> **SUPERSEDED (2026-09-24).** The fallible-`Mode`-decoder rationale behind
+> this section's `m()` restriction and §5.2's #62 concern is historical
+> and superseded by #62: `M = 0b11` now decodes as `Mode::Continuous`.
+> Snapshot decoding remains mode-independent because its result does not
+> contain functional mode; the design's conclusions still stand, only
+> that justification changed. The text below is retained unaltered as a
+> historical record. See `CHANGELOG.md` under `[Unreleased]`.
+
 - Exhaust all four inputs to `interrupt_alert_cause`.
 - Preserve the existing exhaustive snapshot decoder tests over all 65,536
   register patterns.

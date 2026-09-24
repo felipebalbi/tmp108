@@ -6,6 +6,59 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking
+
+- `Mode` decoding is now total (#62). Both `M = 0b10` and `M = 0b11`
+  decode as `Mode::Continuous`; previously `0b11` was rejected. TMP108
+  datasheet [SBOS663A](https://www.ti.com/lit/gpn/tmp108) §7.4.3,
+  "Continuous Conversion Mode (M1 = 1)", defines continuous conversion
+  by M1 alone, regardless of M0. Confirmed on silicon with a Pico de
+  Gallo and TMP108 at `0x48`: `M = 0b11` converts and reads back as `11`,
+  using FH as the conversion detector and shutdown as the control.
+  This supersedes the 0.6.0 entry's characterisation of `0b11` as
+  "reserved"; that entry records the rejection test shipped at the time.
+
+  **Public API delta from 0.6.0:**
+  - `From<u8> for Mode` is added: `0` maps to `Shutdown`, `1` to
+    `OneShot`, and every other `u8` value to `Continuous`.
+  - `Default for Mode` is added and returns `Continuous`, consistent
+    with the part's power-on reset value `0x1022` (`M = 0b10`).
+  - The explicit `TryFrom<u8> for Mode` implementation is removed.
+    `Mode::try_from` remains available through the standard blanket
+    implementation, but `<Mode as TryFrom<u8>>::Error` changes from
+    `device_driver::ConversionError<u8>` to `core::convert::Infallible`.
+    Decoding cannot fail: there is no conversion error to handle.
+  - Encoding is unchanged: `From<Mode> for u8` still encodes
+    `Mode::Continuous` as canonical `0b10`, not `0b11`.
+
+  **Migration:** use `Mode::from(raw)` instead of fallible conversion
+  and remove conversion-error handling. These are alternative helper
+  definitions before and after the change:
+
+  ```rust
+  // Before (0.6.0; naming this error requires a direct device-driver dependency)
+  fn decode_mode(raw: u8) -> Result<tmp108::Mode, device_driver::ConversionError<u8>> {
+      tmp108::Mode::try_from(raw)
+  }
+  ```
+
+  ```rust
+  // After: total conversion, with no error branch
+  fn decode_mode(raw: u8) -> tmp108::Mode {
+      tmp108::Mode::from(raw)
+  }
+  ```
+
+  Callers retaining `TryFrom` must update any explicit error type or
+  associated-type bound to `core::convert::Infallible`. `ConversionError`
+  belongs to `device_driver` and is not re-exported by `tmp108`; downstream
+  code naming it directly already needed a direct `device-driver`
+  dependency. The generated `Configuration::m()` is not downstream-public
+  because `mod inner` is private; the conversion change is public through
+  the re-exported `Mode` type. `Polarity`, `Hysteresis`, `ConversionRate`
+  and `Thermostat` retain their fallible `TryFrom` implementations and
+  are unaffected.
+
 ### Added
 
 - Observable alert cause through `AlertTmp108::wait_for_alert` (#67),

@@ -158,6 +158,13 @@ drop cleanup runs and no speculative configuration read is allowed.
 
 ## 5. Explicit non-guarantees and residual risks
 
+> **SUPERSEDED (2026-09-24).** The #62 reference below and the related-issues
+> "unchanged" label are historical, scoped to #58. #62 has since been fixed:
+> `M = 0b11` now decodes as `Mode::Continuous`. The design's conclusions
+> still stand because they never depended on mode decoding. The text below
+> is retained unaltered as a historical record. See `CHANGELOG.md` under
+> `[Unreleased]`.
+
 - No durable delivery across wrapper destruction, decomposition, restart,
   or power loss; no event queue or background task.
 - No exactly-once notification per physical excursion. Relatching in
