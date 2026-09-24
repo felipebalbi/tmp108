@@ -506,9 +506,7 @@ pub(crate) mod ops {
     /// Decode a configuration-register snapshot into its settings and
     /// the ALERT status flags it returned.
     ///
-    /// Pure, total, and allocation-free. Notably it does **not** call
-    /// `c.m()`: the generated `Mode` decoder rejects `M = 0b11`
-    /// (issue #62), and this fix must not inherit that defect.
+    /// Pure, total, and allocation-free.
     #[cfg(feature = "embedded-sensors-hal-async")]
     pub(crate) fn decode_alert_snapshot(c: Configuration) -> AlertSnapshot {
         AlertSnapshot {
@@ -2811,11 +2809,11 @@ mod tests {
 
             /// Exhaust all 65,536 `[u8; 2]` patterns.
             ///
-            /// This includes every `M = 0b11` encoding, which the
-            /// generated `Mode` decoder rejects (issue #62). The
-            /// snapshot decoder must not call `m()`, so it has to
-            /// survive them; a future refactor that reintroduces that
-            /// dependency panics here.
+            /// The decoder is total: a configuration read can return any
+            /// bit pattern the bus produces, including words the driver
+            /// never wrote, so every one of them must decode without
+            /// panicking and must agree with the settings decoder. This
+            /// exhaustive walk checks every input.
             #[test]
             fn decoding_is_total_and_matches_the_settings_decoder() {
                 for word in 0..=u16::MAX {
@@ -2878,9 +2876,10 @@ mod tests {
             /// byte (SBOS663A, Table 8), and **no other bit** in the
             /// register can influence the cause.
             ///
-            /// Walking all 65,536 patterns includes every `M = 0b11`
-            /// encoding, which the generated `Mode` decoder rejects
-            /// (issue #62). Nothing on this path may call `c.m()`.
+            /// Walking all 65,536 patterns is what makes the claim
+            /// two-sided: it shows not only that FL/FH decide the cause
+            /// but that nothing else in the register can perturb it, for
+            /// any value of any other field.
             #[test]
             fn only_bits_3_and_4_of_byte_0_decide_the_cause() {
                 for word in 0..=u16::MAX {
@@ -2900,7 +2899,9 @@ mod tests {
             }
 
             /// The same cause for every setting of every other bit,
-            /// holding FL/FH fixed. `M = 0b11` is included explicitly.
+            /// holding FL/FH fixed — the complement of the test above,
+            /// sweeping the 16,384 non-flag words under each of the four
+            /// flag combinations.
             #[test]
             fn other_configuration_bits_are_irrelevant() {
                 for flags in 0..4_u8 {
@@ -2911,8 +2912,7 @@ mod tests {
 
                     for other in 0..=u16::MAX {
                         let other = other.to_le_bytes();
-                        // Everything except bits 3 and 4 of byte 0 —
-                        // M = 0b11 among them.
+                        // Everything except bits 3 and 4 of byte 0.
                         let bytes = [(other[0] & !0x18) | flag_bits, other[1]];
                         let snapshot = decode_alert_snapshot(Configuration::from(bytes));
                         assert_eq!(
@@ -3157,11 +3157,8 @@ mod tests {
             /// — must survive `apply_config` untouched.
             const MODELLED_MASK: u16 = 0b1011_0000_0110_0100;
 
-            /// The `m` field, 1:0. Encoding 3 is reserved.
-            const MODE_MASK: u16 = 0b11;
-
-            /// The reserved `m` encoding: three variants in two bits.
-            const RESERVED_MODE: u16 = 3;
+            /// The `m` field, bits 1:0 of the configuration register.
+            const MODE_FIELD: u16 = 0b11;
 
             /// The 64 `Config` values, applied to `f` one at a time.
             ///
@@ -3291,19 +3288,44 @@ mod tests {
             }
 
             #[test]
-            fn the_mode_getter_fails_exactly_on_the_reserved_encoding() {
-                // Two-sided: reserved encodings must fail, and nothing
-                // else may. A getter that widened its failure set would
-                // reject perfectly legal words.
+            fn the_mode_getter_decodes_every_register_word() {
+                // Every one of the four encodings of the two-bit M field
+                // names a real functional mode. M1 alone selects
+                // continuous conversion — datasheet SBOS663A §7.4.3 is
+                // titled "Continuous Conversion Mode (M1 = 1)" and says
+                // nothing about M0 — so both 0b10 and 0b11 are
+                // continuous. Confirmed on silicon (issue #62): a part
+                // written with M = 0b11 converts and reads back as 0b11.
                 for word in 0..=u16::MAX {
                     let reg = Configuration::from(word.to_le_bytes());
-                    let reserved = (word & MODE_MASK) == RESERVED_MODE;
-                    assert_eq!(
-                        reg.m().is_err(),
-                        reserved,
-                        "word {word:#06x}: m() error state disagrees with the reserved encoding"
-                    );
+                    let want = match word & MODE_FIELD {
+                        0b00 => Mode::Shutdown,
+                        0b01 => Mode::OneShot,
+                        // 0b10 and 0b11 both have M1 set.
+                        _ => Mode::Continuous,
+                    };
+                    assert_eq!(reg.m(), want, "word {word:#06x}: m() decoded the M field wrongly");
                 }
+            }
+
+            #[test]
+            #[allow(clippy::unnecessary_fallible_conversions)]
+            fn mode_three_converts_to_continuous() {
+                // Keep `TryFrom` so this test body also compiles against
+                // the pre-fix explicit implementation and fails its
+                // assertion there. Exercising that baseline requires
+                // isolating this test from tests requiring the new API.
+                // The lint allowance is intentional: clippy is right that
+                // the conversion cannot fail under the current code —
+                // that is the fact under test. Do **not** "simplify" this
+                // to `Mode::from(3u8)`.
+                //
+                // M1 alone selects continuous mode (SBOS663A §7.4.3), so
+                // 0b11 is continuous, not an error.
+                assert!(
+                    matches!(Mode::try_from(3u8), Ok(Mode::Continuous)),
+                    "M = 0b11 must decode, not error"
+                );
             }
         }
 

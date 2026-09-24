@@ -1,5 +1,6 @@
-//! Compile-only test: Config field types and driver types must be
-//! reachable from outside the crate.
+//! Public-API reachability and contract pins: Config field types,
+//! driver types and the alert types must be nameable from outside the
+//! crate, and a few of their runtime contracts are asserted here too.
 use tmp108::{Celsius, Config, ConversionRate, Hysteresis, Mode, OutOfRange, Polarity, Thermostat};
 
 #[test]
@@ -14,6 +15,41 @@ fn config_with_explicit_fields_compiles() {
     let _ = cfg;
     // Also pin Mode (re-exported even though not a Config field).
     let _ = Mode::Continuous;
+}
+
+/// `Mode`'s conversions are public surface: `Mode` is `pub use`'d, so
+/// its `From<u8>`, `Default` and the `TryFrom<u8>` that follows from
+/// `From` are all callable by downstream code and are semver-relevant.
+///
+/// `From<u8>` is total because every encoding of the two-bit M field
+/// names a real mode: `M1 = 1` selects continuous conversion regardless
+/// of `M0` (datasheet SBOS663A §7.4.3), so `3` is `Continuous`, not an
+/// error. Because the conversion is infallible, the blanket
+/// `TryFrom` applies and its `Error` is `Infallible`; pinning that
+/// associated type is what catches a regression to a fallible decoder.
+#[test]
+// The associated-type pin below (`<Mode as TryFrom<u8>>::Error`) is
+// what fixes the error type as `Infallible`; the `try_from` call alone
+// would not. clippy's "use the infallible one" suggestion would remove
+// the call that keeps that pin exercised.
+#[allow(clippy::unnecessary_fallible_conversions)]
+fn mode_conversions_are_public_and_total() {
+    fn infallible(_: core::convert::Infallible) {}
+
+    assert_eq!(Mode::from(0u8), Mode::Shutdown);
+    assert_eq!(Mode::from(1u8), Mode::OneShot);
+    assert_eq!(Mode::from(2u8), Mode::Continuous);
+    assert_eq!(Mode::from(3u8), Mode::Continuous);
+
+    // Power-on reset is 0x1022, i.e. M = 0b10.
+    assert_eq!(Mode::default(), Mode::Continuous);
+
+    // Pin `<Mode as TryFrom<u8>>::Error == Infallible`.
+    let _: fn(<Mode as TryFrom<u8>>::Error) = infallible;
+    assert_eq!(Mode::try_from(3u8), Ok(Mode::Continuous));
+
+    // The write path is unchanged: Continuous still encodes as 0b10.
+    assert_eq!(u8::from(Mode::Continuous), 2);
 }
 
 /// The temperature newtype and its parse error must be reachable from

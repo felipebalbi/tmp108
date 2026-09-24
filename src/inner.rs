@@ -278,11 +278,11 @@ impl Configuration {
     ///
     /// Device functional mode
     #[must_use]
-    pub fn m(&self) -> Result<Mode, <Mode as TryFrom<u8>>::Error> {
+    pub fn m(&self) -> Mode {
         let start = 0;
         let end = 1;
         let raw = unsafe { ::device_driver::ops::load::<u8, ::device_driver::ops::LE>(&self.bits, start, end) };
-        raw.try_into()
+        raw.into()
     }
     /// `bit 2` - Read the `tm` field.
     ///
@@ -765,6 +765,17 @@ impl ::device_driver::EnumIndex for Thermostat {
     }
 }
 /// Device functional mode
+///
+/// `From<u8>` converts an already-extracted M-field value, not
+/// a whole configuration byte: it neither masks nor validates
+/// its input. `0` is `Shutdown`, `1` is `OneShot`, and every
+/// other value is `Continuous`, because continuous conversion
+/// is selected by M1 alone (datasheet SBOS663A section 7.4.3,
+/// "Continuous Conversion Mode (M1 = 1)"), so `0b10` and
+/// `0b11` are both continuous. Confirmed on silicon (#62).
+///
+/// `Default` is the power-on mode, `Continuous`, matching the
+/// configuration reset value `0x1022` (M = `0b10`).
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum Mode {
@@ -775,17 +786,17 @@ pub enum Mode {
     #[doc(alias = "continuous")]
     Continuous = 2,
 }
-impl core::convert::TryFrom<u8> for Mode {
-    type Error = ::device_driver::ConversionError<u8>;
-    fn try_from(val: u8) -> Result<Self, Self::Error> {
+impl Default for Mode {
+    fn default() -> Self {
+        Self::Continuous
+    }
+}
+impl From<u8> for Mode {
+    fn from(val: u8) -> Self {
         match val {
-            0 => Ok(Self::Shutdown),
-            1 => Ok(Self::OneShot),
-            2 => Ok(Self::Continuous),
-            val => Err(::device_driver::ConversionError {
-                source: val,
-                target: "Mode",
-            }),
+            0 => Self::Shutdown,
+            1 => Self::OneShot,
+            _ => Self::default(),
         }
     }
 }

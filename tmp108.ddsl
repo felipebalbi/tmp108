@@ -21,12 +21,23 @@ device Inner {
             size-bytes: 2,
 
             /// Device functional mode
-            field m 1:0 -> _ as try
+            field m 1:0 -> _ as
                 /// Device functional mode
+                ///
+                /// `From<u8>` converts an already-extracted M-field value, not
+                /// a whole configuration byte: it neither masks nor validates
+                /// its input. `0` is `Shutdown`, `1` is `OneShot`, and every
+                /// other value is `Continuous`, because continuous conversion
+                /// is selected by M1 alone (datasheet SBOS663A section 7.4.3,
+                /// "Continuous Conversion Mode (M1 = 1)"), so `0b10` and
+                /// `0b11` are both continuous. Confirmed on silicon (#62).
+                ///
+                /// `Default` is the power-on mode, `Continuous`, matching the
+                /// configuration reset value `0x1022` (M = `0b10`).
                 enum Mode {
                     shutdown: 0,
                     one-shot: 1,
-                    continuous: 2,
+                    continuous: default 2,
                 },
             /// Thermostat mode
             field tm 2 -> _ as
