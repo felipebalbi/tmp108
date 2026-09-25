@@ -589,7 +589,7 @@ pub(crate) mod ops {
     const M_RAW_ONE_SHOT: u8 = 0b01;
 
     /// Number of completion polls
-    /// [`acquire_one_shot`][crate::Tmp108::acquire_one_shot] performs
+    /// [`one_shot`][crate::Tmp108::one_shot] performs
     /// after triggering the conversion.
     ///
     /// Eight polls, each preceded by a requested
@@ -1803,15 +1803,16 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// otherwise changing an unrelated setting would retrigger the
     /// conversion.
     ///
-    /// The consequence for callers hand-rolling a one-shot: do **not**
-    /// call `configure` between triggering the conversion and reading
-    /// its result. Configure first, then trigger.
+    /// The consequence: do **not** reconfigure the part while a
+    /// [`one_shot`][Self::one_shot] is in progress on it. `&mut self`
+    /// rules that out for a single handle, but not for a second handle
+    /// on a shared bus, nor for another master.
     ///
     /// The hazard is not a conversion that never completes — it is a
-    /// completion that appears to have already happened. A hand-rolled
-    /// poll detects completion by testing for `M == 0b00`, which is
-    /// exactly what `configure` writes. Software cannot distinguish
-    /// its own clearing of the command field from the chip's
+    /// completion that appears to have already happened. The
+    /// completion poll inside `one_shot` detects completion by testing
+    /// for `M == 0b00`, which is exactly what `configure` writes.
+    /// Nothing can distinguish that write from the chip's own
     /// completion transition, so the next poll reports "done"
     /// immediately and the temperature register is read while the
     /// conversion is in fact still running — deferred shutdown
@@ -1870,63 +1871,6 @@ impl<I2C: I2c> Tmp108<I2C> {
         Ok(Celsius::from_register(raw.into()))
     }
 
-    /// Trigger a one-shot conversion.
-    ///
-    /// Writes `M = 0b01` and returns as soon as that write is
-    /// acknowledged. That is *all* it does: it is a bare trigger, not
-    /// an acquisition.
-    ///
-    /// # This is not a complete one-shot
-    ///
-    /// A correct single-sample acquisition has two requirements this
-    /// method neither checks nor satisfies:
-    ///
-    /// - **The part must already be in shutdown.** Triggering from
-    ///   [`Mode::Continuous`] is meaningless — the part is already
-    ///   converting on its own cadence — and the datasheet defers
-    ///   shutdown until the conversion in progress finishes
-    ///   (SBOS663A 7.4.1), so entering shutdown needs a settling
-    ///   delay before the trigger.
-    /// - **Completion must be observed before the temperature
-    ///   register is read.** The chip clears `M` back to `0b00` when
-    ///   the conversion lands; until then the temperature register
-    ///   still holds the *previous* result. Reading it after a fixed
-    ///   delay, without polling `M`, silently returns stale data
-    ///   whenever the delay was short.
-    ///
-    /// Use [`acquire_one_shot`][Self::acquire_one_shot] to get the
-    /// whole sequence — prepare, settle, trigger, poll, read — done
-    /// for you. Reach for this method only when you are driving the
-    /// sequence yourself.
-    ///
-    /// Note also that [`configure`][Self::configure] stands down an
-    /// in-flight trigger, so it must not be called between this
-    /// method and the completion poll.
-    ///
-    /// # Errors
-    ///
-    /// `I2C::Error` when the I2C transaction fails
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
-    /// use tmp108::Tmp108;
-    /// // A one-shot is triggered from shutdown, so the chip reports
-    /// // M = 0b00 (0x1020) going in and is left at M = 0b01 (0x1021).
-    /// let i2c = Mock::new(&[
-    ///     Transaction::write_read(0x48, vec![0x01], vec![0x20, 0x10]),
-    ///     Transaction::write(0x48, vec![0x01, 0x21, 0x10]),
-    /// ]);
-    /// let mut tmp = Tmp108::new_with_a0_gnd(i2c);
-    /// tmp.one_shot().unwrap();
-    /// # let mut i2c = tmp.destroy();
-    /// # i2c.done();
-    /// ```
-    pub fn one_shot(&mut self) -> Result<(), I2C::Error> {
-        self.inner.configuration().modify(|r| r.set_m(Mode::OneShot))
-    }
-
     /// Acquire exactly one temperature sample by supervising a
     /// complete one-shot conversion.
     ///
@@ -1949,10 +1893,8 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// trigger. Neither condition is enforced by the driver, and
     /// neither is an unconditional guarantee; with a too-short delay
     /// or a concurrent writer the result can still be stale. That is
-    /// nonetheless a stronger footing than a fixed-delay
-    /// [`one_shot`][Self::one_shot] plus
-    /// [`temperature`][Self::temperature], which never observes
-    /// completion at all.
+    /// nonetheless a stronger footing than triggering a conversion and
+    /// sleeping on it, which never observes completion at all.
     ///
     /// # This operation is interrupt-destructive
     ///
@@ -2053,12 +1995,12 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// ]);
     /// let mut tmp = Tmp108::new_with_a0_gnd(i2c);
     /// let mut delay = NoopDelay::new();
-    /// let temp = tmp.acquire_one_shot(&mut delay, 40).unwrap();
+    /// let temp = tmp.one_shot(&mut delay, 40).unwrap();
     /// assert_eq!(temp.to_degrees(), 50.0);
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
     /// ```
-    pub fn acquire_one_shot<DELAY: DelayNs>(
+    pub fn one_shot<DELAY: DelayNs>(
         &mut self,
         delay: &mut DELAY,
         shutdown_settle_ms: u32,
@@ -2138,18 +2080,20 @@ impl<I2C: I2c> Tmp108<I2C> {
     ///
     /// - **Staying in Continuous:** discard the first reading.
     /// - **Wanting one fresh sample:** use
-    ///   [`acquire_one_shot`][Self::acquire_one_shot], which drives
-    ///   the part into shutdown, triggers, and waits for the chip to
-    ///   clear `M` back to `0b00` before it reads the temperature
-    ///   register.
+    ///   [`one_shot`][Self::one_shot], which drives the part into
+    ///   shutdown, triggers, and waits for the chip to clear `M` back
+    ///   to `0b00` before it reads the temperature register.
     ///
-    /// Do **not** reach for a bare [`one_shot`][Self::one_shot] plus a
-    /// delay. The datasheet conditions the trigger on the part already
+    /// What does *not* work is triggering a conversion and sleeping on
+    /// it. The datasheet conditions the trigger on the part already
     /// being shut down — *"When the device is in shutdown mode"* a
     /// write of `M = 0b01` starts a single conversion (SBOS663A
     /// §7.4.2) — which is exactly what a caller of *this* method is
     /// not. And a fixed delay never observes the completion the part
     /// does publish, so it cannot make the reading fresh, only likely.
+    /// [`one_shot`][Self::one_shot] establishes the precondition and
+    /// observes the completion, which is why it is the whole sequence
+    /// rather than a trigger.
     ///
     /// # I²C cost per call
     ///
@@ -2363,15 +2307,16 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// otherwise changing an unrelated setting would retrigger the
     /// conversion.
     ///
-    /// The consequence for callers hand-rolling a one-shot: do **not**
-    /// call `configure` between triggering the conversion and reading
-    /// its result. Configure first, then trigger.
+    /// The consequence: do **not** reconfigure the part while a
+    /// [`one_shot`][Self::one_shot] is in progress on it. `&mut self`
+    /// rules that out for a single handle, but not for a second handle
+    /// on a shared bus, nor for another master.
     ///
     /// The hazard is not a conversion that never completes — it is a
-    /// completion that appears to have already happened. A hand-rolled
-    /// poll detects completion by testing for `M == 0b00`, which is
-    /// exactly what `configure` writes. Software cannot distinguish
-    /// its own clearing of the command field from the chip's
+    /// completion that appears to have already happened. The
+    /// completion poll inside `one_shot` detects completion by testing
+    /// for `M == 0b00`, which is exactly what `configure` writes.
+    /// Nothing can distinguish that write from the chip's own
     /// completion transition, so the next poll reports "done"
     /// immediately and the temperature register is read while the
     /// conversion is in fact still running — deferred shutdown
@@ -2437,68 +2382,6 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
         Ok(Celsius::from_register(raw.into()))
     }
 
-    /// Trigger a one-shot conversion.
-    ///
-    /// Writes `M = 0b01` and returns as soon as that write is
-    /// acknowledged. That is *all* it does: it is a bare trigger, not
-    /// an acquisition.
-    ///
-    /// # This is not a complete one-shot
-    ///
-    /// A correct single-sample acquisition has two requirements this
-    /// method neither checks nor satisfies:
-    ///
-    /// - **The part must already be in shutdown.** Triggering from
-    ///   [`Mode::Continuous`] is meaningless — the part is already
-    ///   converting on its own cadence — and the datasheet defers
-    ///   shutdown until the conversion in progress finishes
-    ///   (SBOS663A 7.4.1), so entering shutdown needs a settling
-    ///   delay before the trigger.
-    /// - **Completion must be observed before the temperature
-    ///   register is read.** The chip clears `M` back to `0b00` when
-    ///   the conversion lands; until then the temperature register
-    ///   still holds the *previous* result. Reading it after a fixed
-    ///   delay, without polling `M`, silently returns stale data
-    ///   whenever the delay was short.
-    ///
-    /// Use [`acquire_one_shot`][Self::acquire_one_shot] to get the
-    /// whole sequence — prepare, settle, trigger, poll, read — done
-    /// for you. Reach for this method only when you are driving the
-    /// sequence yourself.
-    ///
-    /// Note also that [`configure`][Self::configure] stands down an
-    /// in-flight trigger, so it must not be called between this
-    /// method and the completion poll.
-    ///
-    /// # Errors
-    ///
-    /// `I2C::Error` when the I2C transaction fails
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-    /// # use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
-    /// use tmp108::AsyncTmp108;
-    /// // A one-shot is triggered from shutdown, so the chip reports
-    /// // M = 0b00 (0x1020) going in and is left at M = 0b01 (0x1021).
-    /// let i2c = Mock::new(&[
-    ///     Transaction::write_read(0x48, vec![0x01], vec![0x20, 0x10]),
-    ///     Transaction::write(0x48, vec![0x01, 0x21, 0x10]),
-    /// ]);
-    /// let mut tmp = AsyncTmp108::new_with_a0_gnd(i2c);
-    /// tmp.one_shot().await.unwrap();
-    /// # let mut i2c = tmp.destroy();
-    /// # i2c.done();
-    /// # });
-    /// ```
-    pub async fn one_shot(&mut self) -> Result<(), I2C::Error> {
-        self.inner
-            .configuration()
-            .modify_async(|r| r.set_m(Mode::OneShot))
-            .await
-    }
-
     /// Acquire exactly one temperature sample by supervising a
     /// complete one-shot conversion.
     ///
@@ -2521,10 +2404,8 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// trigger. Neither condition is enforced by the driver, and
     /// neither is an unconditional guarantee; with a too-short delay
     /// or a concurrent writer the result can still be stale. That is
-    /// nonetheless a stronger footing than a fixed-delay
-    /// [`one_shot`][Self::one_shot] plus
-    /// [`temperature`][Self::temperature], which never observes
-    /// completion at all.
+    /// nonetheless a stronger footing than triggering a conversion and
+    /// sleeping on it, which never observes completion at all.
     ///
     /// # This operation is interrupt-destructive
     ///
@@ -2628,13 +2509,13 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// ]);
     /// let mut tmp = AsyncTmp108::new_with_a0_gnd(i2c);
     /// let mut delay = NoopDelay::new();
-    /// let temp = tmp.acquire_one_shot(&mut delay, 40).await.unwrap();
+    /// let temp = tmp.one_shot(&mut delay, 40).await.unwrap();
     /// assert_eq!(temp.to_degrees(), 50.0);
     /// # let mut i2c = tmp.destroy();
     /// # i2c.done();
     /// # });
     /// ```
-    pub async fn acquire_one_shot<DELAY: AsyncDelayNs>(
+    pub async fn one_shot<DELAY: AsyncDelayNs>(
         &mut self,
         delay: &mut DELAY,
         shutdown_settle_ms: u32,
@@ -2785,7 +2666,7 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// See [`Tmp108::wait_for_temperature`] for the full semantics,
     /// including the stale-first-reading and per-call I²C cost notes.
     /// The supervised single-sample alternative described there is
-    /// [`acquire_one_shot`][Self::acquire_one_shot] on this type.
+    /// [`one_shot`][Self::one_shot] on this type.
     ///
     /// # Errors
     ///
@@ -3103,8 +2984,8 @@ impl<E: embedded_hal::i2c::Error + Eq, P: embedded_hal::digital::Error + Eq> Eq 
 
 /// Why a supervised one-shot acquisition did not produce a reading.
 ///
-/// Returned by [`Tmp108::acquire_one_shot`] and
-/// [`AsyncTmp108::acquire_one_shot`]. Distinct from [`Error`] because
+/// Returned by [`Tmp108::one_shot`] and
+/// [`AsyncTmp108::one_shot`]. Distinct from [`Error`] because
 /// the failure modes are entirely different: nothing here is an
 /// invalid *input*, and there is no ALERT pin in the sequence, so
 /// neither of `Error`'s non-bus variants can occur and `Error`'s `P`
@@ -4132,7 +4013,7 @@ mod tests {
             assert_ne!(bus_err, invalid_a);
         }
 
-        /// The pure decision functions behind `acquire_one_shot`.
+        /// The pure decision functions behind `one_shot`.
         ///
         /// The domain is the raw two-bit `M` field, so these walk it
         /// exhaustively rather than sampling. Everything else in the
@@ -4423,7 +4304,7 @@ mod tests {
             }
         }
 
-        /// The interleaving `acquire_one_shot` must produce when the
+        /// The interleaving `one_shot` must produce when the
         /// first poll finds the conversion still in flight and the
         /// second finds it complete.
         ///
@@ -4859,7 +4740,7 @@ mod tests {
         /// end of a case is what proves the sequence issued nothing
         /// further — that is how "no trigger was written" and "the
         /// temperature register was never read" are checked.
-        mod acquire_one_shot {
+        mod one_shot {
             use embedded_hal_mock::eh1::delay::{CheckedDelay, Transaction as Delay};
             use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
 
@@ -4906,7 +4787,7 @@ mod tests {
             ) -> Result<Celsius, OneShotError<embedded_hal::i2c::ErrorKind>> {
                 let mut tmp = Tmp108::new_with_a0_gnd(Mock::new(i2c));
                 let mut clock = CheckedDelay::new(delay);
-                let result = tmp.acquire_one_shot(&mut clock, SETTLE_MS);
+                let result = tmp.one_shot(&mut clock, SETTLE_MS);
                 clock.done();
                 let mut mock = tmp.destroy();
                 mock.done();
@@ -4942,7 +4823,7 @@ mod tests {
                 let mut sensor = Tmp108::new_with_a0_gnd(bus);
                 let mut clock = timeline::Clock::new(&log);
 
-                let temp = sensor.acquire_one_shot(&mut clock, SETTLE_MS).unwrap();
+                let temp = sensor.one_shot(&mut clock, SETTLE_MS).unwrap();
 
                 assert_approx_eq!(temp.to_degrees(), 50.0);
                 assert_eq!(timeline::events(&log), timeline::expected_one_shot_timeline(SETTLE_MS));
@@ -8990,7 +8871,7 @@ mod tests {
 
         /// Wire-level behaviour of the supervised one-shot sequence.
         ///
-        /// Mirror of `tests::blocking::acquire_one_shot`. The two
+        /// Mirror of `tests::blocking::one_shot`. The two
         /// modules are gated on opposite settings of the `async`
         /// feature and never run in the same build, so both copies
         /// have to exist for both shells to be covered.
@@ -9001,7 +8882,7 @@ mod tests {
         /// end of a case is what proves the sequence issued nothing
         /// further — that is how "no trigger was written" and "the
         /// temperature register was never read" are checked.
-        mod acquire_one_shot {
+        mod one_shot {
             use embedded_hal_mock::eh1::delay::{CheckedDelay, Transaction as Delay};
             use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
 
@@ -9048,7 +8929,7 @@ mod tests {
             ) -> Result<Celsius, OneShotError<embedded_hal::i2c::ErrorKind>> {
                 let mut tmp = AsyncTmp108::new_with_a0_gnd(Mock::new(i2c));
                 let mut clock = CheckedDelay::new(delay);
-                let result = tmp.acquire_one_shot(&mut clock, SETTLE_MS).await;
+                let result = tmp.one_shot(&mut clock, SETTLE_MS).await;
                 clock.done();
                 let mut mock = tmp.destroy();
                 mock.done();
@@ -9084,7 +8965,7 @@ mod tests {
                 let mut sensor = AsyncTmp108::new_with_a0_gnd(bus);
                 let mut clock = timeline::Clock::new(&log);
 
-                let temp = sensor.acquire_one_shot(&mut clock, SETTLE_MS).await.unwrap();
+                let temp = sensor.one_shot(&mut clock, SETTLE_MS).await.unwrap();
 
                 assert_approx_eq!(temp.to_degrees(), 50.0);
                 assert_eq!(timeline::events(&log), timeline::expected_one_shot_timeline(SETTLE_MS));

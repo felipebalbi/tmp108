@@ -210,12 +210,12 @@ fn one_shot_error_is_reachable_and_exhaustive() {
     eq_bound(copied);
 }
 
-/// `Tmp108::acquire_one_shot` is public surface: the generic delay
+/// `Tmp108::one_shot` is public surface: the generic delay
 /// parameter, the `shutdown_settle_ms` scalar, and the
 /// `Result<Celsius, OneShotError<I2C::Error>>` return type are all
 /// pinned here from outside the crate.
 #[allow(dead_code)]
-fn pin_blocking_acquire_one_shot() {
+fn pin_blocking_one_shot() {
     fn _type_check<I2C, DELAY>(
         tmp: &mut tmp108::Tmp108<I2C>,
         delay: &mut DELAY,
@@ -225,15 +225,15 @@ fn pin_blocking_acquire_one_shot() {
         I2C: embedded_hal::i2c::I2c,
         DELAY: embedded_hal::delay::DelayNs,
     {
-        tmp.acquire_one_shot(delay, settle_ms)
+        tmp.one_shot(delay, settle_ms)
     }
 }
 
-/// The async `acquire_one_shot` carries the same signature over the
+/// The async `one_shot` carries the same signature over the
 /// async I2C and delay traits.
 #[cfg(feature = "async")]
 #[allow(dead_code)]
-fn pin_async_acquire_one_shot() {
+fn pin_async_one_shot() {
     async fn _type_check<I2C, DELAY>(
         tmp: &mut tmp108::AsyncTmp108<I2C>,
         delay: &mut DELAY,
@@ -243,6 +243,6 @@ fn pin_async_acquire_one_shot() {
         I2C: embedded_hal_async::i2c::I2c,
         DELAY: embedded_hal_async::delay::DelayNs,
     {
-        tmp.acquire_one_shot(delay, settle_ms).await
+        tmp.one_shot(delay, settle_ms).await
     }
 }
