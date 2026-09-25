@@ -1,4 +1,4 @@
-//! TMP108 ALERT pin example — comparator mode (latched behavior).
+//! TMP108 ALERT pin example — comparator mode (level-following behavior).
 //!
 //! # Hardware
 //!
@@ -16,18 +16,27 @@
 //! In comparator mode the ALERT pin stays asserted until the temperature
 //! returns to within `(T_low + HYS, T_high − HYS)`. This example demonstrates
 //! that:
-//! - A `wait_for_temperature_threshold` call returns when the threshold is
-//!   first crossed.
-//! - A *second* call returns *immediately* while the pin is still asserted.
+//! - A `wait_for_temperature_threshold` call waits for the asserted pin level,
+//!   then reads the latest temperature conversion, not a trigger-time sample.
+//! - A *second* call skips waiting while the pin is still asserted; it still
+//!   performs its register reads. This is not a second threshold crossing.
 //! - Once the temperature falls back inside the hysteresis band, the pin
 //!   releases; the next call blocks again.
+//!
+//! Setup updates the configuration register and writes the low/high limit
+//! registers. Each waiter reads configuration, waits for the asserted level,
+//! then reads temperature. There is no post-wait configuration acknowledgment
+//! in comparator mode. The latest reading may be back inside the band by the
+//! time it is read.
 //!
 //! # Usage
 //!
 //! Run the example, then warm the TMP108 with a finger to trip the high
 //! threshold. Hold the warmth while the program prints two back-to-back
-//! readings demonstrating the latched pin, then let it cool below 28 C
-//! (high threshold 30 − 2 °C hysteresis) and observe the next call blocks.
+//! readings demonstrating the asserted pin. The third call also returns
+//! without waiting if the pin is still asserted: the program does not wait
+//! for cooling. It blocks only if the pin has released before that wait
+//! (after cooling below 28 C, high threshold 30 − 2 °C hysteresis).
 
 #[cfg(not(all(feature = "async", feature = "embedded-sensors-hal-async")))]
 fn main() {
@@ -74,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
         .wait_for_temperature_threshold()
         .await
         .map_err(|_| anyhow!("First wait failed"))?;
-    println!("First trigger: {t1:.2} C (pin is latched)");
+    println!("First ALERT observation; latest temperature: {t1:.2} C");
 
     // While the temperature is still above 30 - 2 = 28 C, this returns
     // immediately because the pin remains asserted.
@@ -82,14 +91,14 @@ async fn main() -> anyhow::Result<()> {
         .wait_for_temperature_threshold()
         .await
         .map_err(|_| anyhow!("Second wait failed"))?;
-    println!("Second trigger (immediate): {t2:.2} C");
+    println!("Second ALERT observation; latest temperature: {t2:.2} C");
 
-    println!("Let the sensor cool below 28 C; the next ALERT will reassert when temperature rises again...");
+    println!("Observing ALERT again (no wait for cooling; may return immediately)...");
     let t3 = tmp
         .wait_for_temperature_threshold()
         .await
         .map_err(|_| anyhow!("Third wait failed"))?;
-    println!("Third trigger: {t3:.2} C");
+    println!("Third ALERT observation; latest temperature: {t3:.2} C");
 
     Ok(())
 }

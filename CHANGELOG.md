@@ -4,6 +4,281 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Breaking
+
+- `Mode` decoding is now total (#62). Both `M = 0b10` and `M = 0b11`
+  decode as `Mode::Continuous`; previously `0b11` was rejected. TMP108
+  datasheet [SBOS663A](https://www.ti.com/lit/gpn/tmp108) §7.4.3,
+  "Continuous Conversion Mode (M1 = 1)", defines continuous conversion
+  by M1 alone, regardless of M0. Confirmed on silicon with a Pico de
+  Gallo and TMP108 at `0x48`: `M = 0b11` converts and reads back as `11`,
+  using FH as the conversion detector and shutdown as the control.
+  This supersedes the 0.6.0 entry's characterisation of `0b11` as
+  "reserved"; that entry records the rejection test shipped at the time.
+
+  **Public API delta from 0.6.0:**
+  - `From<u8> for Mode` is added: `0` maps to `Shutdown`, `1` to
+    `OneShot`, and every other `u8` value to `Continuous`.
+  - `Default for Mode` is added and returns `Continuous`, consistent
+    with the part's power-on reset value `0x1022` (`M = 0b10`).
+  - The explicit `TryFrom<u8> for Mode` implementation is removed.
+    `Mode::try_from` remains available through the standard blanket
+    implementation, but `<Mode as TryFrom<u8>>::Error` changes from
+    `device_driver::ConversionError<u8>` to `core::convert::Infallible`.
+    Decoding cannot fail: there is no conversion error to handle.
+  - Encoding is unchanged: `From<Mode> for u8` still encodes
+    `Mode::Continuous` as canonical `0b10`, not `0b11`.
+
+  **Migration:** use `Mode::from(raw)` instead of fallible conversion
+  and remove conversion-error handling. These are alternative helper
+  definitions before and after the change:
+
+  ```rust
+  // Before (0.6.0; naming this error requires a direct device-driver dependency)
+  fn decode_mode(raw: u8) -> Result<tmp108::Mode, device_driver::ConversionError<u8>> {
+      tmp108::Mode::try_from(raw)
+  }
+  ```
+
+  ```rust
+  // After: total conversion, with no error branch
+  fn decode_mode(raw: u8) -> tmp108::Mode {
+      tmp108::Mode::from(raw)
+  }
+  ```
+
+  Callers retaining `TryFrom` must update any explicit error type or
+  associated-type bound to `core::convert::Infallible`. `ConversionError`
+  belongs to `device_driver` and is not re-exported by `tmp108`; downstream
+  code naming it directly already needed a direct `device-driver`
+  dependency. The generated `Configuration::m()` is not downstream-public
+  because `mod inner` is private; the conversion change is public through
+  the re-exported `Mode` type. `Polarity`, `Hysteresis`, `ConversionRate`
+  and `Thermostat` retain their fallible `TryFrom` implementations and
+  are unaffected.
+
+### Added
+
+- Supervised single-sample acquisition through
+  `acquire_one_shot(&mut self, delay, shutdown_settle_ms: u32)` on both
+  `Tmp108` and `AsyncTmp108` (#60). The result is
+  `Result<Celsius, OneShotError<I2C::Error>>`; the new `OneShotError<E>`
+  distinguishes `Bus(E)`, `PreparationNotShutdown(Mode)`,
+  `UnexpectedMode(Mode)` and `Timeout`. This public API change is
+  **purely additive**: existing signatures and `Error<E, P>` are unchanged.
+
+  The helper requests shutdown, waits the caller-supplied settling delay,
+  requires a configuration re-read to report `M = 0b00`, then triggers a
+  one-shot. Each of up to eight completion polls delays 5 ms before reading:
+  `0b01` keeps polling, `0b00` completes, and `0b10` or `0b11` aborts with
+  `UnexpectedMode(Mode::Continuous)`. Temperature is read exactly once,
+  only after observed completion. Success deliberately leaves the part in
+  shutdown; the previous mode is not restored. There is no error-path
+  cleanup write, so an error is not a guarantee of shutdown.
+
+  **The settling delay is the caller's responsibility.** TMP108 datasheet
+  [SBOS663A](https://www.ti.com/lit/gpn/tmp108) §7.4.1 says the device
+  "shuts down when current conversion is completed". Shutdown is deferred:
+  a successful write, or a re-read of the `M = 0b00` software just wrote,
+  does not prove quiescence. The Electrical Characteristics table's
+  21 / 27 / 33 ms conversion-time figures apply at +25 °C and V+ = +1.8 V.
+  A 40 ms settling delay is a **starting point, not a guarantee**; validate
+  it against the board, supply and temperature range. The driver does not
+  validate this argument or infer a safe bound.
+
+  **Interrupt-destructive:** the full sequence performs up to 11
+  configuration reads. In interrupt thermostat mode each acknowledges
+  FL/FH and releases ALERT (SBOS663A §7.5.3.4). Uncollected interrupt
+  evidence is consumed, and the result does not report that loss. Collect
+  pending evidence first, or do not use this sample-only helper where
+  evidence must survive acquisition. A non-destructive variant remains
+  future work (#65).
+
+  **Migration:** replace a bare trigger plus a fixed delay with the
+  supervised helper when a fresh sample is required. These alternative
+  blocking call sites assume an existing `Tmp108` named `sensor` and an
+  `embedded_hal::delay::DelayNs` named `delay`; the after-call uses a
+  board-validated `shutdown_settle_ms`. The before-call is the incomplete
+  pattern being replaced, not a recommended acquisition sequence:
+
+  ```rust,ignore
+  // Before: neither prepares shutdown nor observes completion.
+  use embedded_hal::delay::DelayNs;
+  sensor.one_shot().unwrap();
+  delay.delay_ms(40);
+  let temperature = sensor.temperature().unwrap();
+
+  // After: prepares, settles, triggers, polls, then reads.
+  let temperature = sensor
+      .acquire_one_shot(&mut delay, shutdown_settle_ms)
+      .unwrap();
+  ```
+
+  Async callers use an `embedded_hal_async::delay::DelayNs` and await
+  `sensor.acquire_one_shot(&mut delay, shutdown_settle_ms)`. Production
+  callers handle `OneShotError` rather than the illustrative `unwrap()`.
+- Observable alert cause through `AlertTmp108::wait_for_alert` (#67),
+  supplying the status-bearing API left open by #58 below. The crate root
+  now exposes `AlertCause::{BelowLow, AboveHigh, Both, Unknown}` without
+  a feature gate, and `AlertEvent { cause: AlertCause, temperature: Celsius }`
+  with `embedded-sensors-hal-async`. The additive inherent method requires
+  that same feature; its signature is:
+
+  ```rust
+  pub async fn wait_for_alert(
+      &mut self,
+  ) -> Result<
+      AlertEvent,
+      Error<I2C::Error, <ALERT as embedded_hal::digital::ErrorType>::Error>,
+  >;
+  ```
+
+  The part records which limit it crossed in FL/FH; the driver previously
+  decoded those flags for control flow but discarded the direction. TMP108
+  datasheet SBOS663A §7.5.3.4 specifies that FH is set when temperature
+  exceeds THIGH and FL when it falls below TLOW. FH is bit 4 and FL is bit 3
+  of the first configuration byte (Table 8). FL alone reports `BelowLow`,
+  FH alone `AboveHigh`, and both together `Both`. Interrupt acquisition
+  uses the flags from the entry read if either is set; otherwise it uses
+  the post-wait acknowledging read. No extra status read is added.
+
+  `Unknown` means an alert was observed but direction is unavailable,
+  not that no alert occurred:
+  - Fresh Comparator acquisition always reports `Unknown`. It performs
+    no acknowledging read, and the entry read's flags predate the level
+    observation; attributing them to that observation would be a guess.
+  - Interrupt acquisition reports `Unknown` when the post-wait
+    acknowledging read returns both flags clear. This still counts as a
+    delivered alert; requiring nonzero flags would reintroduce the
+    lost-event loop fixed in #59.
+
+  In Interrupt mode, flags describe what happened since they were last
+  observed and cleared, subject to reset, not what is true now. The
+  temperature is the latest conversion (SBOS663A §7.5.2), **not a
+  trigger-time sample**. Comparing it against the limits to infer direction
+  is the invalid inference documented in #58. `Both` supplies neither the
+  number nor the order of excursions.
+
+  A retained cause may be older than its sample. If an interrupt is
+  acknowledged and the temperature read then fails or is cancelled, the
+  wrapper still owes delivery. A retry reports the original cause with a
+  newly read sample, without configuration reads or GPIO waiting. Another
+  excursion may have latched in the opposite direction meanwhile, so the
+  sample need not support the reported direction. This is expected, not a
+  defect. Fresh Comparator acquisition never retains a delivery obligation.
+
+  `wait_for_temperature_threshold` now delegates to `wait_for_alert` and
+  converts `event.temperature` with `.to_degrees()`. The delegation leaves
+  its signature, behavior, transaction sequence and error mapping unchanged;
+  the #58/#59 fixes below still apply. The methods share one delivery
+  obligation: either may acquire it and either may settle it. A successful
+  scalar delivery discards the cause; a later `wait_for_alert` cannot
+  retrieve it. These are two views of one consumptive stream, not two
+  subscribers.
+
+  **Upgrade behavior:** relative to 0.6.0, this API addition is purely
+  additive: no existing signature changes and no caller needs to change.
+  Adding public API requires a **minor** version bump, which
+  `cargo semver-checks` will report. **Migration:** callers wanting direction
+  can replace the scalar wait with the inherent method. These alternative
+  call sites assume an existing `AlertTmp108` named `sensor` in an async
+  function with compatible error propagation and `embedded-sensors-hal-async`
+  enabled:
+
+  ```rust
+  // Before: temperature only
+  use embedded_sensors_hal_async::temperature::TemperatureThresholdWait;
+  let temperature: f32 = sensor.wait_for_temperature_threshold().await?;
+
+  // After: cause and latest temperature
+  let event = sensor.wait_for_alert().await?;
+  let cause: tmp108::AlertCause = event.cause;
+  let temperature: tmp108::Celsius = event.temperature;
+  ```
+
+### Fixed
+
+- `configure()` no longer retriggers an in-flight one-shot when changing
+  unrelated settings (#61). Before, its read-modify-write echoed sampled
+  `M = 0b01` back to the chip, reissuing a conversion command. Now
+  `ops::apply_config` normalises only that encoding to `0b00` (shutdown).
+  Raw `0b00`, `0b10` and `0b11` are preserved bit-for-bit; `0b11` is not
+  canonicalised to `0b10`. The datasheet's One-Shot Mode description makes
+  `M` a trigger/completion field, not an ordinary setting to preserve.
+
+  **Upgrade behavior:** a caller hand-rolling a one-shot **must not call
+  `configure()` between triggering the conversion and checking for
+  completion**. It now stands the trigger down, so a later `M = 0b00`
+  cannot establish that the chip completed the requested conversion.
+  Configure first, then acquire; the hysteresis setter that delegates to
+  `configure()` has the same restriction. This is a non-breaking bug fix:
+  preserving the in-flight busy indication across reconfiguration was
+  never a documented or supported contract. Neither `configure()`'s
+  signature nor `Error<E, P>` changed. `continuous()` does not route
+  through `configure()` and its mode transitions are unaffected.
+- Correct `one_shot()` documentation and doctest priming on both driver
+  types (#60). The method remains a **bare trigger**, returning after the
+  `M = 0b01` write; its signature and semantics are unchanged. Callers
+  supervising acquisition themselves must first establish shutdown and
+  allow deferred shutdown to settle (SBOS663A §7.4.1), then observe
+  completion before reading temperature. The doctests now start from
+  shutdown (`0x1020`, wire bytes `[0x20, 0x10]`), not the continuous-mode
+  power-on word (`0x1022`, `[0x22, 0x10]`), and still expect the same
+  trigger write (`0x1021`, `[0x21, 0x10]`). Use `acquire_one_shot` for the
+  complete sequence, subject to its settling and interrupt-loss caveats.
+- `AlertTmp108::wait_for_temperature_threshold` no longer loses an
+  already-pending interrupt-mode alert (#59). Reading the configuration
+  register clears both the watchdog flags and the ALERT pin (TMP108
+  datasheet SBOS663A §7.5.3.4). The waiter now retains FL/FH from that
+  entry read: if either flag was set, it reads the latest temperature
+  without a GPIO wait or a second acknowledgment. Otherwise it waits for
+  the asserted pin level, not an edge, also covering an assertion between
+  the entry read and arming the GPIO wait. Comparator mode is unchanged.
+  **Upgrade behavior:** a waiter that previously hung after a transient
+  excursion may now return promptly, even with temperature back inside
+  the configured band. A polling loop that appeared to work while the
+  excursion persisted was receiving a later, relatched alert, not the
+  original event. Calls no longer need that later event to complete.
+  This is a behavioral bug fix; no public API or caller signature changes
+  are required.
+- Preserve an acknowledged interrupt's delivery obligation when the threshold
+  waiter's temperature read fails or is cancelled (#58, Gap 2). The next call
+  on the same wrapper reads temperature once, without configuration reads,
+  GPIO waiting, or acknowledgment. Success clears the obligation; repeated
+  failures retain it. Fresh comparator acquisition never retains delivery.
+  **Upgrade behavior from 0.6.0:** a retry can now deliver an earlier interrupt
+  instead of waiting for a new one, even after switching to Comparator mode.
+  Direct sensor reads do not clear the obligation; decomposition or dropping
+  the wrapper abandons it, and re-wrapping starts empty. Apply caller-side
+  backoff or bounded retries: an immediately failing bus can make retries
+  return errors without yielding. The driver does not retry internally.
+  This is a **behaviour change to a documented contract, but not a
+  source-breaking change**: no public API, signature, trait bound, or error
+  variant changed.
+
+### Documentation
+
+- Correct the threshold waiter's returned-value description and alert
+  examples (partial #58): the value is the most recent conversion, read
+  after observing the alert, **not the temperature at time of trigger**.
+  It may already be inside the configured band and cannot identify
+  whether FL, FH, or both caused the event. The flags are not exposed to
+  callers; #58 remains open for a status-bearing API. The earlier
+  pending-edge guarantee described under 0.6.0 is superseded by the
+  snapshot-and-level behavior above.
+- Document that the threshold waiter is **not event-delivery cancel-safe**.
+  Failure or cancellation during the entry or acknowledging configuration
+  read can still consume an interrupt unrecoverably. Only the temperature
+  stage after successful interrupt acknowledgment retains delivery for retry.
+  `Error::Bus` does not identify the failed stage or prove no alert occurred.
+  Retention is a delivery debt, not a cached or trigger-time sample: a retry
+  reads the latest conversion, possibly inside the band and arbitrarily
+  removed in time from the crossing. This is not exactly-once delivery;
+  relatching or sustained comparator assertion can produce multiple `Ok`
+  results for one physical excursion. Gap 1's status-bearing API remains open.
+
 ## [0.6.0] - 2026-09-04
 
 The first release since 0.5.0, and a substantial one. It collects three

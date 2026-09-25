@@ -55,27 +55,27 @@ impl<I> Inner<I> {
     ///
     /// Register operation:
     /// - Address: `2`
-    /// - Reset value: `0`
+    /// - Reset value: `0x0080`
     #[doc(alias = "t-low")]
     pub fn t_low(&mut self) -> ::device_driver::RegisterOperation<'_, Self, TLow, u8, ::device_driver::RW, ()>
     where
         I: ::device_driver::RegisterInterfaceBase<AddressType = u8>,
     {
         let address = self.base_address + 2;
-        ::device_driver::RegisterOperation::new(self, address as u8, TLow::default)
+        ::device_driver::RegisterOperation::new(self, address as u8, || TLow::from([128, 0]))
     }
     /// Temperature high register
     ///
     /// Register operation:
     /// - Address: `3`
-    /// - Reset value: `0`
+    /// - Reset value: `0xF87F`
     #[doc(alias = "t-high")]
     pub fn t_high(&mut self) -> ::device_driver::RegisterOperation<'_, Self, THigh, u8, ::device_driver::RW, ()>
     where
         I: ::device_driver::RegisterInterfaceBase<AddressType = u8>,
     {
         let address = self.base_address + 3;
-        ::device_driver::RegisterOperation::new(self, address as u8, THigh::default)
+        ::device_driver::RegisterOperation::new(self, address as u8, || THigh::from([127, 248]))
     }
 }
 impl<I> ::device_driver::Block for Inner<I> {
@@ -278,11 +278,11 @@ impl Configuration {
     ///
     /// Device functional mode
     #[must_use]
-    pub fn m(&self) -> Result<Mode, <Mode as TryFrom<u8>>::Error> {
+    pub fn m(&self) -> Mode {
         let start = 0;
         let end = 1;
         let raw = unsafe { ::device_driver::ops::load::<u8, ::device_driver::ops::LE>(&self.bits, start, end) };
-        raw.try_into()
+        raw.into()
     }
     /// `bit 2` - Read the `tm` field.
     ///
@@ -765,6 +765,17 @@ impl ::device_driver::EnumIndex for Thermostat {
     }
 }
 /// Device functional mode
+///
+/// `From<u8>` converts an already-extracted M-field value, not
+/// a whole configuration byte: it neither masks nor validates
+/// its input. `0` is `Shutdown`, `1` is `OneShot`, and every
+/// other value is `Continuous`, because continuous conversion
+/// is selected by M1 alone (datasheet SBOS663A section 7.4.3,
+/// "Continuous Conversion Mode (M1 = 1)"), so `0b10` and
+/// `0b11` are both continuous. Confirmed on silicon (#62).
+///
+/// `Default` is the power-on mode, `Continuous`, matching the
+/// configuration reset value `0x1022` (M = `0b10`).
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum Mode {
@@ -775,17 +786,17 @@ pub enum Mode {
     #[doc(alias = "continuous")]
     Continuous = 2,
 }
-impl core::convert::TryFrom<u8> for Mode {
-    type Error = ::device_driver::ConversionError<u8>;
-    fn try_from(val: u8) -> Result<Self, Self::Error> {
+impl Default for Mode {
+    fn default() -> Self {
+        Self::Continuous
+    }
+}
+impl From<u8> for Mode {
+    fn from(val: u8) -> Self {
         match val {
-            0 => Ok(Self::Shutdown),
-            1 => Ok(Self::OneShot),
-            2 => Ok(Self::Continuous),
-            val => Err(::device_driver::ConversionError {
-                source: val,
-                target: "Mode",
-            }),
+            0 => Self::Shutdown,
+            1 => Self::OneShot,
+            _ => Self::default(),
         }
     }
 }

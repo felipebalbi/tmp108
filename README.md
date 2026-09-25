@@ -89,7 +89,7 @@ let temperature = tmp
     .wait_for_temperature_threshold()
     .await
     .map_err(|_| anyhow!("wait_for_temperature_threshold failed"))?;
-println!("ALERT! Temperature at trigger: {temperature:.2} C");
+println!("ALERT serviced! Latest temperature: {temperature:.2} C");
 ```
 
 See `examples/` for complete, runnable versions of each snippet (and more).
@@ -116,6 +116,46 @@ available simultaneously when both relevant features are enabled.
   In interrupt mode the pin clears as soon as the configuration register is
   read (the driver does this for you inside `wait_for_temperature_threshold`).
   See `examples/alert_comparator.rs` for a demonstration.
+- **Retained delivery precedes fresh acquisition.** After an acknowledged
+  interrupt's temperature read fails or is cancelled, the next threshold
+  wait reads temperature once, with no configuration read, GPIO wait, or
+  acknowledgment. This delivery obligation survives direct sensor access
+  and reconfiguration, even to comparator mode. It is wrapper-local:
+  `into_inner()`, `destroy()`, or dropping the wrapper abandons it without
+  driver I/O; re-wrapping starts empty.
+- **Fresh acquisition observes pending interrupts before waiting.** With no
+  retained delivery, the threshold waiter captures FL/FH from its entry
+  configuration read. In interrupt mode, either
+  flag makes it proceed directly to the temperature read, without GPIO
+  waiting or a second acknowledgment. With neither flag set, it waits for
+  the asserted pin level, not an edge, then acknowledges the alert.
+- **An alert reading is not a trigger-time sample.** Both waiters return
+  the latest conversion, read after observing an alert. It may be back
+  inside the configured band. A retained delivery is not a cached sample:
+  it reads at retry time, with no bound on the time since the crossing or
+  the age of the register's conversion.
+- **Only `wait_for_alert` reports the cause.** The scalar
+  `wait_for_temperature_threshold` returns a temperature alone and cannot
+  identify whether FL, FH, or both caused the event.
+  `AlertTmp108::wait_for_alert` returns an `AlertEvent` carrying an
+  `AlertCause`, but a fresh comparator-mode acquisition always reports
+  `Unknown`, as does interrupt mode when the acknowledging read finds both
+  flags clear. Both methods draw on one delivery obligation: a successful
+  scalar delivery discards the cause.
+- **The threshold waiter is not event-delivery cancel-safe.** A configuration
+  read may consume an interrupt before returning success. Failure or
+  cancellation during the entry or acknowledging read can therefore lose
+  it unrecoverably. Only the temperature stage after successful interrupt
+  acknowledgment retains delivery for a later call. `Error::Bus` does not
+  identify the failed stage or prove that no alert occurred. This is not
+  exactly-once delivery: relatching or sustained comparator assertion can
+  produce multiple successful calls for one excursion. See the
+  [`AlertTmp108` documentation](https://docs.rs/tmp108/latest/tmp108/struct.AlertTmp108.html)
+  for the full contract.
+- **Retries need application-level backoff or a bound.** The driver never
+  retries internally. With a retained obligation and an immediately failing
+  bus, repeatedly awaiting the waiter returns an immediately-ready `Err`
+  each time and need not yield to other tasks.
 - **ALERT polarity is set on-chip.** Wire your pull resistor for the polarity
   you configured. Examples assume active-low + external pull-up.
 - **`AsyncTmp108::continuous` is async-only.** For blocking continuous-mode

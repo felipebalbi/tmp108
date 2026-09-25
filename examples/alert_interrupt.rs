@@ -15,16 +15,33 @@
 //!
 //! # Behavior
 //!
-//! In interrupt mode the ALERT pin pulses (it clears as soon as the
-//! configuration register is read). A `wait_for_temperature_threshold` call
-//! in interrupt mode returns once, after which the pin is reset; the next
-//! call will block until a new threshold crossing occurs.
+//! Setup updates the configuration register and writes the low/high limit
+//! registers. A retained interrupt delivery makes `wait_for_temperature_threshold`
+//! read temperature only, once. Otherwise fresh acquisition reads configuration,
+//! capturing FL/FH while acknowledging the interrupt and clearing the pin.
+//! If either flag was set, it skips GPIO waiting and any second acknowledgment.
+//! Otherwise it waits for the asserted pin level, then reads configuration
+//! once more to acknowledge that alert. Finally it reads the temperature
+//! register for the latest conversion, not a trigger-time sample.
+//!
+//! A latched transient can be reported after temperature returns inside the
+//! band. The returned reading cannot identify which threshold caused it.
+//! A persistent condition can relatch, so repeated calls need not correspond
+//! to distinct threshold crossings. After successful interrupt acknowledgment,
+//! a temperature-read failure or cancellation leaves a delivery obligation in
+//! this wrapper. Retrying reads temperature at retry time, not a cached sample,
+//! even after reconfiguration to Comparator mode. Direct sensor reads do not
+//! clear the obligation; decomposition or dropping the wrapper abandons it.
+//! Entry/acknowledging-read failure or cancellation can still lose an event
+//! unrecoverably. The waiter is not fully cancel-safe or exactly-once.
+//! It never retries internally: retrying callers need backoff or a bound,
+//! since repeated immediately-ready bus errors need not yield.
 //!
 //! # Usage
 //!
 //! Run the example, then warm the TMP108 with a finger (or breathe on it) to
-//! cross the 30 °C high threshold. The program will print the temperature at
-//! the moment of the trigger and exit.
+//! cross the 30 °C high threshold. The program will print the latest
+//! temperature reading after servicing the alert and exit.
 
 #[cfg(not(all(feature = "async", feature = "embedded-sensors-hal-async")))]
 fn main() {
@@ -71,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
         .wait_for_temperature_threshold()
         .await
         .map_err(|_| anyhow!("wait_for_temperature_threshold failed"))?;
-    println!("ALERT! Temperature at trigger: {temperature:.2} C");
+    println!("ALERT serviced! Latest temperature: {temperature:.2} C");
     // README-SNIPPET-END: alert
 
     Ok(())
