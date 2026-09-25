@@ -53,6 +53,12 @@ criteria = "safe-to-run"
 delta = "0.8.0 -> 0.11.1"
 notes = "Test mock library for embedded-hal, no unsafe, no build script, restructured for eh0/eh1. Assisted-by: copilot-cli:claude-opus-4.6"
 
+[[audits.embedded-sensors-hal]]
+who = "Felipe Balbi <febalbi@microsoft.com>"
+criteria = "safe-to-deploy"
+version = "0.1.1"
+notes = "Blocking sensor trait definitions. no_std, forbid(unsafe_code), build = false (no build script). The only powerful import is the rustdoc include_str! of README.md in lib.rs. No fs, net, process or env access. Change from the ODP-audited 0.1.0 is the new decl_threshold_traits! macro_rules macro in sensor.rs, which paste::paste! expands into the ThresholdSet/Hysteresis/ThresholdWait trait declarations shared with embedded-sensors-hal-async; it emits trait and impl items only, no unsafe and no new capability. Also bumps the optional defmt dep 0.3.7 to 1.0.0 and adds the paste runtime dep plus an assert_approx_eq dev-dep. Assisted-by: opencode:claude-opus-5"
+
 [[audits.embedded-time]]
 who = "Jerry Xie <jerryxie@microsoft.com>"
 criteria = "safe-to-run"
