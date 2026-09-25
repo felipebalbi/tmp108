@@ -560,11 +560,10 @@ pub(crate) mod ops {
     ///
     /// [`Mode::Continuous`]: crate::Mode::Continuous
     pub(crate) fn apply_config(r: &mut Configuration, cfg: Config) {
-        // The raw M field lives in bits 1:0 of the low byte. Read it
-        // raw rather than through `r.m()`: `Mode` has no inhabitant
-        // for raw 0b11, so getting and re-setting it through the enum
-        // would rewrite 0b11 as 0b10. `set_m` is called only for the
-        // one encoding that must change.
+        // Preserve the raw field rather than decoding through `Mode`: `0b11`
+        // maps to `Mode::Continuous`, but has no distinct enum wire encoding,
+        // so getting and re-setting it would canonicalize it to `0b10`.
+        // `set_m` is called only for the one encoding that must change.
         const M_MASK: u8 = 0b11;
         const M_ONE_SHOT: u8 = 0b01;
 
