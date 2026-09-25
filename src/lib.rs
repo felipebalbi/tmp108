@@ -2126,14 +2126,30 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// # Stale-reading on first call
     ///
     /// The TMP108's conversion period (1/CR — 4 s, 1 s, 250 ms, or
-    /// 62.5 ms) is **not** the same as its conversion **time** (~30 ms
-    /// regardless of CR). After entering [`Mode::Continuous`] the chip's
-    /// next conversion is not phase-aligned with when you enabled it,
-    /// so the first call to this method may return the previous
-    /// conversion result. For "guaranteed fresh" semantics, use
-    /// [`one_shot`][Self::one_shot] followed by a delay of one period
-    /// and a [`temperature`][Self::temperature] read, or discard the
-    /// first reading after entering Continuous.
+    /// 62.5 ms) is **not** the same as its conversion **time**
+    /// (SBOS663A §6.5 gives 21 / 27 / 33 ms min/typ/max, independent
+    /// of CR — the rate bits lengthen the idle gap between
+    /// conversions, not the conversion). After entering
+    /// [`Mode::Continuous`] the chip's next conversion is not
+    /// phase-aligned with when you enabled it, so the first call to
+    /// this method may return the previous conversion result.
+    ///
+    /// Two ways out, depending on what you are after:
+    ///
+    /// - **Staying in Continuous:** discard the first reading.
+    /// - **Wanting one fresh sample:** use
+    ///   [`acquire_one_shot`][Self::acquire_one_shot], which drives
+    ///   the part into shutdown, triggers, and waits for the chip to
+    ///   clear `M` back to `0b00` before it reads the temperature
+    ///   register.
+    ///
+    /// Do **not** reach for a bare [`one_shot`][Self::one_shot] plus a
+    /// delay. The datasheet conditions the trigger on the part already
+    /// being shut down — *"When the device is in shutdown mode"* a
+    /// write of `M = 0b01` starts a single conversion (SBOS663A
+    /// §7.4.2) — which is exactly what a caller of *this* method is
+    /// not. And a fixed delay never observes the completion the part
+    /// does publish, so it cannot make the reading fresh, only likely.
     ///
     /// # I²C cost per call
     ///
@@ -2768,6 +2784,8 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     ///
     /// See [`Tmp108::wait_for_temperature`] for the full semantics,
     /// including the stale-first-reading and per-call I²C cost notes.
+    /// The supervised single-sample alternative described there is
+    /// [`acquire_one_shot`][Self::acquire_one_shot] on this type.
     ///
     /// # Errors
     ///
