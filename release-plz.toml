@@ -1,28 +1,54 @@
 # Release-plz configuration.
 #
-# This repository hand-writes `CHANGELOG.md` and hand-bumps the version in
-# the same pull request as the change. The changelog carries migration
-# guidance -- before/after snippets, datasheet citations, the reasoning
-# behind a behavior change -- that cannot be derived from commit subjects,
-# so generating it would be a downgrade.
-#
-# release-plz is therefore used for one job only: once a version that is not
-# yet on crates.io lands on `main`, publish it, tag it, and cut the GitHub
-# release. It does not open release pull requests and does not touch the
-# changelog.
+# Releases in this repository are fully automated. Nothing here is edited by
+# hand: not `version` in `Cargo.toml`, not `CHANGELOG.md`, not the git tags.
+# See `.github/workflows/release-plz.yml` for the two jobs that drive it, and
+# the "Releases" gotcha in `AGENTS.md` for the contributor-facing rules.
 #
 # Docs: https://release-plz.dev/docs/config
 
 [workspace]
-# The changelog is written by hand. See AGENTS.md, "Releases".
-changelog_update = false
+# Pin the canonical repository instead of letting release-plz infer it from
+# the default git remote. Development happens through forks, so a contributor
+# running `release-plz update` locally would otherwise generate changelog
+# entries and release links pointing at their own fork.
+repo_url = "https://github.com/OpenDevicePartnership/tmp108"
 
-# Publish whenever `main` carries a version that is not yet on crates.io,
-# rather than only when a release PR merges. Because the version is bumped
-# by hand in the PR that makes the change, there is no release PR to wait
-# for. A push that does not change the version is a no-op: the version is
-# already published.
-release_always = true
+# Pin the release pull request's branch prefix instead of inheriting
+# release-plz's default. The value matches the current default, so this is a
+# guard rather than a change: it keeps the branch name stable if release-plz
+# ever moves its default, and it is the name any branch-protection carve-out
+# has to be written against. If this repository gains a ruleset that forbids
+# branch creation on `refs/heads/*`, the exclusion must name this prefix or
+# every release will fail on a rule violation instead of a visible
+# configuration change. Keep this value and any such exclusion in step.
+pr_branch_prefix = "release-plz-"
 
-# The release body is taken from the matching section of CHANGELOG.md.
+[[package]]
+name = "tmp108"
+
+# Regenerate `CHANGELOG.md` from the conventional commits that have landed
+# since the last tag. The commit subjects are the changelog, which is why the
+# commit convention is mandatory rather than advisory.
+changelog_update = true
+
+# Tag `vX.Y.Z` and cut a GitHub release whose body is the matching changelog
+# section.
 git_release_enable = true
+
+# Publish to crates.io. The workflow authenticates with Trusted Publishing,
+# so there is no registry token anywhere in this repository.
+publish = true
+
+# Run cargo-semver-checks and let it drive the version bump: an undeclared API
+# break is promoted to a major semver bump, which on `0.x` means `0.x` ->
+# `0.(x+1)`.
+#
+# This is the only place cargo-semver-checks runs. `check.yml`'s `semver` job
+# is commented out, because it is incompatible with release-plz owning the
+# version: on a feature branch `Cargo.toml` still carries the last published
+# version, so `cargo semver-checks check-release` fails every pull request
+# that makes a breaking change -- the bump it asks for does not arrive until
+# the release PR. Enabling that job again means setting `semver_check = false`
+# here to avoid running the check twice.
+semver_check = true
