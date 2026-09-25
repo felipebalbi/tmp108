@@ -129,13 +129,19 @@ available simultaneously when both relevant features are enabled.
   flag makes it proceed directly to the temperature read, without GPIO
   waiting or a second acknowledgment. With neither flag set, it waits for
   the asserted pin level, not an edge, then acknowledges the alert.
-- **An alert reading is not a trigger-time sample.** The threshold waiter
-  returns the latest conversion read after observing an alert. It may be
-  back inside the configured band and cannot identify whether FL, FH, or
-  both caused the event. A retained delivery is not a cached sample: it
-  reads at retry time, with no bound on the time since the crossing or the
-  age of the register's conversion. Those flags are not exposed by the
-  current API.
+- **An alert reading is not a trigger-time sample.** Both waiters return
+  the latest conversion, read after observing an alert. It may be back
+  inside the configured band. A retained delivery is not a cached sample:
+  it reads at retry time, with no bound on the time since the crossing or
+  the age of the register's conversion.
+- **Only `wait_for_alert` reports the cause.** The scalar
+  `wait_for_temperature_threshold` returns a temperature alone and cannot
+  identify whether FL, FH, or both caused the event.
+  `AlertTmp108::wait_for_alert` returns an `AlertEvent` carrying an
+  `AlertCause`, but a fresh comparator-mode acquisition always reports
+  `Unknown`, as does interrupt mode when the acknowledging read finds both
+  flags clear. Both methods draw on one delivery obligation: a successful
+  scalar delivery discards the cause.
 - **The threshold waiter is not event-delivery cancel-safe.** A configuration
   read may consume an interrupt before returning success. Failure or
   cancellation during the entry or acknowledging read can therefore lose
