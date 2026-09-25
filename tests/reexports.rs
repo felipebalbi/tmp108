@@ -139,7 +139,7 @@ fn alert_event_is_constructible_from_outside() {
     // Clone, Copy, Debug, PartialEq, Eq, Hash.
     let copied = event;
     assert_eq!(copied, event.clone());
-    assert!(!format!("{event:?}").is_empty());
+    assert_ne!(format!("{event:?}"), "");
     let mut set = std::collections::HashSet::new();
     assert!(set.insert(event));
     assert!(!set.insert(copied));

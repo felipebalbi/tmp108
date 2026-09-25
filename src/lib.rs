@@ -6315,7 +6315,11 @@ mod tests {
                     poll_once(fut.as_mut())
                 };
 
-                assert!(pin_calls(&shared).is_empty());
+                assert!(
+                    pin_calls(&shared).is_empty(),
+                    "a pending entry flag must suppress every GPIO operation, saw {:?}",
+                    pin_calls(&shared)
+                );
                 assert_approx_eq!(degrees(result), 80.0, 1e-4);
                 assert_eq!(
                     i2c_writes(&shared),
@@ -6653,7 +6657,11 @@ mod tests {
                     let mut fut = pin!(tmp.wait_for_temperature_threshold());
                     poll_once(fut.as_mut())
                 };
-                assert!(pin_calls(&shared).is_empty());
+                assert!(
+                    pin_calls(&shared).is_empty(),
+                    "a pending entry flag must suppress every GPIO operation, saw {:?}",
+                    pin_calls(&shared)
+                );
                 assert_approx_eq!(degrees(result), 25.0, 1e-4);
                 assert_eq!(steps_left(&shared), 0);
             }
@@ -6726,7 +6734,7 @@ mod tests {
                     poll_once(fut.as_mut())
                 };
                 expect_bus(&shared, result, I2cError::Bus);
-                assert!(pin_calls(&shared).is_empty());
+                assert!(pin_calls(&shared).is_empty(), "a failed C0 must not touch GPIO");
                 assert_eq!(i2c_writes(&shared), vec![vec![0x01]]);
             }
 
@@ -6835,7 +6843,11 @@ mod tests {
                     vec![vec![0x00]],
                     "the retained sample is delivered by T alone — no second C0"
                 );
-                assert!(pin_calls(&shared).is_empty());
+                assert!(
+                    pin_calls(&shared).is_empty(),
+                    "a retained retry must not touch GPIO, saw {:?}",
+                    pin_calls(&shared)
+                );
                 assert_eq!(steps_left(&shared), 0);
             }
 
@@ -6952,7 +6964,7 @@ mod tests {
                     poll_once(fut.as_mut())
                 };
                 expect_bus(&shared, result, I2cError::Bus);
-                assert!(pin_calls(&shared).is_empty());
+                assert!(pin_calls(&shared).is_empty(), "a failed C0 must not touch GPIO");
 
                 push_steps(
                     &shared,
@@ -6985,7 +6997,11 @@ mod tests {
                 }
 
                 assert_eq!(i2c_writes(&shared), vec![vec![0x01]]);
-                assert!(pin_calls(&shared).is_empty());
+                assert!(
+                    pin_calls(&shared).is_empty(),
+                    "a waiter stuck in C0 must not touch GPIO, saw {:?}",
+                    pin_calls(&shared)
+                );
                 assert_eq!(steps_left(&shared), 0);
             }
 
