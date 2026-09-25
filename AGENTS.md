@@ -364,8 +364,13 @@ posix ACL.
 If `cargo run --example oneshot` hangs without printing, the most
 common causes are:
 
-1. Wrong `pico-de-gallo-hal` version. **Use 0.5.0 or newer.** Older
-   releases hang on USB I/O against current firmware.
+1. Wrong Pico de Gallo crate versions. The tree pins
+   `pico-de-gallo-hal = "0.7.0"` and `pico-de-gallo-lib = "0.8.0"` as
+   dev-dependencies; don't downgrade them to work around a hang.
+   Releases before 0.5.0 hang on USB I/O against current firmware.
+   Note the two crates are **no longer version-locked to each other** —
+   they moved in lockstep up to 0.5.0 and have since diverged, so the
+   mismatched minors are intentional, not a bug to "fix".
 2. The board isn't enumerated. Check `lsusb | grep 045e:067d`.
 3. You don't have permission to the USB node. Check
    `ls -la /dev/bus/usb/*/$(lsusb | awk '/045e:067d/ {print $4}' | tr -d :)`.
