@@ -35,9 +35,15 @@ address cannot be requested.
 ```rust,ignore
 let hal = Hal::new();
 let i2c = hal.i2c();
+let mut delay = hal.delay();
 
 let mut tmp = Tmp108::new_with_a0_gnd(i2c);
-let temperature = tmp.temperature().map_err(|_| anyhow!("Failed to read temperature"))?;
+
+// 40 ms settling delay: the part defers shutdown until the conversion
+// already in progress finishes, so the write alone is not quiescence.
+let temperature = tmp
+    .one_shot(&mut delay, 40)
+    .map_err(|_| anyhow!("Failed to acquire a one-shot conversion"))?;
 println!("Temperature: {temperature:.2} C");
 ```
 
@@ -108,9 +114,15 @@ available simultaneously when both relevant features are enabled.
 
 ## Gotchas
 
-- **Constructors are infallible.** They take no delay; the delay only
-  appears on `wait_for_temperature`, where it is genuinely needed to
-  wait out a conversion period.
+- **Constructors are infallible.** They take no delay; the delay appears on
+  the operations that genuinely have to wait — `wait_for_temperature`, to
+  wait out a conversion period, and `one_shot`, to let the part settle into
+  shutdown and then poll for completion.
+- **`one_shot` is the whole acquisition, not a trigger.** It drives the part
+  into shutdown, triggers, waits for the chip to clear `M` back to `0b00`,
+  and only then reads the temperature register, returning the sample. The
+  settling delay is yours to pick: the part defers shutdown until any
+  conversion in progress finishes, so the write alone is not quiescence.
 - **Comparator vs interrupt mode latching.** In comparator mode the ALERT pin
   stays asserted until temperature returns inside `(T_low + HYS, T_high − HYS)`.
   In interrupt mode the pin clears as soon as the configuration register is
