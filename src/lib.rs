@@ -4075,6 +4075,24 @@ mod tests {
             }
 
             #[test]
+            fn application_note_worked_values_decode() {
+                // SBAA588A works these three by hand. They are worth
+                // having alongside the exhaustive oracle because a
+                // human computed them independently, and because they
+                // exercise mixed integer/fractional data and negative
+                // fractional decoding rather than the round numbers of
+                // Table 7.
+                //
+                // All three have a zero low nibble, so the encode
+                // direction round-trips exactly and is asserted too.
+                for (word, degrees) in [(0x2090_u16, 32.5625_f32), (0xfae0, -5.125), (0x1880, 24.5)] {
+                    let c = Celsius::from_register(word.to_be_bytes());
+                    assert_eq!(c.to_degrees(), degrees, "word {word:#06x}");
+                    assert_eq!(c.to_register(), word.to_be_bytes(), "word {word:#06x}");
+                }
+            }
+
+            #[test]
             fn unused_low_bits_are_discarded_not_truncated_toward_zero() {
                 // Per the datasheet (Table 6 / Table 12) bits 3..0 of the low
                 // byte are hardwired zero and "always read 0". `from_register`
