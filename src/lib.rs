@@ -3679,30 +3679,41 @@ mod tests {
         cfg
     }
 
+    /// Wire bytes, not a packed word.
+    ///
+    /// The configuration register is transmitted MSB first (SBOS663A
+    /// §7.3.4), so wire byte 0 is Table 8's BYTE 1 — the one carrying
+    /// M, TM, FL, FH, CR and ID. The DDSL models the register as a
+    /// little-endian word, which puts that same byte at the word's
+    /// low end; the two descriptions agree, and asserting the bytes
+    /// directly avoids having to hold both in mind at once.
+    ///
+    /// These assertions used `from_ne_bytes`, which is host-endian
+    /// and would have failed on a big-endian target.
     #[test]
     fn default_configuration() {
         let cfg = por_configuration();
-        assert_eq!(u16::from_le_bytes(cfg.into()), 0x1022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x10]);
     }
 
     #[test]
     fn modify_mode() {
         let mut cfg = por_configuration();
         cfg.set_m(Mode::Shutdown);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1020);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x20, 0x10]);
         cfg.set_m(Mode::OneShot);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1021);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x21, 0x10]);
         cfg.set_m(Mode::Continuous);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x10]);
     }
 
     #[test]
     fn modify_thermostat_mode() {
         let mut cfg = por_configuration();
         cfg.set_tm(Thermostat::Comparator);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x10]);
         cfg.set_tm(Thermostat::Interrupt);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1026);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x26, 0x10]);
     }
 
     #[test]
@@ -3710,48 +3721,48 @@ mod tests {
         let mut cfg = por_configuration();
         cfg.set_fl(true);
         cfg.set_fh(false);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x102a);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x2a, 0x10]);
         cfg.set_fl(false);
         cfg.set_fh(true);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1032);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x32, 0x10]);
         cfg.set_fl(true);
         cfg.set_fh(true);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x103a);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x3a, 0x10]);
     }
 
     #[test]
     fn modify_conversion_rate() {
         let mut cfg = por_configuration();
         cfg.set_cr(ConversionRate::QuarterHz);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1002);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x02, 0x10]);
         cfg.set_cr(ConversionRate::OneHz);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x10]);
         cfg.set_cr(ConversionRate::FourHz);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1042);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x42, 0x10]);
         cfg.set_cr(ConversionRate::SixteenHz);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1062);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x62, 0x10]);
     }
 
     #[test]
     fn modify_hysteresis() {
         let mut cfg = por_configuration();
         cfg.set_hys(Hysteresis::ZeroC);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x0022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x00]);
         cfg.set_hys(Hysteresis::OneC);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x10]);
         cfg.set_hys(Hysteresis::TwoC);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x20]);
         cfg.set_hys(Hysteresis::FourC);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x3022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x30]);
     }
 
     #[test]
     fn modify_polarity() {
         let mut cfg = por_configuration();
         cfg.set_pol(Polarity::ActiveLow);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x10]);
         cfg.set_pol(Polarity::ActiveHigh);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x9022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x90]);
     }
 
     mod ops_tests {
