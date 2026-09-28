@@ -128,6 +128,18 @@ available simultaneously when both relevant features are enabled.
   In interrupt mode the pin clears as soon as the configuration register is
   read (the driver does this for you inside `wait_for_temperature_threshold`).
   See `examples/alert_comparator.rs` for a demonstration.
+- **Any configuration read acknowledges, not just the waiter's.** In
+  interrupt mode every read of the configuration register clears FL/FH and
+  releases the ALERT pin — including `probe()`, which looks like a liveness
+  check, `wait_for_temperature()`, which reads it only to pick a delay,
+  `configure()` and `shutdown()`, whose read-modify-write acknowledges on
+  the read half, and `set_temperature_threshold_hysteresis()`, which does it
+  twice. A configuration *write* does not acknowledge. Only
+  `read_configuration_and_acknowledge()` hands back the raw flag pair;
+  `AlertTmp108::wait_for_alert()` reports them as an interpreted
+  `AlertCause`, and everything else discards them. See the
+  [crate documentation](https://docs.rs/tmp108/latest/tmp108/#interrupt-mode-acknowledgement)
+  for the full table.
 - **Retained delivery precedes fresh acquisition.** After an acknowledged
   interrupt's temperature read fails or is cancelled, the next threshold
   wait reads temperature once, with no configuration read, GPIO wait, or
