@@ -5782,6 +5782,38 @@ mod tests {
 
         use super::*;
 
+        /// The async mirror of
+        /// `blocking::limit_registers_reset_to_the_documented_window`.
+        ///
+        /// The reset value is declared once in the DDSL and both
+        /// drivers read it through the same generated register
+        /// operation, so this cannot drift from its blocking twin
+        /// independently — but AGENTS.md asks for both flavors to be
+        /// covered, and a future change to `write_async` could.
+        #[tokio::test]
+        async fn limit_registers_reset_to_the_documented_window() {
+            // Datasheet §7.5.4: THIGH = +127.9375 °C (0x7FF8) and
+            // TLOW = -128 °C (0x8000), sent MSB first.
+            //
+            // Asserted against explicit wire bytes rather than against
+            // `Fieldset::ZERO`, because comparing against ZERO is
+            // precisely what let the wrong defaults through. The only
+            // path where the reset value is observable is a `write()`
+            // whose closure changes nothing.
+            let expectations = vec![
+                Transaction::write(0x48, vec![0x02, 0x80, 0x00]),
+                Transaction::write(0x48, vec![0x03, 0x7f, 0xf8]),
+            ];
+            let mock = Mock::new(&expectations);
+            let mut tmp = AsyncTmp108::new_with_a0_gnd(mock);
+
+            tmp.inner.t_low().write_async(|_| {}).await.unwrap();
+            tmp.inner.t_high().write_async(|_| {}).await.unwrap();
+
+            let mut mock = tmp.destroy();
+            mock.done();
+        }
+
         #[tokio::test]
         async fn handle_a0_pin_accordingly() {
             let expectations = vec![];
