@@ -2930,10 +2930,31 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// Initiate continuous conversions.
     ///
     /// Switches the chip into [`Mode::Continuous`], runs the user-supplied
-    /// closure, and unconditionally returns the chip to [`Mode::Shutdown`]
-    /// before returning, **regardless of whether the closure succeeded or
-    /// failed**. This ensures the chip is not left burning current after
-    /// a transient bus failure inside the closure.
+    /// closure, and then **attempts** to return the chip to
+    /// [`Mode::Shutdown`], whether the closure succeeded or failed. The
+    /// attempt is there to keep the chip from burning current after a
+    /// transient bus failure inside the closure.
+    ///
+    /// Attempts, not guarantees. Three paths skip or lose the cleanup:
+    ///
+    /// - If the *entry* transition into [`Mode::Continuous`] fails, the
+    ///   closure never runs and no cleanup is attempted. This does
+    ///   **not** mean the chip is still in its previous mode: a write
+    ///   that failed partway may already have applied its MS byte,
+    ///   which is the one carrying `M` (SBOS663A §6.6 permits
+    ///   MS-byte-only updates). Treat the mode as unknown and
+    ///   re-establish it rather than assuming a no-op.
+    /// - If the closure panics, the unwind carries past the cleanup and
+    ///   the chip is left converting. `no_std` builds using
+    ///   `panic = "abort"` never reach this case.
+    /// - If the cleanup write itself fails while the closure also
+    ///   failed, the closure's error is what you get and the cleanup
+    ///   error is dropped — so a caller cannot tell a confirmed
+    ///   shutdown apart from a chip still converting.
+    ///
+    /// Even an accepted shutdown is not immediate: the conversion
+    /// already in flight runs to completion before the part goes
+    /// quiescent (SBOS663A §7.4.1).
     ///
     /// # Cancel-safety
     ///
@@ -2957,13 +2978,15 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     ///
     /// # Errors
     ///
+    /// - If the initial transition into [`Mode::Continuous`] fails, the
+    ///   closure is not invoked and that I2C error is returned.
     /// - If the closure returns `Err(e)`, the cleanup `shutdown()` still
-    ///   runs but its result is discarded; the closure's error is
-    ///   returned.
+    ///   runs, but `e` is returned and any cleanup error is dropped.
+    ///   A returned closure error therefore says nothing about whether
+    ///   the chip reached shutdown.
     /// - If the closure returns `Ok(())` and the cleanup `shutdown()`
-    ///   fails, that I2C error is returned.
-    /// - If the initial transition into `Mode::Continuous` fails, the
-    ///   closure is not invoked and the I2C error is returned.
+    ///   fails, that I2C error is returned. `Ok(())` is the only
+    ///   result that confirms the shutdown write was accepted.
     ///
     /// # Examples
     ///
