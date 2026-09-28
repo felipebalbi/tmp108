@@ -4186,6 +4186,75 @@ mod tests {
                 // register cannot store once written.
                 assert_eq!(Celsius::from_register(0x7ff8_u16.to_be_bytes()), Celsius::MAX);
             }
+
+            #[test]
+            fn display_renders_degrees_and_honours_precision() {
+                // `Display` is where the value is finally allowed to
+                // become a float, so it is worth pinning that it
+                // renders degrees rather than sixteenths, and that a
+                // precision specifier reaches the underlying `f32`.
+                let c = Celsius::from_sixteenths(521).unwrap();
+                assert_eq!(std::format!("{c}"), "32.5625");
+                assert_eq!(std::format!("{c:.1}"), "32.6");
+                assert_eq!(std::format!("{c:.2}"), "32.56");
+                assert_eq!(std::format!("{c:.4}"), "32.5625");
+
+                // Negative, and a fraction the decimal representation
+                // holds exactly.
+                let c = Celsius::from_sixteenths(-82).unwrap();
+                assert_eq!(std::format!("{c}"), "-5.125");
+                assert_eq!(std::format!("{c:.2}"), "-5.12");
+
+                // The endpoints.
+                assert_eq!(std::format!("{}", Celsius::MIN), "-128");
+                assert_eq!(std::format!("{}", Celsius::MAX), "127.9375");
+                assert_eq!(std::format!("{}", Celsius::ZERO), "0");
+
+                // Sixteenths would render 521 here, not 32.5625.
+                assert_ne!(std::format!("{}", Celsius::from_sixteenths(521).unwrap()), "521");
+            }
+
+            #[test]
+            fn ordering_matches_temperature() {
+                use core::cmp::Ordering;
+
+                // `Ord` is derived on the private representation. It
+                // agrees with temperature only because that
+                // representation is signed sixteenths — nothing else
+                // pins that, and a change to it would reorder every
+                // `BTreeMap<Celsius, _>` in every downstream crate
+                // without a compile error.
+                assert!(Celsius::MIN < Celsius::ZERO);
+                assert!(Celsius::ZERO < Celsius::MAX);
+                assert!(Celsius::MIN < Celsius::MAX);
+
+                // `BTreeMap` and friends dispatch through `Ord::cmp`,
+                // not `<`, so pin that directly — a divergent `cmp`
+                // would satisfy every comparison above.
+                assert_eq!(Celsius::MIN.cmp(&Celsius::ZERO), Ordering::Less);
+                assert_eq!(Celsius::ZERO.cmp(&Celsius::MAX), Ordering::Less);
+                assert_eq!(Celsius::MAX.cmp(&Celsius::MIN), Ordering::Greater);
+                assert_eq!(Celsius::ZERO.cmp(&Celsius::ZERO), Ordering::Equal);
+
+                // Across zero, where an unsigned representation would
+                // disagree.
+                let below = Celsius::try_from_degrees(-0.0625).unwrap();
+                let above = Celsius::try_from_degrees(0.0625).unwrap();
+                assert!(below < Celsius::ZERO);
+                assert!(Celsius::ZERO < above);
+
+                // Monotonic across the whole domain.
+                let mut previous = Celsius::MIN;
+                for c in all().skip(1) {
+                    assert_eq!(previous.cmp(&c), Ordering::Less, "{previous:?} should sort below {c:?}");
+                    assert!(
+                        previous.to_degrees() < c.to_degrees(),
+                        "{previous:?} should be colder than {c:?}"
+                    );
+                    previous = c;
+                }
+                assert_eq!(previous, Celsius::MAX);
+            }
         }
 
         /// The conversion period the driver sleeps for before reading
