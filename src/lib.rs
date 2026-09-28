@@ -36,6 +36,7 @@
 //! chip in `Mode::Continuous` indefinitely. See the cancel-safety note
 //! on that method.
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc(html_root_url = "https://docs.rs/tmp108/latest")]
 #![doc = include_str!("../README.md")]
 #![cfg_attr(not(test), no_std)]
@@ -192,6 +193,7 @@ pub enum AlertCause {
 /// assert_eq!(event.temperature.sixteenths(), 400);
 /// ```
 #[cfg(feature = "embedded-sensors-hal-async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal-async")))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AlertEvent {
     /// Direction evidence captured while servicing the alert, if available.
@@ -734,6 +736,7 @@ pub struct Tmp108<I2C: I2c> {
 ///
 /// For the blocking flavor, see [`Tmp108`].
 #[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 pub struct AsyncTmp108<I2C: AsyncI2c> {
     inner: Inner<AsyncInterface<I2C>>,
     addr: u8,
@@ -868,6 +871,7 @@ impl<I2C: I2c> Tmp108<I2C> {
 }
 
 #[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// Create a new TMP108 instance.
     ///
@@ -1252,6 +1256,7 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
 /// [3]: embedded_hal_async::digital::Wait::wait_for_low
 /// [4]: embedded_hal_async::digital::Wait::wait_for_high
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal-async")))]
 pub struct AlertTmp108<
     I2C: embedded_hal_async::i2c::I2c,
     ALERT: embedded_hal_async::digital::Wait + embedded_hal::digital::InputPin,
@@ -1290,6 +1295,7 @@ pub struct AlertTmp108<
 }
 
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal-async")))]
 impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait + embedded_hal::digital::InputPin>
     AlertTmp108<I2C, ALERT>
 {
@@ -2344,6 +2350,7 @@ impl<I2C: I2c> Tmp108<I2C> {
 }
 
 #[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// Probe the chip's presence by reading the configuration register.
     ///
@@ -3227,6 +3234,7 @@ pub enum OneShotError<E> {
 }
 
 #[cfg(all(feature = "embedded-sensors-hal", not(feature = "async")))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "embedded-sensors-hal", not(feature = "async")))))]
 impl<E: embedded_hal::i2c::Error, P: embedded_hal::digital::Error> embedded_sensors_hal::sensor::Error for Error<E, P> {
     fn kind(&self) -> embedded_sensors_hal::sensor::ErrorKind {
         embedded_sensors_hal::sensor::ErrorKind::Other
@@ -3234,11 +3242,13 @@ impl<E: embedded_hal::i2c::Error, P: embedded_hal::digital::Error> embedded_sens
 }
 
 #[cfg(all(feature = "embedded-sensors-hal", not(feature = "async")))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "embedded-sensors-hal", not(feature = "async")))))]
 impl<I2C: embedded_hal::i2c::I2c> embedded_sensors_hal::sensor::ErrorType for Tmp108<I2C> {
     type Error = Error<I2C::Error>;
 }
 
 #[cfg(all(feature = "embedded-sensors-hal", not(feature = "async")))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "embedded-sensors-hal", not(feature = "async")))))]
 impl<I2C: embedded_hal::i2c::I2c> embedded_sensors_hal::temperature::TemperatureSensor for Tmp108<I2C> {
     fn temperature(&mut self) -> Result<embedded_sensors_hal::temperature::DegreesCelsius, Self::Error> {
         self.temperature().map(Celsius::to_degrees).map_err(Error::Bus)
@@ -3246,6 +3256,7 @@ impl<I2C: embedded_hal::i2c::I2c> embedded_sensors_hal::temperature::Temperature
 }
 
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal-async")))]
 impl<E: embedded_hal_async::i2c::Error, P: embedded_hal::digital::Error> embedded_sensors_hal_async::sensor::Error
     for Error<E, P>
 {
@@ -3255,11 +3266,13 @@ impl<E: embedded_hal_async::i2c::Error, P: embedded_hal::digital::Error> embedde
 }
 
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal-async")))]
 impl<I2C: embedded_hal_async::i2c::I2c> embedded_sensors_hal_async::sensor::ErrorType for AsyncTmp108<I2C> {
     type Error = Error<I2C::Error>;
 }
 
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal-async")))]
 impl<I2C: embedded_hal_async::i2c::I2c> embedded_sensors_hal_async::temperature::TemperatureSensor
     for AsyncTmp108<I2C>
 {
@@ -3269,6 +3282,7 @@ impl<I2C: embedded_hal_async::i2c::I2c> embedded_sensors_hal_async::temperature:
 }
 
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal-async")))]
 impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait + embedded_hal::digital::InputPin>
     embedded_sensors_hal_async::sensor::ErrorType for AlertTmp108<I2C, ALERT>
 {
@@ -3276,6 +3290,7 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
 }
 
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal-async")))]
 impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait + embedded_hal::digital::InputPin>
     embedded_sensors_hal_async::temperature::TemperatureSensor for AlertTmp108<I2C, ALERT>
 {
@@ -3289,6 +3304,7 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
 }
 
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal-async")))]
 impl<I2C: embedded_hal_async::i2c::I2c> embedded_sensors_hal_async::temperature::TemperatureThresholdSet
     for AsyncTmp108<I2C>
 {
@@ -3313,6 +3329,7 @@ impl<I2C: embedded_hal_async::i2c::I2c> embedded_sensors_hal_async::temperature:
 }
 
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal-async")))]
 impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait + embedded_hal::digital::InputPin>
     embedded_sensors_hal_async::temperature::TemperatureThresholdSet for AlertTmp108<I2C, ALERT>
 {
@@ -3334,6 +3351,7 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
 }
 
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal-async")))]
 impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait + embedded_hal::digital::InputPin>
     embedded_sensors_hal_async::temperature::TemperatureThresholdWait for AlertTmp108<I2C, ALERT>
 {
@@ -3370,6 +3388,7 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
 }
 
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal-async")))]
 impl<I2C: embedded_hal_async::i2c::I2c> embedded_sensors_hal_async::temperature::TemperatureHysteresis
     for AsyncTmp108<I2C>
 {
@@ -3391,6 +3410,7 @@ impl<I2C: embedded_hal_async::i2c::I2c> embedded_sensors_hal_async::temperature:
 }
 
 #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal-async")))]
 impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait + embedded_hal::digital::InputPin>
     embedded_sensors_hal_async::temperature::TemperatureHysteresis for AlertTmp108<I2C, ALERT>
 {
