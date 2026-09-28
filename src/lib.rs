@@ -5444,6 +5444,63 @@ mod tests {
             }
         }
 
+        /// `wait_for_temperature` reads the configuration only to size
+        /// its sleep, then reads the temperature. Both peripherals go
+        /// on one timeline, because the duration is not the property
+        /// at risk — the ordering is. A delay moved after the
+        /// temperature read still sleeps for the right length and
+        /// still returns the previous conversion.
+        mod wait_for_temperature {
+            use super::super::timeline;
+            use super::*;
+
+            /// Wire byte 0 selecting `rate`, with every other field at
+            /// its reset value. The configuration word is
+            /// little-endian, so wire byte 0 is its low byte and CR
+            /// sits at bits 6:5 of it: `0x42` is `0b0100_0010`, so
+            /// CR = `0b10` = 4 Hz.
+            fn configuration_byte(rate: ConversionRate) -> u8 {
+                match rate {
+                    ConversionRate::QuarterHz => 0x02,
+                    ConversionRate::OneHz => 0x22,
+                    ConversionRate::FourHz => 0x42,
+                    ConversionRate::SixteenHz => 0x62,
+                }
+            }
+
+            #[test]
+            fn reads_the_configuration_then_sleeps_then_reads_the_temperature() {
+                for rate in [
+                    ConversionRate::QuarterHz,
+                    ConversionRate::OneHz,
+                    ConversionRate::FourHz,
+                    ConversionRate::SixteenHz,
+                ] {
+                    let log = timeline::log();
+                    // Two scripted replies: the configuration, with
+                    // only CR varying (M = continuous, and 0x10 keeps
+                    // HYS = OneC and POL = ActiveLow at their reset
+                    // values), then the temperature, 0x3200 = +50 °C.
+                    let bus = timeline::Bus::new(&log, &[[configuration_byte(rate), 0x10], [0x32, 0x00]]);
+                    let mut sensor = Tmp108::new_with_a0_gnd(bus);
+                    let mut clock = timeline::Clock::new(&log);
+
+                    let temp = sensor.wait_for_temperature(&mut clock).unwrap();
+
+                    assert_approx_eq!(temp.to_degrees(), 50.0);
+                    assert_eq!(
+                        timeline::events(&log),
+                        vec![
+                            timeline::Event::Read(0x01),
+                            timeline::Event::Delay(ops::conversion_period_us(rate)),
+                            timeline::Event::Read(0x00),
+                        ],
+                        "{rate:?}"
+                    );
+                }
+            }
+        }
+
         /// Issue #65: the acknowledging read returns the flags that
         /// `read_configuration` drops, over identical bus traffic.
         #[test]
@@ -9624,6 +9681,64 @@ mod tests {
                         run(&i2c, &delay).await,
                         Err(OneShotError::Bus(err)),
                         "a bus error at the {what} must surface as OneShotError::Bus"
+                    );
+                }
+            }
+        }
+
+        /// The async mirror of the blocking ordering test.
+        ///
+        /// Sharper than its blocking twin: `timeline::Pause` records
+        /// when it is *polled to completion*, not when it is created,
+        /// and returns `Pending` once before completing. A body that
+        /// built its delay future early and awaited it late would be
+        /// caught here.
+        mod wait_for_temperature {
+            use super::super::timeline;
+            use super::*;
+
+            /// Wire byte 0 selecting `rate`, with every other field at
+            /// its reset value. The configuration word is
+            /// little-endian, so wire byte 0 is its low byte and CR
+            /// sits at bits 6:5 of it: `0x42` is `0b0100_0010`, so
+            /// CR = `0b10` = 4 Hz.
+            fn configuration_byte(rate: ConversionRate) -> u8 {
+                match rate {
+                    ConversionRate::QuarterHz => 0x02,
+                    ConversionRate::OneHz => 0x22,
+                    ConversionRate::FourHz => 0x42,
+                    ConversionRate::SixteenHz => 0x62,
+                }
+            }
+
+            #[tokio::test]
+            async fn reads_the_configuration_then_sleeps_then_reads_the_temperature() {
+                for rate in [
+                    ConversionRate::QuarterHz,
+                    ConversionRate::OneHz,
+                    ConversionRate::FourHz,
+                    ConversionRate::SixteenHz,
+                ] {
+                    let log = timeline::log();
+                    // Two scripted replies: the configuration, with
+                    // only CR varying (M = continuous, and 0x10 keeps
+                    // HYS = OneC and POL = ActiveLow at their reset
+                    // values), then the temperature, 0x3200 = +50 °C.
+                    let bus = timeline::Bus::new(&log, &[[configuration_byte(rate), 0x10], [0x32, 0x00]]);
+                    let mut sensor = AsyncTmp108::new_with_a0_gnd(bus);
+                    let mut clock = timeline::Clock::new(&log);
+
+                    let temp = sensor.wait_for_temperature(&mut clock).await.unwrap();
+
+                    assert_approx_eq!(temp.to_degrees(), 50.0);
+                    assert_eq!(
+                        timeline::events(&log),
+                        vec![
+                            timeline::Event::Read(0x01),
+                            timeline::Event::Delay(ops::conversion_period_us(rate)),
+                            timeline::Event::Read(0x00),
+                        ],
+                        "{rate:?}"
                     );
                 }
             }
