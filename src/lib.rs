@@ -3387,29 +3387,43 @@ pub enum OneShotError<E> {
     Timeout,
 }
 
-#[cfg(all(feature = "embedded-sensors-hal", not(feature = "async")))]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "embedded-sensors-hal", not(feature = "async")))))]
+#[cfg(feature = "embedded-sensors-hal")]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal")))]
 impl<E: embedded_hal::i2c::Error, P: embedded_hal::digital::Error> embedded_sensors_hal::sensor::Error for Error<E, P> {
     fn kind(&self) -> embedded_sensors_hal::sensor::ErrorKind {
         embedded_sensors_hal::sensor::ErrorKind::Other
     }
 }
 
-#[cfg(all(feature = "embedded-sensors-hal", not(feature = "async")))]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "embedded-sensors-hal", not(feature = "async")))))]
+#[cfg(feature = "embedded-sensors-hal")]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal")))]
 impl<I2C: embedded_hal::i2c::I2c> embedded_sensors_hal::sensor::ErrorType for Tmp108<I2C> {
     type Error = Error<I2C::Error>;
 }
 
-#[cfg(all(feature = "embedded-sensors-hal", not(feature = "async")))]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "embedded-sensors-hal", not(feature = "async")))))]
+#[cfg(feature = "embedded-sensors-hal")]
+#[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal")))]
 impl<I2C: embedded_hal::i2c::I2c> embedded_sensors_hal::temperature::TemperatureSensor for Tmp108<I2C> {
     fn temperature(&mut self) -> Result<embedded_sensors_hal::temperature::DegreesCelsius, Self::Error> {
         self.temperature().map(Celsius::to_degrees).map_err(Error::Bus)
     }
 }
 
-#[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
+// `embedded_sensors_hal_async::sensor::Error` is a re-export of
+// `embedded_sensors_hal::sensor::Error`, not a distinct trait, so this
+// impl and the one below would collide when both features are on. Only
+// one of them may be compiled.
+//
+// Unlike the `not(feature = "async")` gates this replaced, that is not
+// a feature-additivity problem: the trait is the same either way, so
+// `Error<E, P>: embedded_sensors_hal::sensor::Error` holds in every
+// configuration where either feature is enabled. Nothing disappears —
+// only the arm that writes it changes.
+#[cfg(all(
+    feature = "embedded-sensors-hal-async",
+    feature = "async",
+    not(feature = "embedded-sensors-hal")
+))]
 #[cfg_attr(docsrs, doc(cfg(feature = "embedded-sensors-hal-async")))]
 impl<E: embedded_hal_async::i2c::Error, P: embedded_hal::digital::Error> embedded_sensors_hal_async::sensor::Error
     for Error<E, P>
@@ -4821,7 +4835,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "async"))]
     mod blocking {
         use assert_approx_eq::assert_approx_eq;
         use embedded_hal_mock::eh1::i2c::{Mock, Transaction};

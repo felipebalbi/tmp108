@@ -315,3 +315,29 @@ fn pin_async_read_configuration_and_acknowledge() {
         tmp.read_configuration_and_acknowledge().await
     }
 }
+
+/// The blocking `TemperatureSensor` impl must exist whenever
+/// `embedded-sensors-hal` is enabled, **including alongside `async`**.
+///
+/// It used to be gated on `all(feature = "embedded-sensors-hal",
+/// not(feature = "async"))`, so turning on an unrelated feature
+/// silently deleted a trait impl. Cargo features are required to be
+/// additive, and `cargo hack --feature-powerset check` cannot catch
+/// this class of regression: removing an impl still compiles. Only a
+/// use site like this one does.
+///
+/// The call is deliberately UFCS. `Tmp108` has an inherent
+/// `temperature()` returning `Celsius`, so `tmp.temperature()` would
+/// resolve to that and keep compiling with the trait impl gone.
+#[cfg(feature = "embedded-sensors-hal")]
+#[allow(dead_code)]
+fn pin_blocking_temperature_sensor_is_feature_additive() {
+    use embedded_sensors_hal::sensor::ErrorType;
+    use embedded_sensors_hal::temperature::{DegreesCelsius, TemperatureSensor};
+
+    fn _type_check<I2C: embedded_hal::i2c::I2c>(
+        tmp: &mut tmp108::Tmp108<I2C>,
+    ) -> Result<DegreesCelsius, <tmp108::Tmp108<I2C> as ErrorType>::Error> {
+        <tmp108::Tmp108<I2C> as TemperatureSensor>::temperature(tmp)
+    }
+}
