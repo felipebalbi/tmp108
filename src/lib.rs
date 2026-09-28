@@ -3910,16 +3910,71 @@ mod tests {
                     .map(|s| Celsius::from_sixteenths(s).expect("in range by construction"))
             }
 
+            /// Sign-extend a 12-bit two's complement code, computed
+            /// without reference to the driver.
+            ///
+            /// This is the oracle. It must not call anything in
+            /// `ops`, or the tests below become the implementation
+            /// checked against itself — which is exactly the hole
+            /// they exist to close.
+            fn sign_extend_12(code: u16) -> i16 {
+                assert!(code < 4096, "not a 12-bit code: {code:#06x}");
+                let widened = i32::from(code);
+                let signed = if widened < 2048 { widened } else { widened - 4096 };
+                i16::try_from(signed).expect("-2048 ..= 2047 fits an i16")
+            }
+
             #[test]
-            fn decoding_a_register_is_total() {
-                // All 65,536 bit patterns, not a sample of them.
+            fn decoding_a_register_matches_an_independent_oracle() {
+                // All 65,536 bit patterns, and the *value* of each,
+                // not merely that it landed in range. Range membership
+                // alone is satisfied by every permutation of the 4096
+                // readings, and the round-trip tests below compare the
+                // encoder against its own inverse — so neither can see
+                // a mutually-consistent wrong mapping.
+                //
+                // The part left-justifies a 12-bit two's complement
+                // field in 16 bits, so the code is the top 12 bits and
+                // the low nibble is discarded.
                 for word in 0..=u16::MAX {
                     let c = Celsius::from_register(word.to_be_bytes());
-                    assert!(
-                        (MIN_SIXTEENTHS..=MAX_SIXTEENTHS).contains(&c.sixteenths()),
-                        "word {word:#06x} decoded out of range: {c:?}"
-                    );
+                    assert_eq!(c.sixteenths(), sign_extend_12(word >> 4), "word {word:#06x}");
+                    // Still total, and now for a stated reason.
+                    assert!((MIN_SIXTEENTHS..=MAX_SIXTEENTHS).contains(&c.sixteenths()));
                 }
+            }
+
+            #[test]
+            fn encoding_matches_an_independent_oracle() {
+                // The other direction, over the 4096 codes that have a
+                // canonical encoding. Byte 0 is the code's top eight
+                // bits; byte 1 is its low nibble left-justified, with
+                // the four hardwired-zero bits below it.
+                for code in 0_u16..4096 {
+                    let c = Celsius::from_sixteenths(sign_extend_12(code))
+                        .expect("every 12-bit code names a representable temperature");
+                    let expected = [
+                        u8::try_from(code >> 4).expect("12 bits less 4 is 8"),
+                        u8::try_from((code & 0xf) << 4).expect("a nibble shifted up by 4 is a byte"),
+                    ];
+                    assert_eq!(c.to_register(), expected, "code {code:#05x}");
+                }
+            }
+
+            #[test]
+            fn the_fractional_bit_weights_are_visible() {
+                // One LSB is 0.0625 °C and two are 0.125 °C. Spelled
+                // out rather than left implicit in an exhaustive loop,
+                // so a reader can see the individual bit weights.
+                assert_eq!(Celsius::try_from_degrees(0.0625).unwrap().sixteenths(), 1);
+                assert_eq!(Celsius::try_from_degrees(-0.0625).unwrap().sixteenths(), -1);
+                assert_eq!(Celsius::try_from_degrees(0.125).unwrap().sixteenths(), 2);
+                assert_eq!(Celsius::try_from_degrees(-0.125).unwrap().sixteenths(), -2);
+
+                assert_eq!(Celsius::from_sixteenths(1).unwrap().to_degrees(), 0.0625);
+                assert_eq!(Celsius::from_sixteenths(-1).unwrap().to_degrees(), -0.0625);
+                assert_eq!(Celsius::from_sixteenths(2).unwrap().to_degrees(), 0.125);
+                assert_eq!(Celsius::from_sixteenths(-2).unwrap().to_degrees(), -0.125);
             }
 
             #[test]
