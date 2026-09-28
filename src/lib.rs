@@ -35,6 +35,50 @@
 //! `embassy_futures::select!` or `tokio::time::timeout`) leaves the
 //! chip in `Mode::Continuous` indefinitely. See the cancel-safety note
 //! on that method.
+//!
+//! ## Interrupt-mode acknowledgement
+//!
+//! In [`Thermostat::Interrupt`] mode, **reading the configuration
+//! register is acknowledging an alert**. The read clears the FL and FH
+//! flags and releases the ALERT pin (TMP108 datasheet SBOS663A
+//! §7.5.3.4). A configuration *write* does not: flags latched before a
+//! write survive it and are still present on the next read.
+//!
+//! This matters because the driver reads that register far more often
+//! than callers expect, including from methods whose names suggest
+//! nothing of the sort:
+//!
+//! | Call | Configuration reads | Why it reads |
+//! |---|---|---|
+//! | [`probe`][Tmp108::probe] | 1 | compares against the power-on reset value |
+//! | [`read_configuration`][Tmp108::read_configuration] | 1 | returns the settings |
+//! | [`read_configuration_and_acknowledge`][Tmp108::read_configuration_and_acknowledge] | 1 | returns the settings **and the flags** |
+//! | [`configure`][Tmp108::configure] | 1 | read-modify-write |
+//! | [`shutdown`][Tmp108::shutdown] | 1 | read-modify-write |
+//! | [`wait_for_temperature`][Tmp108::wait_for_temperature] | 1 | to pick a delay, nothing more |
+//! | [`one_shot`][Tmp108::one_shot] | 3 + up to 8 | preparation, trigger, completion polling |
+//! | `AsyncTmp108::continuous` | 2, plus the closure's own | entry read-modify-write, then cleanup |
+//! | `set_temperature_threshold_hysteresis` | 2, or 0 if rejected | a read followed by a read-modify-write |
+//!
+//! The async driver mirrors every row. Only
+//! `read_configuration_and_acknowledge` returns the flags it consumed;
+//! every other row discards them, because [`Config`] models the 64
+//! configurable settings and has no home for FL, FH or M.
+//!
+//! Three consequences worth stating plainly:
+//!
+//! - A call that fails or is cancelled *after* its configuration read
+//!   has already acknowledged. No error variant reports this, and
+//!   nothing undoes it.
+//! - In [`Thermostat::Comparator`] mode none of this applies. A
+//!   configuration read consumes nothing: FL/FH and the ALERT pin both
+//!   track the temperature rather than latching, so both survive any
+//!   number of reads. They also release together, and at the
+//!   hysteresis boundary rather than at the limit — cooling back below
+//!   `T_high` is not enough, it takes `T_high - HYS` (SBOS663A §7.5.4).
+//! - If you rely on latched interrupt evidence, collect it with
+//!   [`read_configuration_and_acknowledge`][Tmp108::read_configuration_and_acknowledge]
+//!   before calling anything else in the table.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc(html_root_url = "https://docs.rs/tmp108/latest")]
@@ -506,9 +550,9 @@ pub(crate) mod ops {
     ///
     /// Produced by
     /// [`read_configuration_and_acknowledge`][crate::Tmp108::read_configuration_and_acknowledge]
-    /// and its async twin. See the crate-level "Interrupt-mode
-    /// acknowledgement" section for which other calls consume these
-    /// flags without returning them.
+    /// and its async twin. See
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement)
+    /// for which other calls consume these flags without returning them.
     ///
     /// # Examples
     ///
@@ -532,17 +576,25 @@ pub(crate) mod ops {
     pub struct AlertSnapshot {
         /// Settings carried by the configuration read that produced this.
         pub config: Config,
-        /// FL as that read returned it: a low-limit excursion was latched.
+        /// FL as that read returned it.
         ///
-        /// Meaningful in [`Thermostat::Interrupt`][crate::Thermostat::Interrupt]
-        /// mode, where it records an excursion since the flags were last
-        /// observed and cleared.
+        /// In [`Thermostat::Interrupt`][crate::Thermostat::Interrupt]
+        /// mode this is latched history — a low-limit excursion since
+        /// the flags were last observed — and the read that produced
+        /// this snapshot cleared it. In
+        /// [`Thermostat::Comparator`][crate::Thermostat::Comparator]
+        /// mode it tracks the live comparison and the read consumed
+        /// nothing.
         pub low: bool,
-        /// FH as that read returned it: a high-limit excursion was latched.
+        /// FH as that read returned it.
         ///
-        /// Meaningful in [`Thermostat::Interrupt`][crate::Thermostat::Interrupt]
-        /// mode, where it records an excursion since the flags were last
-        /// observed and cleared.
+        /// In [`Thermostat::Interrupt`][crate::Thermostat::Interrupt]
+        /// mode this is latched history — a high-limit excursion since
+        /// the flags were last observed — and the read that produced
+        /// this snapshot cleared it. In
+        /// [`Thermostat::Comparator`][crate::Thermostat::Comparator]
+        /// mode it tracks the live comparison and the read consumed
+        /// nothing.
         pub high: bool,
     }
 
@@ -1448,6 +1500,12 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
     /// Direct reads and reconfiguration do not clear a retained interrupt
     /// delivery obligation; it takes precedence on the next threshold wait.
     ///
+    /// Reads reached this way still acknowledge: a `read_configuration`
+    /// through this borrow clears FL/FH and releases the ALERT pin in
+    /// [`Thermostat::Interrupt`] mode, without returning the flags. On
+    /// this type, prefer
+    /// [`read_configuration_and_acknowledge`][AsyncTmp108::read_configuration_and_acknowledge].
+    ///
     /// # Examples
     ///
     /// ```
@@ -1460,8 +1518,8 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
     /// ]);
     /// let alert = digital::Mock::new(&[]);
     /// let mut tmp = AlertTmp108::new_with_a0_gnd(i2c, alert);
-    /// let cfg = tmp.sensor_mut().read_configuration().await.unwrap();
-    /// assert_eq!(cfg, Config::default());
+    /// let snapshot = tmp.sensor_mut().read_configuration_and_acknowledge().await.unwrap();
+    /// assert_eq!(snapshot.config, Config::default());
     /// # let (mut i2c, mut alert) = tmp.destroy();
     /// # i2c.done();
     /// # alert.done();
@@ -1796,6 +1854,14 @@ impl<I2C: I2c> Tmp108<I2C> {
     ///   chip is present at the expected address (NACK), but any bus
     ///   error reports here as well.
     ///
+    /// # Interrupt-mode acknowledgement
+    ///
+    /// This performs one configuration read, so in
+    /// [`Thermostat::Interrupt`] mode it clears FL/FH and releases the
+    /// ALERT pin. A liveness check is not free: calling it with an
+    /// alert pending destroys the evidence. See
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
+    ///
     /// # Errors
     ///
     /// `I2C::Error` when the I2C read fails.
@@ -1820,6 +1886,19 @@ impl<I2C: I2c> Tmp108<I2C> {
     }
 
     /// Read configuration register
+    ///
+    /// Returns the *configurable parameters*, not complete hardware
+    /// state: FL, FH and M are present in the register this reads and
+    /// are discarded by the decode.
+    ///
+    /// # Interrupt-mode acknowledgement
+    ///
+    /// This performs one configuration read, so in
+    /// [`Thermostat::Interrupt`] mode it clears FL/FH and releases the
+    /// ALERT pin — and returns nothing about them. Use
+    /// [`read_configuration_and_acknowledge`][Self::read_configuration_and_acknowledge]
+    /// to keep the flags. See
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
     ///
     /// # Errors
     ///
@@ -1858,8 +1937,9 @@ impl<I2C: I2c> Tmp108<I2C> {
     ///
     /// In [`Thermostat::Interrupt`] mode the read clears FL and FH and
     /// releases the ALERT pin. That is true of every configuration
-    /// read; see the crate-level "Interrupt-mode acknowledgement"
-    /// section. What is specific to this method is that it is the only
+    /// read; see
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
+    /// What is specific to this method is that it is the only
     /// one that hands the consumed flags back, so the returned value is
     /// the sole surviving evidence of the alert.
     ///
@@ -1905,12 +1985,15 @@ impl<I2C: I2c> Tmp108<I2C> {
 
     /// Configure device parameters.
     ///
-    /// This is a read-modify-write: the flags and mode bits the chip
-    /// reports are read back and preserved, with one deliberate
-    /// exception. The `M` field is a *command*, not a setting, so a
-    /// sampled in-flight one-shot is stood down rather than echoed —
-    /// otherwise changing an unrelated setting would retrigger the
-    /// conversion.
+    /// This is a read-modify-write. The sampled FL/FH bits are written
+    /// back unchanged, but that preserves the *bits in the outgoing
+    /// byte*, not the alert: in [`Thermostat::Interrupt`] mode the read
+    /// half already acknowledged it, and the write cannot undo that.
+    ///
+    /// The mode bits carry one deliberate exception. The `M` field is a
+    /// *command*, not a setting, so a sampled in-flight one-shot is
+    /// stood down rather than echoed — otherwise changing an unrelated
+    /// setting would retrigger the conversion.
     ///
     /// The consequence: do **not** reconfigure the part while a
     /// [`one_shot`][Self::one_shot] is in progress on it. `&mut self`
@@ -1927,6 +2010,15 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// conversion is in fact still running — deferred shutdown
     /// (SBOS663A §7.4.1) finishes it afterwards. The value returned is
     /// stale.
+    ///
+    /// # Interrupt-mode acknowledgement
+    ///
+    /// The read half of the read-modify-write acknowledges: in
+    /// [`Thermostat::Interrupt`] mode it clears FL/FH and releases the
+    /// ALERT pin. The write-back preserves the sampled flag bits, but
+    /// that is not the same as preserving the alert — the chip cleared
+    /// it when the read landed. See
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
     ///
     /// # Errors
     ///
@@ -2005,18 +2097,16 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// nonetheless a stronger footing than triggering a conversion and
     /// sleeping on it, which never observes completion at all.
     ///
-    /// # This operation is interrupt-destructive
+    /// # Interrupt-mode acknowledgement
     ///
-    /// The sequence performs roughly ten configuration-register
-    /// reads. In [`Thermostat::Interrupt`] mode **every configuration
-    /// read acknowledges FL/FH and releases the ALERT pin** (TMP108
-    /// datasheet SBOS663A 7.5.3.4). Any latched interrupt evidence
-    /// that had not yet been collected is consumed and lost, and the
-    /// loss is not reported anywhere in the return value.
-    ///
-    /// This is a sample-only helper. If you are relying on latched
-    /// interrupt evidence, collect it first — or do not use this
-    /// method.
+    /// The sequence performs three configuration reads to prepare and
+    /// trigger, then up to eight more polling for completion, so in
+    /// [`Thermostat::Interrupt`] mode it is thoroughly destructive:
+    /// each read clears FL/FH and releases the ALERT pin, and the loss
+    /// is not reported anywhere in the return value. This is a
+    /// sample-only helper — collect any latched interrupt evidence
+    /// first, or do not use this method. See
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
     ///
     /// # `shutdown_settle_ms` is yours to choose
     ///
@@ -2144,6 +2234,13 @@ impl<I2C: I2c> Tmp108<I2C> {
 
     /// Place device in shutdown mode
     ///
+    /// # Interrupt-mode acknowledgement
+    ///
+    /// This is a read-modify-write, and the read half acknowledges: in
+    /// [`Thermostat::Interrupt`] mode it clears FL/FH and releases the
+    /// ALERT pin. See
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
+    ///
     /// # Errors
     ///
     /// `I2C::Error` when the I2C transaction fails
@@ -2213,6 +2310,14 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// [`read_configuration`][Self::read_configuration] once, computing
     /// the period delay themselves, and calling
     /// [`temperature`][Self::temperature] directly.
+    ///
+    /// # Interrupt-mode acknowledgement
+    ///
+    /// The configuration read named above exists only to discover the
+    /// conversion rate, but in [`Thermostat::Interrupt`] mode it still
+    /// clears FL/FH and releases the ALERT pin. Picking a delay costs
+    /// you a pending alert. See
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
     ///
     /// # Errors
     ///
@@ -2357,6 +2462,14 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// See [`Tmp108::probe`] for full semantics. The async flavor has
     /// the same `Ok(true)` / `Ok(false)` / `Err(_)` contract.
     ///
+    /// # Interrupt-mode acknowledgement
+    ///
+    /// This performs one configuration read, so in
+    /// [`Thermostat::Interrupt`] mode it clears FL/FH and releases the
+    /// ALERT pin. A liveness check is not free: calling it with an
+    /// alert pending destroys the evidence. See
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
+    ///
     /// # Errors
     ///
     /// `I2C::Error` when the I2C read fails.
@@ -2382,6 +2495,19 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     }
 
     /// Read configuration register
+    ///
+    /// Returns the *configurable parameters*, not complete hardware
+    /// state: FL, FH and M are present in the register this reads and
+    /// are discarded by the decode.
+    ///
+    /// # Interrupt-mode acknowledgement
+    ///
+    /// This performs one configuration read, so in
+    /// [`Thermostat::Interrupt`] mode it clears FL/FH and releases the
+    /// ALERT pin — and returns nothing about them. Use
+    /// [`read_configuration_and_acknowledge`][Self::read_configuration_and_acknowledge]
+    /// to keep the flags. See
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
     ///
     /// # Errors
     ///
@@ -2422,8 +2548,9 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     ///
     /// In [`Thermostat::Interrupt`] mode the read clears FL and FH and
     /// releases the ALERT pin. That is true of every configuration
-    /// read; see the crate-level "Interrupt-mode acknowledgement"
-    /// section. What is specific to this method is that it is the only
+    /// read; see
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
+    /// What is specific to this method is that it is the only
     /// one that hands the consumed flags back, so the returned value is
     /// the sole surviving evidence of the alert.
     ///
@@ -2479,12 +2606,15 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
 
     /// Configure device parameters.
     ///
-    /// This is a read-modify-write: the flags and mode bits the chip
-    /// reports are read back and preserved, with one deliberate
-    /// exception. The `M` field is a *command*, not a setting, so a
-    /// sampled in-flight one-shot is stood down rather than echoed —
-    /// otherwise changing an unrelated setting would retrigger the
-    /// conversion.
+    /// This is a read-modify-write. The sampled FL/FH bits are written
+    /// back unchanged, but that preserves the *bits in the outgoing
+    /// byte*, not the alert: in [`Thermostat::Interrupt`] mode the read
+    /// half already acknowledged it, and the write cannot undo that.
+    ///
+    /// The mode bits carry one deliberate exception. The `M` field is a
+    /// *command*, not a setting, so a sampled in-flight one-shot is
+    /// stood down rather than echoed — otherwise changing an unrelated
+    /// setting would retrigger the conversion.
     ///
     /// The consequence: do **not** reconfigure the part while a
     /// [`one_shot`][Self::one_shot] is in progress on it. `&mut self`
@@ -2501,6 +2631,15 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// conversion is in fact still running — deferred shutdown
     /// (SBOS663A §7.4.1) finishes it afterwards. The value returned is
     /// stale.
+    ///
+    /// # Interrupt-mode acknowledgement
+    ///
+    /// The read half of the read-modify-write acknowledges: in
+    /// [`Thermostat::Interrupt`] mode it clears FL/FH and releases the
+    /// ALERT pin. The write-back preserves the sampled flag bits, but
+    /// that is not the same as preserving the alert — the chip cleared
+    /// it when the read landed. See
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
     ///
     /// # Errors
     ///
@@ -2586,18 +2725,16 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// nonetheless a stronger footing than triggering a conversion and
     /// sleeping on it, which never observes completion at all.
     ///
-    /// # This operation is interrupt-destructive
+    /// # Interrupt-mode acknowledgement
     ///
-    /// The sequence performs roughly ten configuration-register
-    /// reads. In [`Thermostat::Interrupt`] mode **every configuration
-    /// read acknowledges FL/FH and releases the ALERT pin** (TMP108
-    /// datasheet SBOS663A 7.5.3.4). Any latched interrupt evidence
-    /// that had not yet been collected is consumed and lost, and the
-    /// loss is not reported anywhere in the return value.
-    ///
-    /// This is a sample-only helper. If you are relying on latched
-    /// interrupt evidence, collect it first — or do not use this
-    /// method.
+    /// The sequence performs three configuration reads to prepare and
+    /// trigger, then up to eight more polling for completion, so in
+    /// [`Thermostat::Interrupt`] mode it is thoroughly destructive:
+    /// each read clears FL/FH and releases the ALERT pin, and the loss
+    /// is not reported anywhere in the return value. This is a
+    /// sample-only helper — collect any latched interrupt evidence
+    /// first, or do not use this method. See
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
     ///
     /// # `shutdown_settle_ms` is yours to choose
     ///
@@ -2741,6 +2878,13 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
 
     /// Place device in shutdown mode
     ///
+    /// # Interrupt-mode acknowledgement
+    ///
+    /// This is a read-modify-write, and the read half acknowledges: in
+    /// [`Thermostat::Interrupt`] mode it clears FL/FH and releases the
+    /// ALERT pin. See
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
+    ///
     /// # Errors
     ///
     /// `I2C::Error` when the I2C transaction fails
@@ -2785,6 +2929,16 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// indefinitely. Callers that need cancellation must structure their
     /// own recovery, for example by calling
     /// [`shutdown`][Self::shutdown] after a cancelled call.
+    ///
+    /// # Interrupt-mode acknowledgement
+    ///
+    /// Two configuration reads of its own: the entry read-modify-write
+    /// that selects continuous mode, and the cleanup shutdown on the
+    /// way out. Anything the closure calls adds its own. In
+    /// [`Thermostat::Interrupt`] mode each clears FL/FH and
+    /// releases the ALERT pin, and the cleanup read happens even when
+    /// the closure returned an error. See
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
     ///
     /// # Errors
     ///
@@ -3392,6 +3546,29 @@ impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait
 impl<I2C: embedded_hal_async::i2c::I2c> embedded_sensors_hal_async::temperature::TemperatureHysteresis
     for AsyncTmp108<I2C>
 {
+    /// Snap a requested hysteresis to one of the chip's four settings
+    /// and write it.
+    ///
+    /// Supported settings are 0, 1, 2 and 4 °C. A finite request within
+    /// 0.05 °C of one of them snaps to it; anything else is rejected
+    /// with [`Error::InvalidInput`] before any I²C traffic.
+    ///
+    /// # Interrupt-mode acknowledgement
+    ///
+    /// **Two** configuration reads when the request is accepted: one to
+    /// read the current settings, and one inside the read-modify-write
+    /// that writes them back. A rejected request performs none — the
+    /// snapping check runs before any I²C. In
+    /// [`Thermostat::Interrupt`] mode each clears FL/FH and
+    /// releases the ALERT pin. Configuring alert hysteresis while an
+    /// alert is pending therefore discards it. See
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] when `hysteresis` is non-finite or is
+    ///   not within the snapping tolerance of a supported setting.
+    /// - [`Error::Bus`] when either configuration transaction fails.
     async fn set_temperature_threshold_hysteresis(
         &mut self,
         hysteresis: embedded_sensors_hal_async::temperature::DegreesCelsius,
@@ -3414,6 +3591,28 @@ impl<I2C: embedded_hal_async::i2c::I2c> embedded_sensors_hal_async::temperature:
 impl<I2C: embedded_hal_async::i2c::I2c, ALERT: embedded_hal_async::digital::Wait + embedded_hal::digital::InputPin>
     embedded_sensors_hal_async::temperature::TemperatureHysteresis for AlertTmp108<I2C, ALERT>
 {
+    /// Snap a requested hysteresis to one of the chip's four settings
+    /// and write it.
+    ///
+    /// Supported settings are 0, 1, 2 and 4 °C. A finite request within
+    /// 0.05 °C of one of them snaps to it; anything else is rejected
+    /// with [`Error::InvalidInput`] before any I²C traffic.
+    ///
+    /// Delegates to the inner [`AsyncTmp108`], and inherits its cost:
+    /// **two** configuration reads when the request is accepted and
+    /// none when it is rejected, each of which clears FL/FH and
+    /// releases the ALERT pin in [`Thermostat::Interrupt`] mode. This
+    /// does not clear a retained interrupt delivery obligation, which
+    /// is wrapper-local. See
+    /// [Interrupt-mode acknowledgement](crate#interrupt-mode-acknowledgement).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] when `hysteresis` is non-finite or is
+    ///   not within the snapping tolerance of a supported setting.
+    /// - [`Error::Bus`] when either configuration transaction fails.
+    ///
+    /// [`Error::Pin`] is never produced: this path performs no GPIO.
     async fn set_temperature_threshold_hysteresis(
         &mut self,
         hysteresis: embedded_sensors_hal_async::temperature::DegreesCelsius,
