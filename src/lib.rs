@@ -4536,10 +4536,22 @@ mod tests {
     mod timeline {
         use std::sync::{Arc, Mutex};
 
+        use crate::ops;
+
         /// Something the driver did, in the order it did it.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub enum Event {
-            /// A delay of this many milliseconds was requested.
+            /// A delay of this many **microseconds** was requested.
+            ///
+            /// Microseconds rather than milliseconds because
+            /// `wait_for_temperature` requests a 16 Hz conversion
+            /// period of 62 500 µs, which has no exact millisecond
+            /// representation. Millisecond storage would record that
+            /// as 62 and lose the half millisecond.
+            ///
+            /// Whole microseconds only: `delay_ns` divides by 1 000,
+            /// so a sub-microsecond request would record as a smaller
+            /// number or as zero. No driver path asks for one.
             Delay(u32),
             /// The register at this address was written.
             Write(u8),
@@ -4654,14 +4666,18 @@ mod tests {
 
         impl embedded_hal::delay::DelayNs for Clock {
             fn delay_ns(&mut self, ns: u32) {
-                record(&self.log, Event::Delay(ns / 1_000_000));
+                record(&self.log, Event::Delay(ns / 1_000));
             }
 
-            // Overridden so a millisecond request lands in the log as
-            // one event rather than as the default implementation's
-            // loop of microsecond waits.
+            // Both overridden so a request lands in the log as one
+            // event rather than as the default implementation's loop,
+            // and so no unit conversion rounds on the way in.
+            fn delay_us(&mut self, us: u32) {
+                record(&self.log, Event::Delay(us));
+            }
+
             fn delay_ms(&mut self, ms: u32) {
-                record(&self.log, Event::Delay(ms));
+                record(&self.log, Event::Delay(ms * 1_000));
             }
         }
 
@@ -4680,16 +4696,16 @@ mod tests {
         #[cfg(feature = "async")]
         pub struct Pause {
             log: Log,
-            ms: u32,
+            us: u32,
             suspended: bool,
         }
 
         #[cfg(feature = "async")]
         impl Pause {
-            fn new(log: &Log, ms: u32) -> Self {
+            fn new(log: &Log, us: u32) -> Self {
                 Self {
                     log: log.clone(),
-                    ms,
+                    us,
                     suspended: false,
                 }
             }
@@ -4704,7 +4720,7 @@ mod tests {
                 cx: &mut core::task::Context<'_>,
             ) -> core::task::Poll<Self::Output> {
                 if self.suspended {
-                    record(&self.log, Event::Delay(self.ms));
+                    record(&self.log, Event::Delay(self.us));
                     core::task::Poll::Ready(())
                 } else {
                     self.suspended = true;
@@ -4719,11 +4735,15 @@ mod tests {
         #[cfg(feature = "async")]
         impl embedded_hal_async::delay::DelayNs for Clock {
             fn delay_ns(&mut self, ns: u32) -> impl core::future::Future<Output = ()> {
-                Pause::new(&self.log, ns / 1_000_000)
+                Pause::new(&self.log, ns / 1_000)
+            }
+
+            fn delay_us(&mut self, us: u32) -> impl core::future::Future<Output = ()> {
+                Pause::new(&self.log, us)
             }
 
             fn delay_ms(&mut self, ms: u32) -> impl core::future::Future<Output = ()> {
-                Pause::new(&self.log, ms)
+                Pause::new(&self.log, ms * 1_000)
             }
         }
 
@@ -4739,8 +4759,9 @@ mod tests {
                 Event::Read(0x01),
                 Event::Write(0x01),
                 // The caller's settling delay, before anything is
-                // concluded about the part being quiescent.
-                Event::Delay(settle_ms),
+                // concluded about the part being quiescent. Logged in
+                // microseconds; the caller states it in milliseconds.
+                Event::Delay(settle_ms * 1_000),
                 // The re-read that gates the trigger.
                 Event::Read(0x01),
                 // Trigger: read-modify-write M = 0b01.
@@ -4748,9 +4769,9 @@ mod tests {
                 Event::Write(0x01),
                 // Each poll delays *first*, then reads. A read here
                 // before its delay would be sampling M at 0 ms.
-                Event::Delay(5),
+                Event::Delay(ops::ONE_SHOT_POLL_INTERVAL_MS * 1_000),
                 Event::Read(0x01),
-                Event::Delay(5),
+                Event::Delay(ops::ONE_SHOT_POLL_INTERVAL_MS * 1_000),
                 Event::Read(0x01),
                 // And only now the temperature register.
                 Event::Read(0x00),
@@ -4804,7 +4825,7 @@ mod tests {
 
                 assert_eq!(
                     events(&log),
-                    vec![Event::Read(0x01), Event::Delay(5)],
+                    vec![Event::Read(0x01), Event::Delay(5_000)],
                     "the read ran first, so it must be logged first"
                 );
             }
@@ -4819,7 +4840,7 @@ mod tests {
                 let mut word = [0u8; 2];
                 bus.write_read(0x48, &[0x01], &mut word).await.unwrap();
 
-                assert_eq!(events(&log), vec![Event::Delay(5), Event::Read(0x01)]);
+                assert_eq!(events(&log), vec![Event::Delay(5_000), Event::Read(0x01)]);
             }
 
             /// A bus access that is never awaited never reaches the
