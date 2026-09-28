@@ -269,10 +269,10 @@ pub struct AlertEvent {
 pub(crate) mod ops {
     #[cfg(feature = "embedded-sensors-hal-async")]
     use crate::AlertCause;
-    use crate::Config;
     #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
     use crate::Hysteresis;
     use crate::inner::Configuration;
+    use crate::{Config, ConversionRate};
 
     /// Documented power-on reset value of the configuration register.
     /// Used by [`crate::Tmp108::probe`] to verify chip presence.
@@ -758,6 +758,21 @@ pub(crate) mod ops {
             Ok(())
         } else {
             Err(crate::Mode::from(raw))
+        }
+    }
+
+    /// The chip's conversion period (1/CR) in microseconds.
+    ///
+    /// Total over the four rates SBOS663A §7.5.3.5 defines. Callers
+    /// sleep for one period before reading the temperature register,
+    /// so an understated value here can return the previous
+    /// conversion rather than failing.
+    pub(crate) const fn conversion_period_us(rate: ConversionRate) -> u32 {
+        match rate {
+            ConversionRate::QuarterHz => 4_000_000,
+            ConversionRate::OneHz => 1_000_000,
+            ConversionRate::FourHz => 250_000,
+            ConversionRate::SixteenHz => 62_500,
         }
     }
 }
@@ -2343,7 +2358,7 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// ```
     pub fn wait_for_temperature<DELAY: DelayNs>(&mut self, delay: &mut DELAY) -> Result<Celsius, I2C::Error> {
         let config = self.read_configuration()?;
-        delay.delay_us(conversion_period_us(config.conversion_rate));
+        delay.delay_us(ops::conversion_period_us(config.conversion_rate));
         self.temperature()
     }
 
@@ -3030,7 +3045,7 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
         delay: &mut DELAY,
     ) -> Result<Celsius, I2C::Error> {
         let config = self.read_configuration().await?;
-        delay.delay_us(conversion_period_us(config.conversion_rate)).await;
+        delay.delay_us(ops::conversion_period_us(config.conversion_rate)).await;
         self.temperature().await
     }
 
@@ -3152,16 +3167,6 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
             .t_high()
             .write_async(|r| *r = THigh::from(limit.to_register()))
             .await
-    }
-}
-
-/// Compute the chip's conversion period (1/CR) in microseconds.
-const fn conversion_period_us(rate: ConversionRate) -> u32 {
-    match rate {
-        ConversionRate::QuarterHz => 4_000_000,
-        ConversionRate::OneHz => 1_000_000,
-        ConversionRate::FourHz => 250_000,
-        ConversionRate::SixteenHz => 62_500,
     }
 }
 
