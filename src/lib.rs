@@ -4024,6 +4024,45 @@ mod tests {
             }
         }
 
+        /// The conversion period the driver sleeps for before reading
+        /// the temperature register.
+        mod conversion_rate {
+            use super::*;
+
+            /// SBOS663A §7.5.3.5 defines four conversion rates. The
+            /// period is 1/CR, and it is what `wait_for_temperature`
+            /// sleeps for — understate it and the caller reads the
+            /// previous conversion.
+            ///
+            /// All four, not a sample: the function is total over a
+            /// four-inhabitant enum, so there is no reason to leave
+            /// three of them unchecked.
+            #[test]
+            fn every_rate_has_its_documented_period() {
+                for (rate, expected_us) in [
+                    (ConversionRate::QuarterHz, 4_000_000_u32),
+                    (ConversionRate::OneHz, 1_000_000),
+                    (ConversionRate::FourHz, 250_000),
+                    (ConversionRate::SixteenHz, 62_500),
+                ] {
+                    assert_eq!(
+                        ops::conversion_period_us(rate),
+                        expected_us,
+                        "{rate:?} must sleep for 1/CR"
+                    );
+                }
+            }
+
+            /// 16 Hz is the one rate whose period is not a whole
+            /// number of milliseconds. A driver that worked in
+            /// milliseconds would sleep 62 ms and read early.
+            #[test]
+            fn the_fastest_rate_is_not_a_whole_millisecond() {
+                assert_eq!(ops::conversion_period_us(ConversionRate::SixteenHz), 62_500);
+                assert_ne!(ops::conversion_period_us(ConversionRate::SixteenHz) % 1_000, 0);
+            }
+        }
+
         #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
         #[test]
         fn snap_hysteresis_accepts_within_tolerance() {
