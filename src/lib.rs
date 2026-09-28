@@ -4147,36 +4147,102 @@ mod tests {
             }
         }
 
+        /// Snapping a continuous `f32` hysteresis request onto the
+        /// four settings the chip actually has.
+        ///
+        /// The ±0.05 °C acceptance band is driver policy, not a
+        /// datasheet tolerance — SBOS663A §7.5.3.1 Table 9 specifies
+        /// the four discrete encodings and says nothing about how a
+        /// caller's arbitrary float should reach one.
         #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
-        #[test]
-        fn snap_hysteresis_accepts_within_tolerance() {
-            let cases: &[(f32, Hysteresis)] = &[
-                (0.0, Hysteresis::ZeroC),
-                (1.0, Hysteresis::OneC),
-                (2.0, Hysteresis::TwoC),
-                (4.0, Hysteresis::FourC),
-                (0.04, Hysteresis::ZeroC),
-                (0.1_f32 + 0.9_f32, Hysteresis::OneC),
-                (1.95, Hysteresis::TwoC),
-                (3.97, Hysteresis::FourC),
-            ];
-            for (input, expected) in cases {
-                assert_eq!(
-                    ops::snap_hysteresis(*input),
-                    Some(*expected),
-                    "input {input} should snap to {expected:?}"
-                );
-            }
-        }
+        mod hysteresis {
+            use super::*;
 
-        #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
-        #[test]
-        fn snap_hysteresis_rejects_out_of_tolerance_and_non_finite() {
-            for bad in [-0.5_f32, 0.5, 3.0, 5.0, -1.0, 10.0] {
-                assert_eq!(ops::snap_hysteresis(bad), None);
+            #[test]
+            fn snap_hysteresis_accepts_within_tolerance() {
+                let cases: &[(f32, Hysteresis)] = &[
+                    (0.0, Hysteresis::ZeroC),
+                    (1.0, Hysteresis::OneC),
+                    (2.0, Hysteresis::TwoC),
+                    (4.0, Hysteresis::FourC),
+                    (0.04, Hysteresis::ZeroC),
+                    (0.1_f32 + 0.9_f32, Hysteresis::OneC),
+                    (1.95, Hysteresis::TwoC),
+                    (3.97, Hysteresis::FourC),
+                ];
+                for (input, expected) in cases {
+                    assert_eq!(
+                        ops::snap_hysteresis(*input),
+                        Some(*expected),
+                        "input {input} should snap to {expected:?}"
+                    );
+                }
             }
-            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-                assert_eq!(ops::snap_hysteresis(bad), None);
+
+            #[test]
+            fn snap_hysteresis_rejects_out_of_tolerance_and_non_finite() {
+                for bad in [-0.5_f32, 0.5, 3.0, 5.0, -1.0, 10.0] {
+                    assert_eq!(ops::snap_hysteresis(bad), None);
+                }
+                for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                    assert_eq!(ops::snap_hysteresis(bad), None);
+                }
+            }
+
+            /// The band is **not** ±0.05 °C at every setting, and this
+            /// test records that rather than asserting the symmetry
+            /// the constant implies.
+            ///
+            /// `HYSTERESIS_TOLERANCE` is `0.05f32`, whose exact value
+            /// is 0.05000000074505805969. The rejection test is
+            /// `(input - closest).abs() > HYSTERESIS_TOLERANCE`, so
+            /// whether an edge is inside or outside depends on which
+            /// side of its own decimal value each literal rounded to:
+            ///
+            /// - `1.0 - 0.95f32` is 0.050000012, above the constant.
+            /// - `1.05f32 - 1.0` is 0.049999952, below it.
+            /// - `4.05f32 - 4.0` is 0.050000191, above it.
+            ///
+            /// Six of the eight edges are accepted; the two
+            /// rejections fall on opposite sides. That asymmetry is a
+            /// wart, and it is tracked in #76 — this test exists so a
+            /// change to it is a deliberate one rather than a silent
+            /// one.
+            #[test]
+            fn the_band_edges_are_asymmetric() {
+                let edges: &[(f32, Option<Hysteresis>)] = &[
+                    (-0.05, Some(Hysteresis::ZeroC)),
+                    (0.05, Some(Hysteresis::ZeroC)),
+                    (0.95, None),
+                    (1.05, Some(Hysteresis::OneC)),
+                    (1.95, Some(Hysteresis::TwoC)),
+                    (2.05, Some(Hysteresis::TwoC)),
+                    (3.95, Some(Hysteresis::FourC)),
+                    (4.05, None),
+                ];
+                for (input, expected) in edges {
+                    assert_eq!(
+                        ops::snap_hysteresis(*input),
+                        *expected,
+                        "edge {input} is measured behaviour, not a symmetry claim"
+                    );
+                }
+            }
+
+            /// A value midway between two settings is rejected.
+            ///
+            /// Which of the two neighbours it is measured against is
+            /// decided by `min_by`, which returns the first minimum —
+            /// so a tie resolves to the lower setting. That choice is
+            /// not observable here: both neighbours are half a degree
+            /// away, far outside the tolerance band, so either would
+            /// give `None`. What this pins is that the midpoints are
+            /// rejected rather than silently snapped.
+            #[test]
+            fn midpoints_between_settings_are_rejected() {
+                assert_eq!(ops::snap_hysteresis(0.5), None);
+                assert_eq!(ops::snap_hysteresis(1.5), None);
+                assert_eq!(ops::snap_hysteresis(3.0), None);
             }
         }
 
