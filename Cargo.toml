@@ -19,6 +19,9 @@ include = [
 edition = "2024"
 rust-version = "1.94.0"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
 device-driver = { version = "2.1.0", default-features = false }
 embedded-hal = "1.0.0"

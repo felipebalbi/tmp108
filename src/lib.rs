@@ -13,8 +13,8 @@
 //! ## I²C bus ownership
 //!
 //! The driver assumes single-master ownership of the TMP108. Several
-//! methods (notably `configure`, `one_shot`, and `shutdown` on both
-//! [`Tmp108`] and [`AsyncTmp108`]) perform a read-modify-write on the
+//! methods (notably `configure`, `one_shot`, and `shutdown`, on both
+//! the blocking and async drivers) perform a read-modify-write on the
 //! configuration register as two distinct I²C transactions. On a
 //! multi-master bus, a second master writing to register `0x01`
 //! between the read and the write will silently lose those writes —
@@ -24,15 +24,14 @@
 //!
 //! ## Driver lifecycle on drop
 //!
-//! Dropping a [`Tmp108`], [`AsyncTmp108`] or [`AlertTmp108`] does
-//! **not** change the chip's operating mode. The chip retains whatever
-//! `M` bits were last written. If you want the chip to stop drawing
-//! current after the driver goes out of scope, call
-//! [`Tmp108::shutdown`] or [`AsyncTmp108::shutdown`] (or finish an
-//! [`AsyncTmp108::continuous`] call cleanly) before dropping.
+//! Dropping any of the driver types does **not** change the chip's
+//! operating mode. The chip retains whatever `M` bits were last
+//! written. If you want the chip to stop drawing current after the
+//! driver goes out of scope, call [`Tmp108::shutdown`] or its async
+//! twin (or finish a `continuous` call cleanly) before dropping.
 //!
 //! In particular, dropping the future returned by
-//! [`AsyncTmp108::continuous`] mid-flight (e.g. via
+//! `AsyncTmp108::continuous` mid-flight (e.g. via
 //! `embassy_futures::select!` or `tokio::time::timeout`) leaves the
 //! chip in `Mode::Continuous` indefinitely. See the cancel-safety note
 //! on that method.
@@ -716,7 +715,11 @@ pub(crate) mod ops {
 /// for the lifetime of any operation; you can recover the bus by
 /// calling [`destroy`][Self::destroy].
 ///
-/// For the asynchronous flavor, see [`AsyncTmp108`].
+#[cfg_attr(feature = "async", doc = "For the asynchronous flavor, see [`AsyncTmp108`].")]
+#[cfg_attr(
+    not(feature = "async"),
+    doc = "For the asynchronous flavor, enable the `async` feature, which adds `AsyncTmp108`."
+)]
 pub struct Tmp108<I2C: I2c> {
     inner: Inner<Interface<I2C>>,
     addr: u8,
@@ -726,7 +729,8 @@ pub struct Tmp108<I2C: I2c> {
 ///
 /// Built on [`embedded_hal_async::i2c::I2c`]. The async flavor unlocks
 /// [`AsyncTmp108::continuous`] (which has no blocking equivalent) and
-/// is required by [`AlertTmp108`].
+#[cfg_attr(feature = "embedded-sensors-hal-async", doc = "is required by [`AlertTmp108`].")]
+#[cfg_attr(not(feature = "embedded-sensors-hal-async"), doc = "is required by `AlertTmp108`.")]
 ///
 /// For the blocking flavor, see [`Tmp108`].
 #[cfg(feature = "async")]
@@ -3100,7 +3104,14 @@ impl<I2C: AsyncI2c> AsyncRegisterInterface for AsyncInterface<I2C> {
 /// is the error type of an optional ALERT GPIO pin; it defaults to
 /// [`core::convert::Infallible`] so bare [`Tmp108`] (which has no pin)
 /// uses `Error<I2C::Error>` and never produces a [`Pin`][Self::Pin]
-/// error. [`AlertTmp108`] specializes to
+#[cfg_attr(
+    feature = "embedded-sensors-hal-async",
+    doc = "error. [`AlertTmp108`] specializes to"
+)]
+#[cfg_attr(
+    not(feature = "embedded-sensors-hal-async"),
+    doc = "error. `AlertTmp108` specializes to"
+)]
 /// `Error<I2C::Error, ALERT::Error>` and uses the [`Pin`][Self::Pin]
 /// variant when the GPIO peripheral fails.
 ///
@@ -3153,7 +3164,14 @@ impl<E: embedded_hal::i2c::Error + Eq, P: embedded_hal::digital::Error + Eq> Eq 
 /// Why a supervised one-shot acquisition did not produce a reading.
 ///
 /// Returned by [`Tmp108::one_shot`] and
-/// [`AsyncTmp108::one_shot`]. Distinct from [`Error`] because
+#[cfg_attr(
+    feature = "async",
+    doc = "[`AsyncTmp108::one_shot`]. Distinct from [`Error`] because"
+)]
+#[cfg_attr(
+    not(feature = "async"),
+    doc = "`AsyncTmp108::one_shot`. Distinct from [`Error`] because"
+)]
 /// the failure modes are entirely different: nothing here is an
 /// invalid *input*, and there is no ALERT pin in the sequence, so
 /// neither of `Error`'s non-bus variants can occur and `Error`'s `P`
