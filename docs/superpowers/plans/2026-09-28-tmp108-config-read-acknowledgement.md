@@ -21,7 +21,7 @@ Recorded on branch `config-read-acknowledgement` at spec commit `1c22935f6011`. 
 | Build | `cargo build --all-features --all-targets --locked` | 0 warnings, 0 errors |
 | Clippy | `cargo clippy --all-features --all-targets --locked -- -W clippy::suspicious -W clippy::correctness -W clippy::perf -W clippy::style` | exit 0, 0 warnings |
 | Format | `cargo +nightly fmt --check` | exit 0 |
-| Docs (every feature combination) | `cargo doc --no-deps --locked` ×7, see gate | exit 0, **0 warnings in all seven** |
+| Docs (every feature combination) | `cargo hack --feature-powerset doc --no-deps --locked` | **originally 9 warnings, 0 from commit 4 onward** — see below |
 | Tests (default) | `cargo test --locked` | 53 unit + 5 reexports + 22 doc pass, 3 ignored |
 | Tests (all) | `cargo test --locked -F async,embedded-sensors-hal-async` | 164 unit + 6 reexports + 53 doc pass, 3 ignored |
 | Doctests | `cargo test --doc --locked -F async,embedded-sensors-hal-async` | 53 pass, 3 ignored |
@@ -29,6 +29,14 @@ Recorded on branch `config-read-acknowledgement` at spec commit `1c22935f6011`. 
 | README | `bash ./scripts/check-readme-snippets.sh` | "README snippets match (3 checked)." |
 
 Test counts **will rise** as tasks add tests. That is expected. What must not change: zero warnings, zero failures, and the ignored count staying at 3.
+
+### The doc-warning baseline moved mid-plan
+
+The doc row above is the one exception to "must produce exactly this". The original baseline, inherited from `upstream/main`, was **9 unresolved intra-doc links** on the default-feature build — links from ungated items to feature-gated ones, which cannot resolve when the feature is off. It was 9 at the spec commit, the plan commit, and the `feat:` commit; none of those introduced any.
+
+Commit 4 (`docs: resolve the intra-doc links…`) fixed them, and it was actually **ten**, not nine: `src/lib.rs:732` sat on an `async`-gated item pointing at an `embedded-sensors-hal-async`-gated one, so it warned only in the middle of the feature matrix and was invisible to both a default build and an `--all-features` build.
+
+**From commit 4 onward the baseline is 0 in every combination**, and that is what later tasks must hold. Verify with a set comparison rather than a count if you ever need to distinguish inherited warnings from new ones.
 
 ### The lint configuration is stricter than AGENTS.md's command line
 
@@ -1052,6 +1060,12 @@ async fn main() -> anyhow::Result<()> {
 
     // 1-2. Interrupt mode at 0.25 Hz, and a high limit well below
     // ambient so the over-temperature condition is true and stays true.
+    //
+    // `configure` cannot set the mode: `Config` has no mode field and
+    // `apply_config` preserves M. A previous run that ended in shutdown
+    // would leave the part with no conversions running and nothing
+    // would ever latch. The `continuous` wrapper below is what makes
+    // this independent of the starting state.
     tmp.configure(Config {
         thermostat_mode: Thermostat::Interrupt,
         alert_polarity: Polarity::ActiveLow,
@@ -1067,35 +1081,46 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|_| anyhow!("set_high_limit failed"))?;
 
-    // 3. One conversion period at 0.25 Hz, plus margin, to latch FH.
-    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    tmp.continuous(async |t| {
+        // 3. One conversion period at 0.25 Hz, plus margin, to latch FH.
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 
-    // 4. Park in shutdown so no further conversion can re-assert FH.
-    tmp.shutdown().await.map_err(|_| anyhow!("shutdown failed"))?;
+        // 4. Remove the over-temperature condition so no further
+        //    conversion can re-latch FH. This writes the T_high
+        //    register only -- it does NOT touch the configuration
+        //    register, so it does not acknowledge.
+        //
+        //    Do NOT use `shutdown()` here. It also stops conversions,
+        //    but it is a read-modify-write, so its read half
+        //    acknowledges the alert and releases the pin before step 5
+        //    can observe it. That is the exact hazard this change
+        //    documents, and the first attempt fell into it.
+        t.set_high_limit(Celsius::try_from_degrees(100.0).unwrap()).await?;
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 
-    // 5. ALERT asserted. POL = ActiveLow, so asserted reads low.
-    assert!(alert.is_low().unwrap(), "expected ALERT asserted before the ack");
+        // 5. ALERT still asserted: interrupt mode latches, so the flag
+        //    and the pin survive the condition clearing.
+        assert!(alert.is_low().unwrap(), "expected ALERT still asserted");
 
-    // 6. The acknowledging read hands the flag back.
-    let first = tmp
-        .read_configuration_and_acknowledge()
-        .await
-        .map_err(|_| anyhow!("first ack read failed"))?;
-    println!("first:  low={} high={}", first.low, first.high);
-    assert!(first.high, "FH should be latched");
-    assert!(!first.low, "FL should be clear");
+        // 6. The acknowledging read hands the flag back.
+        let first = t.read_configuration_and_acknowledge().await?;
+        println!("first:  low={} high={}", first.low, first.high);
+        assert!(first.high, "FH should be latched");
+        assert!(!first.low, "FL should be clear");
 
-    // 7. That read released the pin.
-    assert!(alert.is_high().unwrap(), "expected ALERT released by the ack");
+        // 7. That read released the pin.
+        assert!(alert.is_high().unwrap(), "expected ALERT released by the ack");
 
-    // 8. The evidence is gone, though nothing physical changed.
-    let second = tmp
-        .read_configuration_and_acknowledge()
-        .await
-        .map_err(|_| anyhow!("second ack read failed"))?;
-    println!("second: low={} high={}", second.low, second.high);
-    assert!(!second.high, "FH should have been consumed by the first read");
-    assert_eq!(second.config, first.config);
+        // 8. The evidence is gone, though nothing physical changed.
+        let second = t.read_configuration_and_acknowledge().await?;
+        println!("second: low={} high={}", second.low, second.high);
+        assert!(!second.high, "FH should have been consumed");
+        assert_eq!(second.config, first.config);
+
+        Ok(())
+    })
+    .await
+    .map_err(|_| anyhow!("continuous block failed"))?;
 
     println!("OK: acknowledgement confirmed on hardware");
     Ok(())
@@ -1119,8 +1144,8 @@ OK: acknowledgement confirmed on hardware
 Diagnosis if it fails:
 
 - `first.high == false` — the decode is wrong; check `decode_alert_snapshot` reads `c.fh()` into `high`, and that FH is bit 4.
-- Panic at step 5 (`ALERT asserted`) — the part never latched. The ambient may be below the 10 °C limit, or the sleep was too short for the configured rate.
-- Panic at step 7 (`ALERT released`) — the shutdown in step 4 did not take, so a conversion re-asserted between the read and the pin check. This is the exact race the spec's Evidence section avoids.
+- Panic at step 5 (`ALERT still asserted`) — nothing latched. Either the ambient is below the 10 °C limit, or the part was not converting. The latter is the likely one: if an earlier run left it in shutdown, `configure()` will not bring it back, because `Config` has no mode field. The `continuous` wrapper is what fixes this; if you removed it, put it back.
+- Panic at step 7 (`ALERT released`) — the pin did not release on the acknowledging read. Check the part really is in `Thermostat::Interrupt`; in `Thermostat::Comparator` the read does not release it.
 
 - [ ] **Step 2: Delete the scratch example and restore the chip**
 
@@ -1159,11 +1184,20 @@ If an example hangs with no output at all, check AGENTS.md's "Hardware setup" tr
 
 ## Done
 
-Branch `config-read-acknowledgement`, four commits on top of `upstream/main`:
+Branch `config-read-acknowledgement`, nine commits on top of `upstream/main`:
 
 1. `docs:` the design spec
-2. `feat:` `read_configuration_and_acknowledge`
-3. `docs:` the acknowledgement documentation
-4. `docs(readme):` the Gotchas bullet
+2. `docs:` this plan
+3. `feat:` `read_configuration_and_acknowledge`
+4. `docs:` resolve the intra-doc links that break on a default-feature build
+5. `docs:` run the doc build under every feature combination
+6. `docs:` mark feature-gated items with `doc(cfg)` badges
+7. `ci:` build the documentation under every feature combination
+8. `docs:` the acknowledgement documentation
+9. `docs(readme):` the Gotchas bullet
+
+Commits 4 through 7 were not in the original plan. They came out of the work: the gate in Task 1 surfaced ten pre-existing unresolved intra-doc links, and chasing those revealed that `Cargo.toml` had no `[package.metadata.docs.rs]`, so docs.rs was publishing the crate with every optional feature off — no `AsyncTmp108`, no `AlertTmp108`, and all ten links broken. Fixing that made the `doc_cfg` badges worth adding, since gated items would otherwise render with no indication they need a feature, and the CI doc job needed to cover every feature combination to stop the class recurring.
+
+That means this plan's "File structure" section is now incomplete: `Cargo.toml` and `.github/workflows/check.yml` are also modified. `Cargo.toml` gains only `[package.metadata.docs.rs]` — the version and `CHANGELOG.md` remain untouched, as AGENTS.md gotcha #9 requires.
 
 **Do not open a pull request.** The branch is handed back for review first.
