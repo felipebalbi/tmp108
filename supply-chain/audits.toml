@@ -35,6 +35,38 @@ proc-macro and embedded-io subtree that v1 pulled in is gone.
 Assisted-by: opencode:claude-opus-5
 """
 
+[[audits.device-driver]]
+who = "Felipe Balbi <febalbi@microsoft.com>"
+criteria = "safe-to-deploy"
+delta = "2.1.0 -> 2.1.1"
+notes = """
+No-op for the runtime crate. `src/` is byte-identical between the two
+published packages, so every conclusion in the 1.0.9 -> 2.1.0 audit carries
+forward unchanged: no build script (`build = false` still holds), the sole
+powerful import is still the rustdoc `include_str!(concat!("../",
+env!("CARGO_PKG_README")))` in lib.rs, and the unsafe surface (the lsb0
+bit-packing helpers in ops.rs and `unsafe trait Fieldset` in fieldset.rs) is
+untouched.
+
+The three fixes in the 2.1.1 release notes -- the `defmt::Format` derives on
+generated devices and blocks, the MIR-pass speedup with its identifier `Hash`
+and `PartialEq` corrections, and the inclusive-vs-exclusive range fix for
+repeated fields -- all land in `device-driver-generation`, not here. tmp108
+depends on device-driver with `default-features = false` and enables neither
+`macros` nor `defmt`, so none of that code is in our dependency graph;
+`cargo tree -e normal -p device-driver` still shows it with zero transitive
+dependencies.
+
+What is left in the delta is packaging only: the version bump itself, the
+pinned optional `device-driver-macros` dep moving `=2.1.0 -> =2.1.1` (not
+enabled here), a new `[[test]]` target plus its `tests/repeats.rs` regression
+test for the repeated-field fix, and the removal of the explicit
+`readme = "README.md"` key from the workspace-side Cargo.toml. That last one
+is cosmetic: the packaged manifest cargo publishes still carries
+`readme = "README.md"`, so `CARGO_PKG_README` resolves as before. Test code
+is not compiled into the library and adds no capability to a consumer.
+"""
+
 [[audits.device-driver-generation]]
 who = "Jerry Xie <jerryxie@microsoft.com>"
 criteria = "safe-to-deploy"
