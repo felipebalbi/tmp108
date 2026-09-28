@@ -297,10 +297,76 @@ and the next audit would start a second one.
 | `continuous()` entry failure | `tests::asynchronous` |
 | Async reset mirror | `tests::asynchronous` |
 
+## Addendum — the layout tests assert a host-dependent word
+
+Found while executing this plan, not during the original survey.
+
+Eighteen assertions at `src/lib.rs:3692-3754` compare the
+configuration fieldset against a packed word using **native**-endian
+decoding:
+
+```rust
+assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1026);
+```
+
+`from_ne_bytes` resolves to `from_le_bytes` on x86, so they pass here
+and would fail on a big-endian host. `default_configuration`
+(`src/lib.rs:3685`), four lines above them, correctly uses
+`from_le_bytes` — so the module contradicts itself.
+
+This is the cleanup issue #66 Part 2 asked for in the same breath as
+recording the byte order as correct:
+
+> Prefer explicit byte-array assertions over `from_ne_bytes` in
+> layout tests so this stops looking suspicious.
+
+Replacing the packed word with the wire bytes it stands for removes
+the host dependency and states the thing the test actually cares
+about. `Configuration` is `Copy` and already converts to `[u8; 2]`,
+so `assert_eq!(<[u8; 2]>::from(cfg), [0x26, 0x10]);` is a direct
+substitution.
+
+### Why the DDSL keeps `default-byte-order: LE`
+
+The `from_ne_bytes` confusion prompted a second look at the DDSL,
+which declares `LE` for a device the datasheet describes as MSB-first
+(SBOS663A §7.3.4, §7.5.3, §7.5.4). The alternative was measured
+rather than argued: `default-byte-order` switched to `BE`, all eight
+configuration fields renumbered (`m` 1:0 → 9:8, `cr` 6:5 → 14:13,
+`hys` 13:12 → 5:4, `pol` 15 → 7, and so on), the three reset values
+rewritten, and `src/inner.rs` regenerated with `ddc`.
+
+Result: 12 DDSL lines plus a regenerate, **no driver changes, no test
+changes**, and the full matrix green at 60/6/24, 83/6/44 and
+189/7/56. The generated reset byte arrays were byte-identical —
+`[34, 16]`, `[128, 0]`, `[127, 248]`. The two encodings are the same
+wire format under different labels.
+
+Since it is a pure relabel, it was judged on readability, and neither
+option wins outright:
+
+- `BE` would let the limit registers declare the datasheet's literal
+  `0x7FF8` and `0x8000` instead of the byte-swapped `0xF87F` and
+  `0x0080` that today need eight lines of comment in `tmp108.ddsl`.
+- `LE` keeps the field offsets matching Table 8's per-byte bit
+  numbering: `m 1:0` reads as "BYTE 1, D1:D0", where `m 9:8` does not.
+
+`BE` would also leave `ops::POR_CONFIG` (`0x1022`) and `probe()`'s
+`from_le_bytes` as the inconsistent remainder, which nothing would
+catch. The status quo stays; this section exists so the next reader
+does not re-derive the equivalence from scratch.
+
+Note that issue #66's warning — "changing the serialisation to 'fix'
+the endianness would introduce a defect" — is about a *different*
+change: flipping the byte order without renumbering the fields. A
+coordinated relabel does not touch serialisation at all.
+
 ## Non-goals
 
 - No change to `snap_hysteresis` behaviour. The asymmetry is recorded
   and referred out.
+- No change to `tmp108.ddsl`'s byte order, and therefore no
+  regeneration of `src/inner.rs`. See the addendum above.
 - No change to `Error<E, P>`, to `Celsius`'s domain, to `Config`'s
   inhabitants, or to the `THIGH >= TLOW` relationship. Part 2 of the
   issue addresses each of these directly.
@@ -325,6 +391,9 @@ Twelve, one concern each, each building and passing clippy on its own.
 10. `docs:` stop promising `continuous()` unconditionally shuts down
 11. `test:` mirror the limit-register reset assertions on the async driver
 12. `test:` pin `Celsius`'s `Display` and ordering
+
+A thirteenth was added mid-execution: `test:` assert configuration
+layout against wire bytes, covering the addendum above.
 
 ## Verification
 

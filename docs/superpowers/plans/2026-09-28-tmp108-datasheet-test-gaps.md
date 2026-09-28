@@ -1974,6 +1974,110 @@ git commit -F "C:\Users\febalbi\AppData\Local\Temp\opencode\commitmsg.txt"
 
 ---
 
+## Task 4b: Assert configuration layout against wire bytes
+
+**Added mid-execution.** Not in the original survey — found while
+answering a question about why `tmp108.ddsl` declares
+`default-byte-order: LE` for a device the datasheet describes as
+MSB-first. See the spec's addendum for why the DDSL is staying as it
+is; this task fixes the thing that made it look wrong.
+
+Eighteen assertions at `src/lib.rs:3692-3754` compare the
+configuration fieldset against a packed word using **native**-endian
+decoding. `from_ne_bytes` resolves to `from_le_bytes` on x86, so they
+pass here and would fail on a big-endian host. `default_configuration`
+at `src/lib.rs:3685`, four lines above, correctly uses
+`from_le_bytes` — the module contradicts itself.
+
+Issue #66 Part 2 asked for exactly this:
+
+> Prefer explicit byte-array assertions over `from_ne_bytes` in
+> layout tests so this stops looking suspicious.
+
+**Files:**
+- Modify: `src/lib.rs:3682-3755` (seven tests in the top-level `mod tests`)
+
+- [ ] **Step 1: Convert all eighteen assertions**
+
+`Configuration` is `Copy` and already converts to `[u8; 2]`, so each
+`assert_eq!(u16::from_ne_bytes(cfg.into()), WORD);` becomes
+`assert_eq!(<[u8; 2]>::from(cfg), [LOW, HIGH]);` where the word's low
+byte is wire byte 0. The conversions, all verified:
+
+| Word | Wire bytes |
+|---|---|
+| `0x1020` | `[0x20, 0x10]` |
+| `0x1021` | `[0x21, 0x10]` |
+| `0x1022` | `[0x22, 0x10]` |
+| `0x1026` | `[0x26, 0x10]` |
+| `0x102a` | `[0x2a, 0x10]` |
+| `0x1032` | `[0x32, 0x10]` |
+| `0x103a` | `[0x3a, 0x10]` |
+| `0x1002` | `[0x02, 0x10]` |
+| `0x1042` | `[0x42, 0x10]` |
+| `0x1062` | `[0x62, 0x10]` |
+| `0x0022` | `[0x22, 0x00]` |
+| `0x2022` | `[0x22, 0x20]` |
+| `0x3022` | `[0x22, 0x30]` |
+| `0x9022` | `[0x22, 0x90]` |
+
+Also convert `default_configuration` at `src/lib.rs:3685` from
+`from_le_bytes` to the same byte-array form, so all eight tests in the
+module are consistent.
+
+- [ ] **Step 2: Add a comment recording the byte order**
+
+Above `default_configuration`, state the convention once so the
+remaining tests read without a lookup:
+
+```rust
+    /// Wire bytes, not a packed word.
+    ///
+    /// The configuration register is transmitted MSB first (SBOS663A
+    /// §7.3.4), so wire byte 0 is Table 8's BYTE 1 — the one carrying
+    /// M, TM, FL, FH, CR and ID. The DDSL models the register as a
+    /// little-endian word, which puts that same byte at the word's
+    /// low end; the two descriptions agree, and asserting the bytes
+    /// directly avoids having to hold both in mind at once.
+    ///
+    /// These assertions used `from_ne_bytes`, which is host-endian
+    /// and would have failed on a big-endian target.
+```
+
+- [ ] **Step 3: Verify**
+
+```bash
+cargo test --locked
+cargo test --locked -F async,embedded-sensors-hal-async
+cargo +nightly fmt --check
+cargo clippy --all-features --all-targets
+```
+
+Note: plain `cargo clippy` — `Cargo.toml:55` sets `pedantic = "deny"`,
+which is stricter than the lint flags AGENTS.md lists.
+
+Test counts must be **unchanged**. This converts assertions; it adds
+none.
+
+- [ ] **Step 4: Prove the assertions still bite**
+
+Temporarily change one expectation (e.g. `[0x26, 0x10]` to
+`[0x27, 0x10]` in `modify_thermostat_mode`), confirm FAIL, revert.
+
+- [ ] **Step 5: Commit**
+
+```
+test: assert configuration layout against wire bytes
+
+Eighteen assertions decoded the fieldset with from_ne_bytes, which
+is host-endian and would fail on a big-endian target; the test four
+lines above them already used from_le_bytes. Asserting the wire
+bytes directly drops the host dependency and states what the layout
+tests are actually about.
+```
+
+---
+
 ## Task 13: Full verification
 
 Everything is committed. Run the complete local matrix from AGENTS.md before handing the branch back.
