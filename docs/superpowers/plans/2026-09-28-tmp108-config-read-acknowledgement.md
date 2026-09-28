@@ -21,7 +21,7 @@ Recorded on branch `config-read-acknowledgement` at spec commit `1c22935f6011`. 
 | Build | `cargo build --all-features --all-targets --locked` | 0 warnings, 0 errors |
 | Clippy | `cargo clippy --all-features --all-targets --locked -- -W clippy::suspicious -W clippy::correctness -W clippy::perf -W clippy::style` | exit 0, 0 warnings |
 | Format | `cargo +nightly fmt --check` | exit 0 |
-| Docs | `cargo doc --no-deps --all-features --locked` | exit 0, 0 warnings |
+| Docs (every feature combination) | `cargo doc --no-deps --locked` ×7, see gate | exit 0, **0 warnings in all seven** |
 | Tests (default) | `cargo test --locked` | 53 unit + 5 reexports + 22 doc pass, 3 ignored |
 | Tests (all) | `cargo test --locked -F async,embedded-sensors-hal-async` | 164 unit + 6 reexports + 53 doc pass, 3 ignored |
 | Doctests | `cargo test --doc --locked -F async,embedded-sensors-hal-async` | 53 pass, 3 ignored |
@@ -62,6 +62,12 @@ Run this **after every commit**, not just at the end. It is referenced below as 
 ```bash
 cargo +nightly fmt --check
 cargo clippy --all-features --all-targets --locked -- -W clippy::suspicious -W clippy::correctness -W clippy::perf -W clippy::style
+cargo doc --no-deps --locked
+cargo doc --no-deps --locked -F async
+cargo doc --no-deps --locked -F embedded-sensors-hal
+cargo doc --no-deps --locked -F embedded-sensors-hal-async
+cargo doc --no-deps --locked -F async,embedded-sensors-hal
+cargo doc --no-deps --locked -F async,embedded-sensors-hal-async
 cargo doc --no-deps --all-features --locked
 cargo test --locked
 cargo test --locked -F async
@@ -77,9 +83,21 @@ cargo hack --feature-powerset check --locked
 bash ./scripts/check-readme-snippets.sh
 ```
 
-Expected from all fifteen: exit 0, no `warning:` lines, no failures.
+Expected from all twenty-one: exit 0, no `warning:` lines, no failures.
 
 If any command fails, **fix it before the next commit** by amending the commit under test (`git commit --amend`), not by adding a follow-up fix commit. AGENTS.md gotcha #6: each commit must be clean independently, so history stays bisectable.
+
+### Why the doc build is run under seven feature combinations
+
+Because two bookend builds cannot see a whole class of broken link.
+
+An intra-doc link breaks when the documented item exists but the link target does not. A link on an `async`-gated item pointing at an `embedded-sensors-hal-async`-gated item is invisible to **both** ends of the matrix: under default features the enclosing item does not exist so nothing is documented, and under `--all-features` the target does exist so the link resolves. It warns only in the middle.
+
+That is not hypothetical — `src/lib.rs:732` was exactly this, and was missed until the intermediate combinations were checked. The crate had accumulated ten such warnings because CI's doc job only builds one configuration.
+
+This matters most for **Task 2**, which adds a crate-level section full of intra-doc links to items across several feature gates. The current baseline is **0 warnings in every combination**; anything above 0 anywhere is a regression introduced by that task.
+
+`cargo hack --feature-powerset check` does not help here — it runs `check`, not `doc`, so it never evaluates a link.
 
 ### Why the powerset step is not optional here
 
@@ -557,7 +575,7 @@ Expected: PASS, unit count rises from 164.
 
 Run every command in "The verification gate" above.
 
-Expected: all fifteen exit 0 with no `warning:` lines.
+Expected: all twenty-one exit 0 with no `warning:` lines.
 
 Pay attention to `cargo hack --feature-powerset check --locked`. If it fails on a combination that does not include `embedded-sensors-hal-async`, a `#[cfg]` removal in Step 3 was incomplete or `interrupt_alert_cause`'s gate at 529 was removed by mistake.
 
@@ -837,7 +855,7 @@ Expected: PASS. The `sensor_mut` doctest is the one at risk.
 
 Run every command in "The verification gate".
 
-Expected: all fifteen exit 0, no `warning:` lines. `cargo doc` is the important one for this task — eleven new intra-doc links resolve there or not at all.
+Expected: all twenty-one exit 0, no `warning:` lines. The **seven `cargo doc` runs** are the ones that matter for this task: it adds eleven new intra-doc links, and a link to a feature-gated item only warns in the combinations where the documented item exists but the target does not. The baseline is 0 warnings in all seven — any nonzero result is this task's regression.
 
 - [ ] **Step 8: Commit**
 
@@ -923,7 +941,7 @@ Expected: one match.
 
 Run every command in "The verification gate".
 
-Expected: all fifteen exit 0, no `warning:` lines. `README.md` is included into the crate docs via `#![doc = include_str!("../README.md")]` at `src/lib.rs:41`, so a malformed bullet shows up as a `cargo doc` warning, not just a cosmetic issue.
+Expected: all twenty-one exit 0, no `warning:` lines. `README.md` is included into the crate docs via `#![doc = include_str!("../README.md")]` at `src/lib.rs:41`, so a malformed bullet shows up as a `cargo doc` warning, not just a cosmetic issue.
 
 - [ ] **Step 5: Commit**
 
@@ -976,7 +994,7 @@ The spec commit `1c22935f6011` is documentation-only and will pass trivially; it
 
 Run every command in "The verification gate" one final time at the branch tip.
 
-Expected: all fifteen exit 0. Compare the test counts against the baseline table — they should be *higher*, with warnings still zero, failures zero, and ignored still 3.
+Expected: all twenty-one exit 0. Compare the test counts against the baseline table — they should be *higher*, with warnings still zero, failures zero, and ignored still 3.
 
 - [ ] **Step 3: Supply chain**
 
