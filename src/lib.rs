@@ -4053,6 +4053,63 @@ mod tests {
             }
 
             #[test]
+            fn ties_round_half_away_from_zero() {
+                // `f32::round` lives in `std` and this crate is
+                // `no_std`, so the conversion adds a half and
+                // truncates toward zero. That rounds ties away from
+                // zero, and it is policy rather than anything the
+                // datasheet asks for — the part only ever reports
+                // exact sixteenths.
+                //
+                // A tie is a value exactly half an LSB above a
+                // representable one, i.e. an odd multiple of 1/32.
+                for (degrees, expected) in [
+                    (0.03125_f32, 1_i16),
+                    (-0.03125, -1),
+                    (0.09375, 2),
+                    (-0.09375, -2),
+                    (1.53125, 25),
+                    (-1.53125, -25),
+                ] {
+                    assert_eq!(
+                        Celsius::try_from_degrees(degrees).unwrap().sixteenths(),
+                        expected,
+                        "{degrees} is a tie and must round away from zero"
+                    );
+                }
+            }
+
+            #[test]
+            fn the_rejection_boundaries_are_exact_and_closed() {
+                // The boundaries are exactly representable: -2048.5/16
+                // is -128.03125 and 2047.5/16 is 127.96875. The
+                // comparisons are `<=` and `>=`, so the boundary value
+                // itself is rejected and the interval is open.
+                //
+                // Checked one `f32` ulp either side, not at a rounded
+                // decimal, because a decimal approximation cannot
+                // distinguish "the boundary is closed" from "the
+                // boundary is a little further out than I thought".
+                // `LOWEST_ACCEPTED` and `HIGHEST_ACCEPTED` are in
+                // sixteenths (-2048.5 and 2047.5); dividing by 16
+                // gives degrees. Both divisions are exact — the
+                // divisor is a power of two.
+                let low = -128.03125_f32;
+                let high = 127.96875_f32;
+
+                assert_eq!(low, LOWEST_ACCEPTED / 16.0);
+                assert_eq!(high, HIGHEST_ACCEPTED / 16.0);
+
+                assert_eq!(Celsius::try_from_degrees(low.next_down()), Err(OutOfRange::TooLow));
+                assert_eq!(Celsius::try_from_degrees(low), Err(OutOfRange::TooLow));
+                assert_eq!(Celsius::try_from_degrees(low.next_up()), Ok(Celsius::MIN));
+
+                assert_eq!(Celsius::try_from_degrees(high.next_down()), Ok(Celsius::MAX));
+                assert_eq!(Celsius::try_from_degrees(high), Err(OutOfRange::TooHigh));
+                assert_eq!(Celsius::try_from_degrees(high.next_up()), Err(OutOfRange::TooHigh));
+            }
+
+            #[test]
             fn known_datasheet_values_decode() {
                 // Table 7 of the datasheet, as register words.
                 for (word, degrees) in [
