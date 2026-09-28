@@ -6129,6 +6129,46 @@ mod tests {
             mock.done();
         }
 
+        #[tokio::test]
+        async fn continuous_skips_the_closure_and_cleanup_when_entry_fails() {
+            use embedded_hal_async::i2c::Error as _;
+
+            // The entry read-modify-write is the first thing
+            // `continuous` does. If it fails, the closure never runs
+            // and no cleanup is attempted.
+            //
+            // This test fails the *read*, so nothing was written and
+            // the mode really is unchanged. A failed *write* is a
+            // different case: the MS byte carries M, and SBOS663A §6.6
+            // permits MS-byte-only updates, so a partial write can
+            // leave the part converting. The driver cannot tell the
+            // two apart, which is why the documentation tells callers
+            // to treat the mode as unknown.
+            //
+            // The single scripted transaction is the assertion:
+            // `done()` fails if a closure body, or a cleanup
+            // shutdown, issued anything further.
+            let entry_err = embedded_hal::i2c::ErrorKind::Bus;
+
+            let expectations = vec![Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]).with_error(entry_err)];
+            let mock = Mock::new(&expectations);
+            let mut tmp108 = AsyncTmp108::new_with_a0_gnd(mock);
+
+            let mut closure_ran = false;
+            let result = tmp108
+                .continuous(async |_| {
+                    closure_ran = true;
+                    Ok(())
+                })
+                .await;
+
+            assert_eq!(result.err().map(|e| e.kind()), Some(entry_err));
+            assert!(!closure_ran, "the closure must not run when entry failed");
+
+            let mut mock = tmp108.destroy();
+            mock.done();
+        }
+
         #[cfg(feature = "embedded-sensors-hal-async")]
         #[tokio::test]
         async fn handle_threshold_alerts_properly() {
