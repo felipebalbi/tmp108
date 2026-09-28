@@ -246,3 +246,72 @@ fn pin_async_one_shot() {
         tmp.one_shot(delay, settle_ms).await
     }
 }
+
+/// `AlertSnapshot` is ungated public surface: it must be reachable and
+/// destructurable with no optional features enabled. The gate-free
+/// `#[test]` is the point — it is what catches a regression that
+/// re-introduces the `embedded-sensors-hal-async` gate the type
+/// carried while it was `pub(crate)`.
+///
+/// Constructing it by literal, with no `..`, pins the deliberate
+/// absence of `#[non_exhaustive]`, exactly as
+/// `one_shot_error_is_reachable_and_exhaustive` does for `OneShotError`.
+// Pinning the `Clone` impl is the point of the assertion, so the
+// redundant clone on a `Copy` type is deliberate.
+#[allow(clippy::clone_on_copy)]
+#[test]
+fn alert_snapshot_is_reachable_and_exhaustive() {
+    use tmp108::{AlertSnapshot, Config};
+
+    fn eq_bound<T: Eq>(_: T) {}
+
+    let snapshot = AlertSnapshot {
+        config: Config::default(),
+        low: false,
+        high: true,
+    };
+
+    let AlertSnapshot { config, low, high } = snapshot;
+    assert_eq!(config, Config::default());
+    assert!(!low);
+    assert!(high);
+
+    // Clone, Copy, Debug, PartialEq, Eq, Hash.
+    let copied = snapshot;
+    assert_eq!(copied, snapshot.clone());
+    assert_ne!(
+        snapshot,
+        AlertSnapshot {
+            config: Config::default(),
+            low: true,
+            high: true,
+        }
+    );
+    assert_ne!(format!("{snapshot:?}"), "");
+    let mut set = std::collections::HashSet::new();
+    assert!(set.insert(snapshot));
+    assert!(!set.insert(copied));
+    eq_bound(copied);
+}
+
+/// `Tmp108::read_configuration_and_acknowledge` is public surface, and
+/// returns the snapshot type rather than `Config`.
+#[allow(dead_code)]
+fn pin_blocking_read_configuration_and_acknowledge() {
+    fn _type_check<I2C: embedded_hal::i2c::I2c>(
+        tmp: &mut tmp108::Tmp108<I2C>,
+    ) -> Result<tmp108::AlertSnapshot, I2C::Error> {
+        tmp.read_configuration_and_acknowledge()
+    }
+}
+
+/// The async twin carries the same signature over the async I2C trait.
+#[cfg(feature = "async")]
+#[allow(dead_code)]
+fn pin_async_read_configuration_and_acknowledge() {
+    async fn _type_check<I2C: embedded_hal_async::i2c::I2c>(
+        tmp: &mut tmp108::AsyncTmp108<I2C>,
+    ) -> Result<tmp108::AlertSnapshot, I2C::Error> {
+        tmp.read_configuration_and_acknowledge().await
+    }
+}
