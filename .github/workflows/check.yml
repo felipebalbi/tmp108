@@ -109,10 +109,27 @@ jobs:
       - name: Install nightly
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: cargo doc
+      - name: cargo install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      # Building a single configuration cannot see a whole class of broken
+      # intra-doc link. A link on an `async`-gated item pointing at an
+      # `embedded-sensors-hal-async`-gated item resolves under --all-features,
+      # and is not documented at all under default features, so it warns only
+      # in the middle of the matrix. Ten such warnings had accumulated before
+      # this job checked every combination.
+      - name: cargo doc (every feature combination)
+        run: cargo hack --feature-powerset doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+
+      # Mirrors what docs.rs actually builds, per [package.metadata.docs.rs]
+      # in Cargo.toml. The powerset above subsumes it, but this is the
+      # configuration users see published, so it is worth naming explicitly.
+      - name: cargo doc (as docs.rs builds it)
         run: cargo doc --no-deps --all-features --locked
         env:
-          RUSTDOCFLAGS: --cfg docsrs
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
 
   hack:
     # cargo-hack checks combinations of feature flags to ensure that features are all additive
