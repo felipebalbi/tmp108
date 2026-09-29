@@ -269,10 +269,10 @@ pub struct AlertEvent {
 pub(crate) mod ops {
     #[cfg(feature = "embedded-sensors-hal-async")]
     use crate::AlertCause;
-    use crate::Config;
     #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
     use crate::Hysteresis;
     use crate::inner::Configuration;
+    use crate::{Config, ConversionRate};
 
     /// Documented power-on reset value of the configuration register.
     /// Used by [`crate::Tmp108::probe`] to verify chip presence.
@@ -758,6 +758,21 @@ pub(crate) mod ops {
             Ok(())
         } else {
             Err(crate::Mode::from(raw))
+        }
+    }
+
+    /// The chip's conversion period (1/CR) in microseconds.
+    ///
+    /// Total over the four rates SBOS663A §7.5.3.5 defines. Callers
+    /// sleep for one period before reading the temperature register,
+    /// so an understated value here can return the previous
+    /// conversion rather than failing.
+    pub(crate) const fn conversion_period_us(rate: ConversionRate) -> u32 {
+        match rate {
+            ConversionRate::QuarterHz => 4_000_000,
+            ConversionRate::OneHz => 1_000_000,
+            ConversionRate::FourHz => 250_000,
+            ConversionRate::SixteenHz => 62_500,
         }
     }
 }
@@ -2343,7 +2358,7 @@ impl<I2C: I2c> Tmp108<I2C> {
     /// ```
     pub fn wait_for_temperature<DELAY: DelayNs>(&mut self, delay: &mut DELAY) -> Result<Celsius, I2C::Error> {
         let config = self.read_configuration()?;
-        delay.delay_us(conversion_period_us(config.conversion_rate));
+        delay.delay_us(ops::conversion_period_us(config.conversion_rate));
         self.temperature()
     }
 
@@ -2915,10 +2930,31 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     /// Initiate continuous conversions.
     ///
     /// Switches the chip into [`Mode::Continuous`], runs the user-supplied
-    /// closure, and unconditionally returns the chip to [`Mode::Shutdown`]
-    /// before returning, **regardless of whether the closure succeeded or
-    /// failed**. This ensures the chip is not left burning current after
-    /// a transient bus failure inside the closure.
+    /// closure, and then **attempts** to return the chip to
+    /// [`Mode::Shutdown`], whether the closure succeeded or failed. The
+    /// attempt is there to keep the chip from burning current after a
+    /// transient bus failure inside the closure.
+    ///
+    /// Attempts, not guarantees. Three paths skip or lose the cleanup:
+    ///
+    /// - If the *entry* transition into [`Mode::Continuous`] fails, the
+    ///   closure never runs and no cleanup is attempted. This does
+    ///   **not** mean the chip is still in its previous mode: a write
+    ///   that failed partway may already have applied its MS byte,
+    ///   which is the one carrying `M` (SBOS663A §6.6 permits
+    ///   MS-byte-only updates). Treat the mode as unknown and
+    ///   re-establish it rather than assuming a no-op.
+    /// - If the closure panics, the unwind carries past the cleanup and
+    ///   the chip is left converting. `no_std` builds using
+    ///   `panic = "abort"` never reach this case.
+    /// - If the cleanup write itself fails while the closure also
+    ///   failed, the closure's error is what you get and the cleanup
+    ///   error is dropped — so a caller cannot tell a confirmed
+    ///   shutdown apart from a chip still converting.
+    ///
+    /// Even an accepted shutdown is not immediate: the conversion
+    /// already in flight runs to completion before the part goes
+    /// quiescent (SBOS663A §7.4.1).
     ///
     /// # Cancel-safety
     ///
@@ -2942,13 +2978,15 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
     ///
     /// # Errors
     ///
+    /// - If the initial transition into [`Mode::Continuous`] fails, the
+    ///   closure is not invoked and that I2C error is returned.
     /// - If the closure returns `Err(e)`, the cleanup `shutdown()` still
-    ///   runs but its result is discarded; the closure's error is
-    ///   returned.
+    ///   runs, but `e` is returned and any cleanup error is dropped.
+    ///   A returned closure error therefore says nothing about whether
+    ///   the chip reached shutdown.
     /// - If the closure returns `Ok(())` and the cleanup `shutdown()`
-    ///   fails, that I2C error is returned.
-    /// - If the initial transition into `Mode::Continuous` fails, the
-    ///   closure is not invoked and the I2C error is returned.
+    ///   fails, that I2C error is returned. `Ok(())` is the only
+    ///   result that confirms the shutdown write was accepted.
     ///
     /// # Examples
     ///
@@ -3030,7 +3068,7 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
         delay: &mut DELAY,
     ) -> Result<Celsius, I2C::Error> {
         let config = self.read_configuration().await?;
-        delay.delay_us(conversion_period_us(config.conversion_rate)).await;
+        delay.delay_us(ops::conversion_period_us(config.conversion_rate)).await;
         self.temperature().await
     }
 
@@ -3152,16 +3190,6 @@ impl<I2C: AsyncI2c> AsyncTmp108<I2C> {
             .t_high()
             .write_async(|r| *r = THigh::from(limit.to_register()))
             .await
-    }
-}
-
-/// Compute the chip's conversion period (1/CR) in microseconds.
-const fn conversion_period_us(rate: ConversionRate) -> u32 {
-    match rate {
-        ConversionRate::QuarterHz => 4_000_000,
-        ConversionRate::OneHz => 1_000_000,
-        ConversionRate::FourHz => 250_000,
-        ConversionRate::SixteenHz => 62_500,
     }
 }
 
@@ -3674,30 +3702,41 @@ mod tests {
         cfg
     }
 
+    /// Wire bytes, not a packed word.
+    ///
+    /// The configuration register is transmitted MSB first (SBOS663A
+    /// §7.3.4), so wire byte 0 is Table 8's BYTE 1 — the one carrying
+    /// M, TM, FL, FH, CR and ID. The DDSL models the register as a
+    /// little-endian word, which puts that same byte at the word's
+    /// low end; the two descriptions agree, and asserting the bytes
+    /// directly avoids having to hold both in mind at once.
+    ///
+    /// These assertions used `from_ne_bytes`, which is host-endian
+    /// and would have failed on a big-endian target.
     #[test]
     fn default_configuration() {
         let cfg = por_configuration();
-        assert_eq!(u16::from_le_bytes(cfg.into()), 0x1022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x10]);
     }
 
     #[test]
     fn modify_mode() {
         let mut cfg = por_configuration();
         cfg.set_m(Mode::Shutdown);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1020);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x20, 0x10]);
         cfg.set_m(Mode::OneShot);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1021);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x21, 0x10]);
         cfg.set_m(Mode::Continuous);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x10]);
     }
 
     #[test]
     fn modify_thermostat_mode() {
         let mut cfg = por_configuration();
         cfg.set_tm(Thermostat::Comparator);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x10]);
         cfg.set_tm(Thermostat::Interrupt);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1026);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x26, 0x10]);
     }
 
     #[test]
@@ -3705,48 +3744,48 @@ mod tests {
         let mut cfg = por_configuration();
         cfg.set_fl(true);
         cfg.set_fh(false);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x102a);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x2a, 0x10]);
         cfg.set_fl(false);
         cfg.set_fh(true);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1032);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x32, 0x10]);
         cfg.set_fl(true);
         cfg.set_fh(true);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x103a);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x3a, 0x10]);
     }
 
     #[test]
     fn modify_conversion_rate() {
         let mut cfg = por_configuration();
         cfg.set_cr(ConversionRate::QuarterHz);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1002);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x02, 0x10]);
         cfg.set_cr(ConversionRate::OneHz);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x10]);
         cfg.set_cr(ConversionRate::FourHz);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1042);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x42, 0x10]);
         cfg.set_cr(ConversionRate::SixteenHz);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1062);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x62, 0x10]);
     }
 
     #[test]
     fn modify_hysteresis() {
         let mut cfg = por_configuration();
         cfg.set_hys(Hysteresis::ZeroC);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x0022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x00]);
         cfg.set_hys(Hysteresis::OneC);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x10]);
         cfg.set_hys(Hysteresis::TwoC);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x2022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x20]);
         cfg.set_hys(Hysteresis::FourC);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x3022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x30]);
     }
 
     #[test]
     fn modify_polarity() {
         let mut cfg = por_configuration();
         cfg.set_pol(Polarity::ActiveLow);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x1022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x10]);
         cfg.set_pol(Polarity::ActiveHigh);
-        assert_eq!(u16::from_ne_bytes(cfg.into()), 0x9022);
+        assert_eq!(<[u8; 2]>::from(cfg), [0x22, 0x90]);
     }
 
     mod ops_tests {
@@ -3894,16 +3933,71 @@ mod tests {
                     .map(|s| Celsius::from_sixteenths(s).expect("in range by construction"))
             }
 
+            /// Sign-extend a 12-bit two's complement code, computed
+            /// without reference to the driver.
+            ///
+            /// This is the oracle. It must not call anything in
+            /// `ops`, or the tests below become the implementation
+            /// checked against itself — which is exactly the hole
+            /// they exist to close.
+            fn sign_extend_12(code: u16) -> i16 {
+                assert!(code < 4096, "not a 12-bit code: {code:#06x}");
+                let widened = i32::from(code);
+                let signed = if widened < 2048 { widened } else { widened - 4096 };
+                i16::try_from(signed).expect("-2048 ..= 2047 fits an i16")
+            }
+
             #[test]
-            fn decoding_a_register_is_total() {
-                // All 65,536 bit patterns, not a sample of them.
+            fn decoding_a_register_matches_an_independent_oracle() {
+                // All 65,536 bit patterns, and the *value* of each,
+                // not merely that it landed in range. Range membership
+                // alone is satisfied by every permutation of the 4096
+                // readings, and the round-trip tests below compare the
+                // encoder against its own inverse — so neither can see
+                // a mutually-consistent wrong mapping.
+                //
+                // The part left-justifies a 12-bit two's complement
+                // field in 16 bits, so the code is the top 12 bits and
+                // the low nibble is discarded.
                 for word in 0..=u16::MAX {
                     let c = Celsius::from_register(word.to_be_bytes());
-                    assert!(
-                        (MIN_SIXTEENTHS..=MAX_SIXTEENTHS).contains(&c.sixteenths()),
-                        "word {word:#06x} decoded out of range: {c:?}"
-                    );
+                    assert_eq!(c.sixteenths(), sign_extend_12(word >> 4), "word {word:#06x}");
+                    // Still total, and now for a stated reason.
+                    assert!((MIN_SIXTEENTHS..=MAX_SIXTEENTHS).contains(&c.sixteenths()));
                 }
+            }
+
+            #[test]
+            fn encoding_matches_an_independent_oracle() {
+                // The other direction, over the 4096 codes that have a
+                // canonical encoding. Byte 0 is the code's top eight
+                // bits; byte 1 is its low nibble left-justified, with
+                // the four hardwired-zero bits below it.
+                for code in 0_u16..4096 {
+                    let c = Celsius::from_sixteenths(sign_extend_12(code))
+                        .expect("every 12-bit code names a representable temperature");
+                    let expected = [
+                        u8::try_from(code >> 4).expect("12 bits less 4 is 8"),
+                        u8::try_from((code & 0xf) << 4).expect("a nibble shifted up by 4 is a byte"),
+                    ];
+                    assert_eq!(c.to_register(), expected, "code {code:#05x}");
+                }
+            }
+
+            #[test]
+            fn the_fractional_bit_weights_are_visible() {
+                // One LSB is 0.0625 °C and two are 0.125 °C. Spelled
+                // out rather than left implicit in an exhaustive loop,
+                // so a reader can see the individual bit weights.
+                assert_eq!(Celsius::try_from_degrees(0.0625).unwrap().sixteenths(), 1);
+                assert_eq!(Celsius::try_from_degrees(-0.0625).unwrap().sixteenths(), -1);
+                assert_eq!(Celsius::try_from_degrees(0.125).unwrap().sixteenths(), 2);
+                assert_eq!(Celsius::try_from_degrees(-0.125).unwrap().sixteenths(), -2);
+
+                assert_eq!(Celsius::from_sixteenths(1).unwrap().to_degrees(), 0.0625);
+                assert_eq!(Celsius::from_sixteenths(-1).unwrap().to_degrees(), -0.0625);
+                assert_eq!(Celsius::from_sixteenths(2).unwrap().to_degrees(), 0.125);
+                assert_eq!(Celsius::from_sixteenths(-2).unwrap().to_degrees(), -0.125);
             }
 
             #[test]
@@ -3982,6 +4076,63 @@ mod tests {
             }
 
             #[test]
+            fn ties_round_half_away_from_zero() {
+                // `f32::round` lives in `std` and this crate is
+                // `no_std`, so the conversion adds a half and
+                // truncates toward zero. That rounds ties away from
+                // zero, and it is policy rather than anything the
+                // datasheet asks for — the part only ever reports
+                // exact sixteenths.
+                //
+                // A tie is a value exactly half an LSB above a
+                // representable one, i.e. an odd multiple of 1/32.
+                for (degrees, expected) in [
+                    (0.03125_f32, 1_i16),
+                    (-0.03125, -1),
+                    (0.09375, 2),
+                    (-0.09375, -2),
+                    (1.53125, 25),
+                    (-1.53125, -25),
+                ] {
+                    assert_eq!(
+                        Celsius::try_from_degrees(degrees).unwrap().sixteenths(),
+                        expected,
+                        "{degrees} is a tie and must round away from zero"
+                    );
+                }
+            }
+
+            #[test]
+            fn the_rejection_boundaries_are_exact_and_closed() {
+                // The boundaries are exactly representable: -2048.5/16
+                // is -128.03125 and 2047.5/16 is 127.96875. The
+                // comparisons are `<=` and `>=`, so the boundary value
+                // itself is rejected and the interval is open.
+                //
+                // Checked one `f32` ulp either side, not at a rounded
+                // decimal, because a decimal approximation cannot
+                // distinguish "the boundary is closed" from "the
+                // boundary is a little further out than I thought".
+                // `LOWEST_ACCEPTED` and `HIGHEST_ACCEPTED` are in
+                // sixteenths (-2048.5 and 2047.5); dividing by 16
+                // gives degrees. Both divisions are exact — the
+                // divisor is a power of two.
+                let low = -128.03125_f32;
+                let high = 127.96875_f32;
+
+                assert_eq!(low, LOWEST_ACCEPTED / 16.0);
+                assert_eq!(high, HIGHEST_ACCEPTED / 16.0);
+
+                assert_eq!(Celsius::try_from_degrees(low.next_down()), Err(OutOfRange::TooLow));
+                assert_eq!(Celsius::try_from_degrees(low), Err(OutOfRange::TooLow));
+                assert_eq!(Celsius::try_from_degrees(low.next_up()), Ok(Celsius::MIN));
+
+                assert_eq!(Celsius::try_from_degrees(high.next_down()), Ok(Celsius::MAX));
+                assert_eq!(Celsius::try_from_degrees(high), Err(OutOfRange::TooHigh));
+                assert_eq!(Celsius::try_from_degrees(high.next_up()), Err(OutOfRange::TooHigh));
+            }
+
+            #[test]
             fn known_datasheet_values_decode() {
                 // Table 7 of the datasheet, as register words.
                 for (word, degrees) in [
@@ -4004,6 +4155,24 @@ mod tests {
             }
 
             #[test]
+            fn application_note_worked_values_decode() {
+                // SBAA588A works these three by hand. They are worth
+                // having alongside the exhaustive oracle because a
+                // human computed them independently, and because they
+                // exercise mixed integer/fractional data and negative
+                // fractional decoding rather than the round numbers of
+                // Table 7.
+                //
+                // All three have a zero low nibble, so the encode
+                // direction round-trips exactly and is asserted too.
+                for (word, degrees) in [(0x2090_u16, 32.5625_f32), (0xfae0, -5.125), (0x1880, 24.5)] {
+                    let c = Celsius::from_register(word.to_be_bytes());
+                    assert_eq!(c.to_degrees(), degrees, "word {word:#06x}");
+                    assert_eq!(c.to_register(), word.to_be_bytes(), "word {word:#06x}");
+                }
+            }
+
+            #[test]
             fn unused_low_bits_are_discarded_not_truncated_toward_zero() {
                 // Per the datasheet (Table 6 / Table 12) bits 3..0 of the low
                 // byte are hardwired zero and "always read 0". `from_register`
@@ -4017,38 +4186,212 @@ mod tests {
                 // register cannot store once written.
                 assert_eq!(Celsius::from_register(0x7ff8_u16.to_be_bytes()), Celsius::MAX);
             }
-        }
 
-        #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
-        #[test]
-        fn snap_hysteresis_accepts_within_tolerance() {
-            let cases: &[(f32, Hysteresis)] = &[
-                (0.0, Hysteresis::ZeroC),
-                (1.0, Hysteresis::OneC),
-                (2.0, Hysteresis::TwoC),
-                (4.0, Hysteresis::FourC),
-                (0.04, Hysteresis::ZeroC),
-                (0.1_f32 + 0.9_f32, Hysteresis::OneC),
-                (1.95, Hysteresis::TwoC),
-                (3.97, Hysteresis::FourC),
-            ];
-            for (input, expected) in cases {
-                assert_eq!(
-                    ops::snap_hysteresis(*input),
-                    Some(*expected),
-                    "input {input} should snap to {expected:?}"
-                );
+            #[test]
+            fn display_renders_degrees_and_honours_precision() {
+                // `Display` is where the value is finally allowed to
+                // become a float, so it is worth pinning that it
+                // renders degrees rather than sixteenths, and that a
+                // precision specifier reaches the underlying `f32`.
+                let c = Celsius::from_sixteenths(521).unwrap();
+                assert_eq!(std::format!("{c}"), "32.5625");
+                assert_eq!(std::format!("{c:.1}"), "32.6");
+                assert_eq!(std::format!("{c:.2}"), "32.56");
+                assert_eq!(std::format!("{c:.4}"), "32.5625");
+
+                // Negative, and a fraction the decimal representation
+                // holds exactly.
+                let c = Celsius::from_sixteenths(-82).unwrap();
+                assert_eq!(std::format!("{c}"), "-5.125");
+                assert_eq!(std::format!("{c:.2}"), "-5.12");
+
+                // The endpoints.
+                assert_eq!(std::format!("{}", Celsius::MIN), "-128");
+                assert_eq!(std::format!("{}", Celsius::MAX), "127.9375");
+                assert_eq!(std::format!("{}", Celsius::ZERO), "0");
+
+                // Sixteenths would render 521 here, not 32.5625.
+                assert_ne!(std::format!("{}", Celsius::from_sixteenths(521).unwrap()), "521");
+            }
+
+            #[test]
+            fn ordering_matches_temperature() {
+                use core::cmp::Ordering;
+
+                // `Ord` is derived on the private representation. It
+                // agrees with temperature only because that
+                // representation is signed sixteenths — nothing else
+                // pins that, and a change to it would reorder every
+                // `BTreeMap<Celsius, _>` in every downstream crate
+                // without a compile error.
+                assert!(Celsius::MIN < Celsius::ZERO);
+                assert!(Celsius::ZERO < Celsius::MAX);
+                assert!(Celsius::MIN < Celsius::MAX);
+
+                // `BTreeMap` and friends dispatch through `Ord::cmp`,
+                // not `<`, so pin that directly — a divergent `cmp`
+                // would satisfy every comparison above.
+                assert_eq!(Celsius::MIN.cmp(&Celsius::ZERO), Ordering::Less);
+                assert_eq!(Celsius::ZERO.cmp(&Celsius::MAX), Ordering::Less);
+                assert_eq!(Celsius::MAX.cmp(&Celsius::MIN), Ordering::Greater);
+                assert_eq!(Celsius::ZERO.cmp(&Celsius::ZERO), Ordering::Equal);
+
+                // Across zero, where an unsigned representation would
+                // disagree.
+                let below = Celsius::try_from_degrees(-0.0625).unwrap();
+                let above = Celsius::try_from_degrees(0.0625).unwrap();
+                assert!(below < Celsius::ZERO);
+                assert!(Celsius::ZERO < above);
+
+                // Monotonic across the whole domain.
+                let mut previous = Celsius::MIN;
+                for c in all().skip(1) {
+                    assert_eq!(previous.cmp(&c), Ordering::Less, "{previous:?} should sort below {c:?}");
+                    assert!(
+                        previous.to_degrees() < c.to_degrees(),
+                        "{previous:?} should be colder than {c:?}"
+                    );
+                    previous = c;
+                }
+                assert_eq!(previous, Celsius::MAX);
             }
         }
 
-        #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
-        #[test]
-        fn snap_hysteresis_rejects_out_of_tolerance_and_non_finite() {
-            for bad in [-0.5_f32, 0.5, 3.0, 5.0, -1.0, 10.0] {
-                assert_eq!(ops::snap_hysteresis(bad), None);
+        /// The conversion period the driver sleeps for before reading
+        /// the temperature register.
+        mod conversion_rate {
+            use super::*;
+
+            /// SBOS663A §7.5.3.5 defines four conversion rates. The
+            /// period is 1/CR, and it is what `wait_for_temperature`
+            /// sleeps for — understate it and the caller reads the
+            /// previous conversion.
+            ///
+            /// All four, not a sample: the function is total over a
+            /// four-inhabitant enum, so there is no reason to leave
+            /// three of them unchecked.
+            #[test]
+            fn every_rate_has_its_documented_period() {
+                for (rate, expected_us) in [
+                    (ConversionRate::QuarterHz, 4_000_000_u32),
+                    (ConversionRate::OneHz, 1_000_000),
+                    (ConversionRate::FourHz, 250_000),
+                    (ConversionRate::SixteenHz, 62_500),
+                ] {
+                    assert_eq!(
+                        ops::conversion_period_us(rate),
+                        expected_us,
+                        "{rate:?} must sleep for 1/CR"
+                    );
+                }
             }
-            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-                assert_eq!(ops::snap_hysteresis(bad), None);
+
+            /// 16 Hz is the one rate whose period is not a whole
+            /// number of milliseconds. A driver that worked in
+            /// milliseconds would sleep 62 ms and read early.
+            #[test]
+            fn the_fastest_rate_is_not_a_whole_millisecond() {
+                assert_eq!(ops::conversion_period_us(ConversionRate::SixteenHz), 62_500);
+                assert_ne!(ops::conversion_period_us(ConversionRate::SixteenHz) % 1_000, 0);
+            }
+        }
+
+        /// Snapping a continuous `f32` hysteresis request onto the
+        /// four settings the chip actually has.
+        ///
+        /// The ±0.05 °C acceptance band is driver policy, not a
+        /// datasheet tolerance — SBOS663A §7.5.3.1 Table 9 specifies
+        /// the four discrete encodings and says nothing about how a
+        /// caller's arbitrary float should reach one.
+        #[cfg(all(feature = "embedded-sensors-hal-async", feature = "async"))]
+        mod hysteresis {
+            use super::*;
+
+            #[test]
+            fn snap_hysteresis_accepts_within_tolerance() {
+                let cases: &[(f32, Hysteresis)] = &[
+                    (0.0, Hysteresis::ZeroC),
+                    (1.0, Hysteresis::OneC),
+                    (2.0, Hysteresis::TwoC),
+                    (4.0, Hysteresis::FourC),
+                    (0.04, Hysteresis::ZeroC),
+                    (0.1_f32 + 0.9_f32, Hysteresis::OneC),
+                    (1.95, Hysteresis::TwoC),
+                    (3.97, Hysteresis::FourC),
+                ];
+                for (input, expected) in cases {
+                    assert_eq!(
+                        ops::snap_hysteresis(*input),
+                        Some(*expected),
+                        "input {input} should snap to {expected:?}"
+                    );
+                }
+            }
+
+            #[test]
+            fn snap_hysteresis_rejects_out_of_tolerance_and_non_finite() {
+                for bad in [-0.5_f32, 0.5, 3.0, 5.0, -1.0, 10.0] {
+                    assert_eq!(ops::snap_hysteresis(bad), None);
+                }
+                for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                    assert_eq!(ops::snap_hysteresis(bad), None);
+                }
+            }
+
+            /// The band is **not** ±0.05 °C at every setting, and this
+            /// test records that rather than asserting the symmetry
+            /// the constant implies.
+            ///
+            /// `HYSTERESIS_TOLERANCE` is `0.05f32`, whose exact value
+            /// is 0.05000000074505805969. The rejection test is
+            /// `(input - closest).abs() > HYSTERESIS_TOLERANCE`, so
+            /// whether an edge is inside or outside depends on which
+            /// side of its own decimal value each literal rounded to:
+            ///
+            /// - `1.0 - 0.95f32` is 0.050000012, above the constant.
+            /// - `1.05f32 - 1.0` is 0.049999952, below it.
+            /// - `4.05f32 - 4.0` is 0.050000191, above it.
+            ///
+            /// Six of the eight edges are accepted; the two
+            /// rejections fall on opposite sides. That asymmetry is a
+            /// wart, and it is tracked in #76 — this test exists so a
+            /// change to it is a deliberate one rather than a silent
+            /// one.
+            #[test]
+            fn the_band_edges_are_asymmetric() {
+                let edges: &[(f32, Option<Hysteresis>)] = &[
+                    (-0.05, Some(Hysteresis::ZeroC)),
+                    (0.05, Some(Hysteresis::ZeroC)),
+                    (0.95, None),
+                    (1.05, Some(Hysteresis::OneC)),
+                    (1.95, Some(Hysteresis::TwoC)),
+                    (2.05, Some(Hysteresis::TwoC)),
+                    (3.95, Some(Hysteresis::FourC)),
+                    (4.05, None),
+                ];
+                for (input, expected) in edges {
+                    assert_eq!(
+                        ops::snap_hysteresis(*input),
+                        *expected,
+                        "edge {input} is measured behaviour, not a symmetry claim"
+                    );
+                }
+            }
+
+            /// A value midway between two settings is rejected.
+            ///
+            /// Which of the two neighbours it is measured against is
+            /// decided by `min_by`, which returns the first minimum —
+            /// so a tie resolves to the lower setting. That choice is
+            /// not observable here: both neighbours are half a degree
+            /// away, far outside the tolerance band, so either would
+            /// give `None`. What this pins is that the midpoints are
+            /// rejected rather than silently snapped.
+            #[test]
+            fn midpoints_between_settings_are_rejected() {
+                assert_eq!(ops::snap_hysteresis(0.5), None);
+                assert_eq!(ops::snap_hysteresis(1.5), None);
+                assert_eq!(ops::snap_hysteresis(3.0), None);
             }
         }
 
@@ -4531,10 +4874,22 @@ mod tests {
     mod timeline {
         use std::sync::{Arc, Mutex};
 
+        use crate::ops;
+
         /// Something the driver did, in the order it did it.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub enum Event {
-            /// A delay of this many milliseconds was requested.
+            /// A delay of this many **microseconds** was requested.
+            ///
+            /// Microseconds rather than milliseconds because
+            /// `wait_for_temperature` requests a 16 Hz conversion
+            /// period of 62 500 µs, which has no exact millisecond
+            /// representation. Millisecond storage would record that
+            /// as 62 and lose the half millisecond.
+            ///
+            /// Whole microseconds only: `delay_ns` divides by 1 000,
+            /// so a sub-microsecond request would record as a smaller
+            /// number or as zero. No driver path asks for one.
             Delay(u32),
             /// The register at this address was written.
             Write(u8),
@@ -4649,14 +5004,18 @@ mod tests {
 
         impl embedded_hal::delay::DelayNs for Clock {
             fn delay_ns(&mut self, ns: u32) {
-                record(&self.log, Event::Delay(ns / 1_000_000));
+                record(&self.log, Event::Delay(ns / 1_000));
             }
 
-            // Overridden so a millisecond request lands in the log as
-            // one event rather than as the default implementation's
-            // loop of microsecond waits.
+            // Both overridden so a request lands in the log as one
+            // event rather than as the default implementation's loop,
+            // and so no unit conversion rounds on the way in.
+            fn delay_us(&mut self, us: u32) {
+                record(&self.log, Event::Delay(us));
+            }
+
             fn delay_ms(&mut self, ms: u32) {
-                record(&self.log, Event::Delay(ms));
+                record(&self.log, Event::Delay(ms * 1_000));
             }
         }
 
@@ -4675,16 +5034,16 @@ mod tests {
         #[cfg(feature = "async")]
         pub struct Pause {
             log: Log,
-            ms: u32,
+            us: u32,
             suspended: bool,
         }
 
         #[cfg(feature = "async")]
         impl Pause {
-            fn new(log: &Log, ms: u32) -> Self {
+            fn new(log: &Log, us: u32) -> Self {
                 Self {
                     log: log.clone(),
-                    ms,
+                    us,
                     suspended: false,
                 }
             }
@@ -4699,7 +5058,7 @@ mod tests {
                 cx: &mut core::task::Context<'_>,
             ) -> core::task::Poll<Self::Output> {
                 if self.suspended {
-                    record(&self.log, Event::Delay(self.ms));
+                    record(&self.log, Event::Delay(self.us));
                     core::task::Poll::Ready(())
                 } else {
                     self.suspended = true;
@@ -4714,11 +5073,15 @@ mod tests {
         #[cfg(feature = "async")]
         impl embedded_hal_async::delay::DelayNs for Clock {
             fn delay_ns(&mut self, ns: u32) -> impl core::future::Future<Output = ()> {
-                Pause::new(&self.log, ns / 1_000_000)
+                Pause::new(&self.log, ns / 1_000)
+            }
+
+            fn delay_us(&mut self, us: u32) -> impl core::future::Future<Output = ()> {
+                Pause::new(&self.log, us)
             }
 
             fn delay_ms(&mut self, ms: u32) -> impl core::future::Future<Output = ()> {
-                Pause::new(&self.log, ms)
+                Pause::new(&self.log, ms * 1_000)
             }
         }
 
@@ -4734,8 +5097,9 @@ mod tests {
                 Event::Read(0x01),
                 Event::Write(0x01),
                 // The caller's settling delay, before anything is
-                // concluded about the part being quiescent.
-                Event::Delay(settle_ms),
+                // concluded about the part being quiescent. Logged in
+                // microseconds; the caller states it in milliseconds.
+                Event::Delay(settle_ms * 1_000),
                 // The re-read that gates the trigger.
                 Event::Read(0x01),
                 // Trigger: read-modify-write M = 0b01.
@@ -4743,9 +5107,9 @@ mod tests {
                 Event::Write(0x01),
                 // Each poll delays *first*, then reads. A read here
                 // before its delay would be sampling M at 0 ms.
-                Event::Delay(5),
+                Event::Delay(ops::ONE_SHOT_POLL_INTERVAL_MS * 1_000),
                 Event::Read(0x01),
-                Event::Delay(5),
+                Event::Delay(ops::ONE_SHOT_POLL_INTERVAL_MS * 1_000),
                 Event::Read(0x01),
                 // And only now the temperature register.
                 Event::Read(0x00),
@@ -4799,7 +5163,7 @@ mod tests {
 
                 assert_eq!(
                     events(&log),
-                    vec![Event::Read(0x01), Event::Delay(5)],
+                    vec![Event::Read(0x01), Event::Delay(5_000)],
                     "the read ran first, so it must be logged first"
                 );
             }
@@ -4814,7 +5178,7 @@ mod tests {
                 let mut word = [0u8; 2];
                 bus.write_read(0x48, &[0x01], &mut word).await.unwrap();
 
-                assert_eq!(events(&log), vec![Event::Delay(5), Event::Read(0x01)]);
+                assert_eq!(events(&log), vec![Event::Delay(5_000), Event::Read(0x01)]);
             }
 
             /// A bus access that is never awaited never reaches the
@@ -5379,6 +5743,63 @@ mod tests {
             }
         }
 
+        /// `wait_for_temperature` reads the configuration only to size
+        /// its sleep, then reads the temperature. Both peripherals go
+        /// on one timeline, because the duration is not the property
+        /// at risk — the ordering is. A delay moved after the
+        /// temperature read still sleeps for the right length and
+        /// still returns the previous conversion.
+        mod wait_for_temperature {
+            use super::super::timeline;
+            use super::*;
+
+            /// Wire byte 0 selecting `rate`, with every other field at
+            /// its reset value. The configuration word is
+            /// little-endian, so wire byte 0 is its low byte and CR
+            /// sits at bits 6:5 of it: `0x42` is `0b0100_0010`, so
+            /// CR = `0b10` = 4 Hz.
+            fn configuration_byte(rate: ConversionRate) -> u8 {
+                match rate {
+                    ConversionRate::QuarterHz => 0x02,
+                    ConversionRate::OneHz => 0x22,
+                    ConversionRate::FourHz => 0x42,
+                    ConversionRate::SixteenHz => 0x62,
+                }
+            }
+
+            #[test]
+            fn reads_the_configuration_then_sleeps_then_reads_the_temperature() {
+                for rate in [
+                    ConversionRate::QuarterHz,
+                    ConversionRate::OneHz,
+                    ConversionRate::FourHz,
+                    ConversionRate::SixteenHz,
+                ] {
+                    let log = timeline::log();
+                    // Two scripted replies: the configuration, with
+                    // only CR varying (M = continuous, and 0x10 keeps
+                    // HYS = OneC and POL = ActiveLow at their reset
+                    // values), then the temperature, 0x3200 = +50 °C.
+                    let bus = timeline::Bus::new(&log, &[[configuration_byte(rate), 0x10], [0x32, 0x00]]);
+                    let mut sensor = Tmp108::new_with_a0_gnd(bus);
+                    let mut clock = timeline::Clock::new(&log);
+
+                    let temp = sensor.wait_for_temperature(&mut clock).unwrap();
+
+                    assert_approx_eq!(temp.to_degrees(), 50.0);
+                    assert_eq!(
+                        timeline::events(&log),
+                        vec![
+                            timeline::Event::Read(0x01),
+                            timeline::Event::Delay(ops::conversion_period_us(rate)),
+                            timeline::Event::Read(0x00),
+                        ],
+                        "{rate:?}"
+                    );
+                }
+            }
+        }
+
         /// Issue #65: the acknowledging read returns the flags that
         /// `read_configuration` drops, over identical bus traffic.
         #[test]
@@ -5429,6 +5850,38 @@ mod tests {
         use embedded_hal_mock::eh1::i2c::{Mock, Transaction};
 
         use super::*;
+
+        /// The async mirror of
+        /// `blocking::limit_registers_reset_to_the_documented_window`.
+        ///
+        /// The reset value is declared once in the DDSL and both
+        /// drivers read it through the same generated register
+        /// operation, so this cannot drift from its blocking twin
+        /// independently — but AGENTS.md asks for both flavors to be
+        /// covered, and a future change to `write_async` could.
+        #[tokio::test]
+        async fn limit_registers_reset_to_the_documented_window() {
+            // Datasheet §7.5.4: THIGH = +127.9375 °C (0x7FF8) and
+            // TLOW = -128 °C (0x8000), sent MSB first.
+            //
+            // Asserted against explicit wire bytes rather than against
+            // `Fieldset::ZERO`, because comparing against ZERO is
+            // precisely what let the wrong defaults through. The only
+            // path where the reset value is observable is a `write()`
+            // whose closure changes nothing.
+            let expectations = vec![
+                Transaction::write(0x48, vec![0x02, 0x80, 0x00]),
+                Transaction::write(0x48, vec![0x03, 0x7f, 0xf8]),
+            ];
+            let mock = Mock::new(&expectations);
+            let mut tmp = AsyncTmp108::new_with_a0_gnd(mock);
+
+            tmp.inner.t_low().write_async(|_| {}).await.unwrap();
+            tmp.inner.t_high().write_async(|_| {}).await.unwrap();
+
+            let mut mock = tmp.destroy();
+            mock.done();
+        }
 
         #[tokio::test]
         async fn handle_a0_pin_accordingly() {
@@ -5795,6 +6248,46 @@ mod tests {
 
             // Must propagate the closure error, not the shutdown error.
             assert_eq!(result.err().map(|e| e.kind()), Some(closure_err));
+
+            let mut mock = tmp108.destroy();
+            mock.done();
+        }
+
+        #[tokio::test]
+        async fn continuous_skips_the_closure_and_cleanup_when_entry_fails() {
+            use embedded_hal_async::i2c::Error as _;
+
+            // The entry read-modify-write is the first thing
+            // `continuous` does. If it fails, the closure never runs
+            // and no cleanup is attempted.
+            //
+            // This test fails the *read*, so nothing was written and
+            // the mode really is unchanged. A failed *write* is a
+            // different case: the MS byte carries M, and SBOS663A §6.6
+            // permits MS-byte-only updates, so a partial write can
+            // leave the part converting. The driver cannot tell the
+            // two apart, which is why the documentation tells callers
+            // to treat the mode as unknown.
+            //
+            // The single scripted transaction is the assertion:
+            // `done()` fails if a closure body, or a cleanup
+            // shutdown, issued anything further.
+            let entry_err = embedded_hal::i2c::ErrorKind::Bus;
+
+            let expectations = vec![Transaction::write_read(0x48, vec![0x01], vec![0x22, 0x10]).with_error(entry_err)];
+            let mock = Mock::new(&expectations);
+            let mut tmp108 = AsyncTmp108::new_with_a0_gnd(mock);
+
+            let mut closure_ran = false;
+            let result = tmp108
+                .continuous(async |_| {
+                    closure_ran = true;
+                    Ok(())
+                })
+                .await;
+
+            assert_eq!(result.err().map(|e| e.kind()), Some(entry_err));
+            assert!(!closure_ran, "the closure must not run when entry failed");
 
             let mut mock = tmp108.destroy();
             mock.done();
@@ -9559,6 +10052,64 @@ mod tests {
                         run(&i2c, &delay).await,
                         Err(OneShotError::Bus(err)),
                         "a bus error at the {what} must surface as OneShotError::Bus"
+                    );
+                }
+            }
+        }
+
+        /// The async mirror of the blocking ordering test.
+        ///
+        /// Sharper than its blocking twin: `timeline::Pause` records
+        /// when it is *polled to completion*, not when it is created,
+        /// and returns `Pending` once before completing. A body that
+        /// built its delay future early and awaited it late would be
+        /// caught here.
+        mod wait_for_temperature {
+            use super::super::timeline;
+            use super::*;
+
+            /// Wire byte 0 selecting `rate`, with every other field at
+            /// its reset value. The configuration word is
+            /// little-endian, so wire byte 0 is its low byte and CR
+            /// sits at bits 6:5 of it: `0x42` is `0b0100_0010`, so
+            /// CR = `0b10` = 4 Hz.
+            fn configuration_byte(rate: ConversionRate) -> u8 {
+                match rate {
+                    ConversionRate::QuarterHz => 0x02,
+                    ConversionRate::OneHz => 0x22,
+                    ConversionRate::FourHz => 0x42,
+                    ConversionRate::SixteenHz => 0x62,
+                }
+            }
+
+            #[tokio::test]
+            async fn reads_the_configuration_then_sleeps_then_reads_the_temperature() {
+                for rate in [
+                    ConversionRate::QuarterHz,
+                    ConversionRate::OneHz,
+                    ConversionRate::FourHz,
+                    ConversionRate::SixteenHz,
+                ] {
+                    let log = timeline::log();
+                    // Two scripted replies: the configuration, with
+                    // only CR varying (M = continuous, and 0x10 keeps
+                    // HYS = OneC and POL = ActiveLow at their reset
+                    // values), then the temperature, 0x3200 = +50 °C.
+                    let bus = timeline::Bus::new(&log, &[[configuration_byte(rate), 0x10], [0x32, 0x00]]);
+                    let mut sensor = AsyncTmp108::new_with_a0_gnd(bus);
+                    let mut clock = timeline::Clock::new(&log);
+
+                    let temp = sensor.wait_for_temperature(&mut clock).await.unwrap();
+
+                    assert_approx_eq!(temp.to_degrees(), 50.0);
+                    assert_eq!(
+                        timeline::events(&log),
+                        vec![
+                            timeline::Event::Read(0x01),
+                            timeline::Event::Delay(ops::conversion_period_us(rate)),
+                            timeline::Event::Read(0x00),
+                        ],
+                        "{rate:?}"
                     );
                 }
             }
