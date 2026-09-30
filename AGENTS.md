@@ -83,12 +83,15 @@ meaningful work to `ops::*`.
 ├── tests/
 │   └── reexports.rs        # compile-only: pins Tmp108 + AsyncTmp108
 ├── scripts/
-│   └── check-readme-snippets.sh    # CI gate: README in sync with examples/
+│   ├── check-readme-snippets.sh    # CI gate: README in sync with examples/
+│   └── check-tla.py                # local gate: runs the TLA+ specs
 ├── supply-chain/           # cargo-vet audits
 ├── .github/
 │   ├── copilot-instructions.md # short stub → this file
 │   └── workflows/          # fmt, clippy, test, doc, hack, deny, semver, vet, no-std
-└── docs/superpowers/       # specs + plans for non-trivial work
+├── docs/superpowers/       # specs + plans for non-trivial work
+├── docs/tla/               # TLA+ specs of the part and the driver
+└── docs/vendor/            # citable text extracts of the vendor documentation
 ```
 
 ---
@@ -156,6 +159,9 @@ cargo hack --feature-powerset check --locked
 
 # README snippets match the examples they were lifted from
 ./scripts/check-readme-snippets.sh
+
+# formal specs (needs a JRE and tla2tools.jar; NOT run in CI)
+python scripts/check-tla.py
 
 # supply-chain (every new dependency needs an audit or trust entry)
 cargo vet --locked
@@ -462,6 +468,8 @@ certify the Developer Certificate of Origin.
 | A new doctest pattern | If it's reusable, document it in this file under "Gotchas" |
 | A new test (unit) | `src/lib.rs` `mod tests` (pure-function tests go in `mod tests::ops_tests`; blocking-driver tests go in `mod tests::blocking`; async-driver tests go in `mod tests::asynchronous`) |
 | A new test (integration) | `tests/<topic>.rs` |
+| A behaviour change to any modelled driver method | Also update `docs/tla/Tmp108Driver.tla`, and re-run `python scripts/check-tla.py`. The table in `docs/tla/README.md` says which methods are modelled and which transactions each performs. **Nothing mechanically enforces this** — the gate will stay green against a stale spec — so it is on you |
+| A new fact about the part measured on silicon | `docs/tla/README.md`'s bench-measurement table, with the reproduction commands, then encode it in `docs/tla/Tmp108Hw.tla` |
 | A new dev-dep | `Cargo.toml [dev-dependencies]` + a `[[audits.<crate>]]` entry |
 | A README usage snippet | Marker region in an example file + matching `<!-- snippet: NAME -->` block in `README.md`; register in `scripts/check-readme-snippets.sh` |
 | A design document | `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md` |
